@@ -9,8 +9,8 @@ services:
       - "127.0.0.1:8080:8080"
     restart: unless-stopped
 
-  # HTTPS для мини-приложения на своём домене: docker compose --profile https up -d
-  # Нужны DOMAIN в .env, A-запись домена на этот сервер и открытые порты 80/443.
+  # HTTPS для мини-приложения на своём домене. Включается строкой COMPOSE_PROFILES=https в .env
+  # (или флагом --profile https). Нужны DOMAIN в .env, A-запись домена на сервер и открытые порты 80/443.
   caddy:
     image: caddy:2
     profiles: ["https"]
