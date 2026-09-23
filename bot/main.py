@@ -40,9 +40,12 @@ COMMANDS = [
 
 
 def build_bot(config: Config) -> Bot:
-    session = None
+    session_kwargs: dict[str, Any] = {}
     if config.bot_api_url:
-        session = AiohttpSession(api=TelegramAPIServer.from_base(config.bot_api_url, is_local=config.bot_api_local))
+        session_kwargs["api"] = TelegramAPIServer.from_base(config.bot_api_url, is_local=config.bot_api_local)
+    if config.telegram_proxy:
+        session_kwargs["proxy"] = config.telegram_proxy
+    session = AiohttpSession(**session_kwargs) if session_kwargs else None
     return Bot(config.bot_token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 
@@ -115,7 +118,12 @@ async def check_telegram(bot: Bot) -> User:
         sys.exit("Telegram отклонил BOT_TOKEN: скопируйте токен из @BotFather заново (в .env, строка BOT_TOKEN=)")
     except TelegramNetworkError as e:
         await bot.session.close()
-        sys.exit(f"Не удалось связаться с Telegram (api.telegram.org): {e}. Проверьте интернет на сервере.")
+        sys.exit(
+            f"Не удалось связаться с Telegram (api.telegram.org): {e}\n"
+            "Проверьте на сервере: curl -m 15 -sS -o /dev/null -w '%{http_code}\\n' https://api.telegram.org\n"
+            "Ответ 302 — Telegram доступен, попробуйте DOCKER_MTU=1400 в .env. Таймаут — провайдер не пускает "
+            "к Telegram: нужен TELEGRAM_PROXY или другой сервер. Подробно: docs/GUIDE.md, «Бот совсем не отвечает»."
+        )
 
 
 async def main() -> None:

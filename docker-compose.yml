@@ -24,3 +24,9 @@ services:
 
 volumes:
   caddy_data:
+
+networks:
+  default:
+    driver_opts:
+      # Если на VPS соединения из контейнера зависают (а с самого сервера работают), поставьте DOCKER_MTU=1400 в .env
+      com.docker.network.driver.mtu: ${DOCKER_MTU:-1500}

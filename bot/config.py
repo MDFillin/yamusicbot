@@ -21,6 +21,7 @@ class Config:
     data_dir: Path
     bot_api_url: str | None = None
     bot_api_local: bool = False
+    telegram_proxy: str | None = None  # http://… или socks5://… — если сервер не видит api.telegram.org
     max_bitrate: int = 320
     # Мини-приложение: публичный HTTPS-адрес (для кнопки в Telegram) и где слушать веб-сервер.
     webapp_url: str | None = None
@@ -73,6 +74,10 @@ def load_config() -> Config:
     if webapp_url and not webapp_url.startswith("https://"):
         raise ConfigError("WEBAPP_URL должен начинаться с https:// — мини-приложения Telegram работают только по HTTPS")
 
+    telegram_proxy = os.getenv("TELEGRAM_PROXY", "").strip() or None
+    if telegram_proxy and not telegram_proxy.startswith(("http://", "socks4://", "socks5://")):
+        raise ConfigError("TELEGRAM_PROXY должен начинаться с http://, socks5:// или socks4://")
+
     return Config(
         bot_token=bot_token,
         ym_token=ym_token,
@@ -80,6 +85,7 @@ def load_config() -> Config:
         data_dir=Path(os.getenv("DATA_DIR", "data")),
         bot_api_url=os.getenv("BOT_API_URL", "").strip() or None,
         bot_api_local=_flag(os.getenv("BOT_API_LOCAL")),
+        telegram_proxy=telegram_proxy,
         max_bitrate=bitrate,
         webapp_url=webapp_url,
         web_host=os.getenv("WEB_HOST", "0.0.0.0"),

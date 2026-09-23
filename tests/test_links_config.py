@@ -45,3 +45,20 @@ def test_webapp_url_must_be_https(monkeypatch):
         load_config()
     monkeypatch.setenv("WEBAPP_URL", "https://music.example.com/")
     assert load_config().webapp_url == "https://music.example.com"
+
+
+def test_telegram_proxy(monkeypatch):
+    from bot.config import ConfigError, load_config
+    from bot.main import build_bot
+
+    monkeypatch.setenv("BOT_TOKEN", "1:x")
+    monkeypatch.setenv("YANDEX_MUSIC_TOKEN", "y0")
+    monkeypatch.setenv("TELEGRAM_PROXY", "1.2.3.4:1080")
+    with pytest.raises(ConfigError, match="socks5"):
+        load_config()
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://user:pass@1.2.3.4:1080")
+    config = load_config()
+    bot = build_bot(config)
+    assert bot.session.proxy == "socks5://user:pass@1.2.3.4:1080"
+    monkeypatch.delenv("TELEGRAM_PROXY")
+    assert build_bot(load_config()).session.proxy is None
