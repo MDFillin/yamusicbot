@@ -22,6 +22,11 @@ class Config:
     bot_api_url: str | None = None
     bot_api_local: bool = False
     max_bitrate: int = 320
+    # Мини-приложение: публичный HTTPS-адрес (для кнопки в Telegram) и где слушать веб-сервер.
+    webapp_url: str | None = None
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
+    web_max_upload_mb: int = 300
 
     @property
     def max_tg_download(self) -> int:
@@ -64,6 +69,10 @@ def load_config() -> Config:
     if bitrate not in (64, 128, 192, 320):
         raise ConfigError("MAX_BITRATE должен быть одним из: 64, 128, 192, 320")
 
+    webapp_url = os.getenv("WEBAPP_URL", "").strip().rstrip("/") or None
+    if webapp_url and not webapp_url.startswith("https://"):
+        raise ConfigError("WEBAPP_URL должен начинаться с https:// — мини-приложения Telegram работают только по HTTPS")
+
     return Config(
         bot_token=bot_token,
         ym_token=ym_token,
@@ -72,4 +81,8 @@ def load_config() -> Config:
         bot_api_url=os.getenv("BOT_API_URL", "").strip() or None,
         bot_api_local=_flag(os.getenv("BOT_API_LOCAL")),
         max_bitrate=bitrate,
+        webapp_url=webapp_url,
+        web_host=os.getenv("WEB_HOST", "0.0.0.0"),
+        web_port=int(os.getenv("WEB_PORT", "8080")),
+        web_max_upload_mb=int(os.getenv("WEB_MAX_UPLOAD_MB", "300")),
     )

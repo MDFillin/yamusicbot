@@ -10,8 +10,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import aiohttp
-from yandex_music import Album, ClientAsync, Playlist, Search, Track
+from yandex_music import Album, ClientAsync, DownloadInfo, Playlist, Search, Track
 from yandex_music.exceptions import YandexMusicError
+
+from bot.audio import safe_filename, tag_mp3
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +46,17 @@ def track_title(track: Track) -> str:
 
 def track_album(track: Track) -> Album | None:
     return track.albums[0] if track.albums else None
+
+
+def cover_url(uri: str | None, size: str = "200x200") -> str | None:
+    """Адрес картинки Яндекса по шаблону вида avatars.yandex.net/.../%%."""
+    if not uri:
+        return None
+    return "https://" + uri.replace("%%", size).removeprefix("https://").removeprefix("//")
+
+
+def tagged_filename(track: Track) -> str:
+    return safe_filename(f"{track_artists(track)} - {track_title(track)}") + ".mp3"
 
 
 class YandexMusic:
@@ -129,6 +142,23 @@ class YandexMusic:
     async def delete_playlist(self, kind: int) -> bool:
         return await self.client.users_playlists_delete(kind)
 
+    async def rename_playlist(self, kind: int, title: str) -> Playlist | None:
+        return await self.client.users_playlists_name(kind, title)
+
+    async def remove_from_playlist(self, kind: int, index: int, track_id: str) -> Playlist | None:
+        """Удаляет трек по позиции; позицию сверяем с id, чтобы не удалить не тот трек, если плейлист изменился."""
+        playlist = await self.get_playlist(kind)
+        if playlist is None:
+            raise YandexMusicError("Плейлист не найден")
+        ids = [str(s.id) for s in playlist.tracks or []]
+        if not (0 <= index < len(ids) and ids[index] == track_id):
+            if track_id not in ids:
+                raise YandexMusicError("Трека уже нет в плейлисте")
+            index = ids.index(track_id)
+        return await self.client.users_playlists_delete_track(
+            kind, index, index + 1, revision=playlist.revision or 1,
+        )
+
     async def add_to_playlist(self, kind: int, track: Track) -> Playlist | None:
         playlist = await self.get_playlist(kind)
         if playlist is None:
@@ -152,17 +182,42 @@ class YandexMusic:
 
     # ---------- скачивание ----------
 
-    async def download(self, track: Track) -> tuple[bytes, int]:
-        """Скачивает MP3 в лучшем доступном качестве (но не выше MAX_BITRATE)."""
+    async def _best_download_info(self, track: Track) -> DownloadInfo:
+        """Лучший MP3 (но не выше MAX_BITRATE) с уже полученной прямой ссылкой."""
         if track.available is False:
             raise TrackUnavailableError("Трек недоступен для прослушивания")
-        infos = await track.get_download_info_async(get_direct_links=True)
+        infos = await track.get_download_info_async()
         mp3 = [i for i in infos if i.codec == "mp3" and not i.preview] or [i for i in infos if i.codec == "mp3"]
         if not mp3:
             raise TrackUnavailableError("Для трека нет MP3 для скачивания")
         allowed = [i for i in mp3 if i.bitrate_in_kbps <= self._max_bitrate]
         best = max(allowed, key=lambda i: i.bitrate_in_kbps) if allowed else min(mp3, key=lambda i: i.bitrate_in_kbps)
+        # Прямую ссылку берём только для выбранного варианта, а не для всех сразу.
+        await best.get_direct_link_async()
+        return best
+
+    async def direct_link(self, track: Track) -> str:
+        """Временная прямая ссылка на MP3 (для плеера в мини-приложении)."""
+        return (await self._best_download_info(track)).direct_link
+
+    async def download(self, track: Track) -> tuple[bytes, int]:
+        """Скачивает MP3 в лучшем доступном качестве (но не выше MAX_BITRATE)."""
+        best = await self._best_download_info(track)
         return await best.download_bytes_async(), best.bitrate_in_kbps
+
+    async def download_tagged(self, track: Track) -> tuple[bytes, int]:
+        """MP3 с тегами (исполнитель, название, альбом, год) и обложкой."""
+        data, bitrate = await self.download(track)
+        album = track_album(track)
+        data = tag_mp3(
+            data,
+            title=track_title(track),
+            artist=track_artists(track),
+            album=album.title if album else None,
+            year=album.year if album else None,
+            cover=await self.download_cover(track, "600x600"),
+        )
+        return data, bitrate
 
     async def download_cover(self, track: Track, size: str = "400x400") -> bytes | None:
         if not track.cover_uri:

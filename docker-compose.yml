@@ -4,4 +4,23 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+    ports:
+      # мини-приложение; наружу его публикует Caddy (ниже) или туннель
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
+
+  # HTTPS для мини-приложения на своём домене: docker compose --profile https up -d
+  # Нужны DOMAIN в .env, A-запись домена на этот сервер и открытые порты 80/443.
+  caddy:
+    image: caddy:2
+    profiles: ["https"]
+    command: caddy reverse-proxy --from ${DOMAIN:-localhost} --to bot:8080
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+    restart: unless-stopped
+
+volumes:
+  caddy_data:

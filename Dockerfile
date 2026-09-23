@@ -12,4 +12,5 @@ COPY bot ./bot
 
 ENV DATA_DIR=/data PYTHONUNBUFFERED=1
 VOLUME /data
+EXPOSE 8080
 CMD ["python", "-m", "bot"]

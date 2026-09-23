@@ -22,7 +22,7 @@ from aiogram.methods import (
 )
 from aiogram.types import Audio, CallbackQuery, Chat, Document, File, Message, Update, User
 
-from bot.audio import read_mp3_tags
+from bot.audio import read_mp3_tags, tag_mp3
 from bot.callbacks import TrackCb, UploadCb
 from bot.config import Config
 from bot.main import build_dependencies, build_dispatcher
@@ -103,9 +103,9 @@ class FakeYM:
     async def get_track(self, track_id):
         return make_track()
 
-    async def download(self, track):
+    async def download_tagged(self, track):
         self.downloads += 1
-        return FAKE_MP3, 320
+        return tag_mp3(FAKE_MP3, artist="Кино", title=track.title), 320
 
     async def download_cover(self, track, size="400x400"):
         return b"\xff\xd8cover"
@@ -222,3 +222,17 @@ async def test_download_track_sends_tagged_mp3_and_caches_file_id(env):
     second = [c for c in env.tg.calls if isinstance(c, SendAudio)][1]
     assert second.audio == "AUDIO-1", "повторно трек отправляется по file_id без скачивания"
     assert env.ym.downloads == 1
+
+
+async def test_app_command_without_webapp_url(env):
+    await env.dp.feed_update(env.bot, message_update(text="/app"))
+    assert "WEBAPP_URL" in env.tg.texts()[-1]
+
+
+def test_app_button_opens_webapp():
+    from bot.handlers.common import app_button
+
+    config = Config(bot_token="1:x", ym_token="x", allowed_users=frozenset(), data_dir=None,
+                    webapp_url="https://music.example.com")
+    [[button]] = app_button(config).inline_keyboard
+    assert button.web_app.url == "https://music.example.com"

@@ -13,11 +13,10 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import BufferedInputFile, Message
 from yandex_music import Track
 
-from bot.audio import safe_filename, tag_mp3
 from bot.config import Config
 from bot.keyboards import track_actions
 from bot.storage import Storage
-from bot.ym import YandexMusic, track_album, track_artists, track_title
+from bot.ym import YandexMusic, tagged_filename, track_album, track_artists, track_title
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -68,17 +67,7 @@ class TrackSender:
             except TelegramBadRequest:
                 log.info("file_id для %s устарел, скачиваю заново", track_id)
 
-        data, bitrate = await self._ym.download(track)
-        album = track_album(track)
-        artists, title = track_artists(track), track_title(track)
-        data = tag_mp3(
-            data,
-            title=title,
-            artist=artists,
-            album=album.title if album else None,
-            year=album.year if album else None,
-            cover=await self._ym.download_cover(track, "600x600"),
-        )
+        data, bitrate = await self._ym.download_tagged(track)
         if len(data) > self._config.max_tg_upload:
             raise TrackTooLargeError(
                 f"Файл {len(data) // (1024 * 1024)} МБ — больше лимита Telegram для ботов "
@@ -89,10 +78,10 @@ class TrackSender:
         msg = await retry_telegram(
             lambda: self._bot.send_audio(
                 chat_id,
-                BufferedInputFile(data, filename=safe_filename(f"{artists} - {title}") + ".mp3"),
+                BufferedInputFile(data, filename=tagged_filename(track)),
                 caption=caption,
-                title=title,
-                performer=artists,
+                title=track_title(track),
+                performer=track_artists(track),
                 duration=(track.duration_ms or 0) // 1000 or None,
                 thumbnail=BufferedInputFile(thumb, filename="cover.jpg") if thumb else None,
                 reply_markup=markup,

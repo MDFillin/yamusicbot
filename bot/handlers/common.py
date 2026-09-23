@@ -3,14 +3,18 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
 from bot.callbacks import NoopCb
+from bot.config import Config
 from bot.ym import YandexMusic
 
 router = Router(name="common")
 
 HELP = """<b>🎧 Бот для Яндекс Музыки</b>
+
+<b>Медиатека</b> — кнопка «Медиатека» слева от поля ввода (или /app) открывает приложение:
+плейлисты, «Мне нравится», поиск, плеер, скачивание на телефон и загрузка файлов до сотен МБ.
 
 <b>Скачивание</b>
 • Напишите название трека или исполнителя — найду и пришлю MP3.
@@ -29,10 +33,30 @@ HELP = """<b>🎧 Бот для Яндекс Музыки</b>
 • /cancel — отменить текущее действие."""
 
 
+def app_button(config: Config) -> InlineKeyboardMarkup | None:
+    if not config.webapp_url:
+        return None
+    button = InlineKeyboardButton(text="🎧 Открыть медиатеку", web_app=WebAppInfo(url=config.webapp_url))
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
 @router.message(CommandStart())
-async def start(message: Message, ym: YandexMusic) -> None:
+async def start(message: Message, ym: YandexMusic, config: Config) -> None:
     plus = "есть" if ym.has_plus else "нет (скачивание полных треков может не работать)"
-    await message.answer(f"Аккаунт Яндекса: <b>{ym.login}</b>, Плюс: {plus}.\n\n{HELP}")
+    text = f"Аккаунт Яндекса: <b>{ym.login}</b>, Плюс: {plus}.\n\n{HELP}"
+    await message.answer(text, reply_markup=app_button(config))
+
+
+@router.message(Command("app"))
+async def open_app(message: Message, config: Config) -> None:
+    markup = app_button(config)
+    if markup is None:
+        await message.answer(
+            "Мини-приложение ещё не настроено: укажите в .env публичный HTTPS-адрес WEBAPP_URL "
+            "и перезапустите бота (см. README, раздел «Мини-приложение»)."
+        )
+        return
+    await message.answer("Ваша медиатека: плейлисты, поиск, плеер, скачивание и загрузка треков.", reply_markup=markup)
 
 
 @router.message(Command("help"))

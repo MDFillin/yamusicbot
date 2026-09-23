@@ -33,3 +33,15 @@ def test_parse_link(text, expected):
 @pytest.mark.parametrize("text", ["просто текст", "https://example.com/album/1", "https://music.yandex.ru/"])
 def test_parse_link_none(text):
     assert parse_link(text) is None
+
+
+def test_webapp_url_must_be_https(monkeypatch):
+    from bot.config import ConfigError, load_config
+
+    monkeypatch.setenv("BOT_TOKEN", "1:x")
+    monkeypatch.setenv("YANDEX_MUSIC_TOKEN", "y0")
+    monkeypatch.setenv("WEBAPP_URL", "http://insecure.example.com")
+    with pytest.raises(ConfigError, match="https"):
+        load_config()
+    monkeypatch.setenv("WEBAPP_URL", "https://music.example.com/")
+    assert load_config().webapp_url == "https://music.example.com"

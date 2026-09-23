@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <title>Моя музыка</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?59"></script>
+  <link rel="stylesheet" href="/static/style.css?v=__V__">
+</head>
+<body>
+  <main id="view"></main>
+
+  <div id="player" hidden>
+    <img class="cover" alt="">
+    <div class="meta"><div class="title"></div><div class="sub"></div></div>
+    <button class="icon-btn" data-act="toggle" aria-label="Пауза"></button>
+    <button class="icon-btn" data-act="next" aria-label="Следующий"></button>
+    <div class="bar"></div>
+  </div>
+
+  <nav id="tabs">
+    <button data-tab="library"></button>
+    <button data-tab="search"></button>
+    <button data-tab="upload"></button>
+  </nav>
+
+  <div id="backdrop"></div>
+  <div id="sheet" role="dialog"></div>
+  <div id="toast"></div>
+  <audio id="audio" preload="none"></audio>
+
+  <script src="/static/app.js?v=__V__"></script>
+</body>
+</html>

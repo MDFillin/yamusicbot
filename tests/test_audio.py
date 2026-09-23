@@ -35,7 +35,7 @@ async def test_prepare_file_caption_sets_tags_and_name():
     name, data, notes = await prepare_file(pf, FAKE_MP3)
     assert name == "Кино - Кукушка.mp3"
     assert read_mp3_tags(data) == ("Кино", "Кукушка")
-    assert notes == ["теги взяты из подписи"]
+    assert notes == ["теги: Кино — Кукушка"]
 
 
 @pytest.mark.asyncio
@@ -48,7 +48,7 @@ async def test_prepare_file_uses_telegram_metadata_when_no_tags():
 
 @pytest.mark.asyncio
 async def test_prepare_file_non_mp3_without_ffmpeg(monkeypatch):
-    monkeypatch.setattr("bot.handlers.upload.ffmpeg_available", lambda: False)
+    monkeypatch.setattr("bot.audio.ffmpeg_available", lambda: False)
     pf = PendingFile("id", "song.flac", 100, "A - B")
     name, data, notes = await prepare_file(pf, b"fLaC-data")
     assert name == "song.flac" and data == b"fLaC-data"

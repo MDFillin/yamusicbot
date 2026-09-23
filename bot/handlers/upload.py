@@ -8,7 +8,6 @@ import io
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -17,13 +16,10 @@ from aiogram.types import CallbackQuery, Message
 
 from bot.audio import (
     ConversionError,
-    convert_to_mp3,
-    ffmpeg_available,
     is_audio_filename,
     parse_caption,
-    read_mp3_tags,
+    prepare_for_upload,
     safe_filename,
-    tag_mp3,
 )
 from bot.callbacks import UploadCb
 from bot.config import Config
@@ -77,31 +73,12 @@ def _is_audio_message(message: Message) -> bool:
 
 
 async def prepare_file(pf: PendingFile, data: bytes) -> tuple[str, bytes, list[str]]:
-    """Готовит файл к загрузке: конвертация в MP3 и теги. Возвращает (имя, байты, заметки)."""
-    notes: list[str] = []
-    name = safe_filename(pf.file_name)
-    ext = Path(name).suffix.lower()
-
-    if ext != ".mp3":
-        if ffmpeg_available():
-            data = await convert_to_mp3(data, ext)
-            name = f"{Path(name).stem}.mp3"
-            notes.append(f"сконвертирован из {ext or 'неизвестного формата'} в MP3")
-        else:
-            notes.append(f"{ext or 'файл'} загружен как есть (ffmpeg не установлен, Яндекс надёжнее принимает MP3)")
-
-    if name.lower().endswith(".mp3"):
-        caption = parse_caption(pf.caption)
-        if caption:
-            artist, title = caption
-            data = tag_mp3(data, artist=artist, title=title)
-            name = safe_filename(f"{artist} - {title}") + ".mp3"
-            notes.append("теги взяты из подписи")
-        else:
-            tag_artist, tag_title = read_mp3_tags(data)
-            if not (tag_artist and tag_title) and (pf.performer or pf.title):
-                data = tag_mp3(data, artist=tag_artist or pf.performer, title=tag_title or pf.title)
-    return name, data, notes
+    """Готовит присланный в чат файл: подпись «Исполнитель - Название» важнее тегов из Telegram."""
+    artist, title = parse_caption(pf.caption) or (None, None)
+    return await prepare_for_upload(
+        pf.file_name, data, artist=artist, title=title,
+        fallback_artist=pf.performer, fallback_title=pf.title,
+    )
 
 
 async def download_from_telegram(bot: Bot, file_id: str) -> bytes:

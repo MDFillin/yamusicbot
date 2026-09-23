@@ -105,3 +105,44 @@ async def convert_to_mp3(data: bytes, source_ext: str, bitrate: int = 320) -> by
         if proc.returncode != 0 or not dst.exists():
             raise ConversionError(stderr.decode(errors="replace").strip()[-500:] or "ffmpeg завершился с ошибкой")
         return dst.read_bytes()
+
+
+async def prepare_for_upload(
+    file_name: str,
+    data: bytes,
+    *,
+    artist: str | None = None,
+    title: str | None = None,
+    fallback_artist: str | None = None,
+    fallback_title: str | None = None,
+) -> tuple[str, bytes, list[str]]:
+    """Готовит файл к загрузке в Яндекс Музыку. Возвращает (имя файла, байты, заметки для пользователя).
+
+    - не-MP3 конвертируется в MP3, если есть ffmpeg;
+    - artist/title (указаны пользователем) записываются в теги и в имя файла;
+    - fallback_* (например, из метаданных Telegram) пишутся, только если своих тегов в файле нет.
+    """
+    notes: list[str] = []
+    name = safe_filename(file_name)
+    ext = Path(name).suffix.lower()
+
+    if ext != ".mp3":
+        if ffmpeg_available():
+            data = await convert_to_mp3(data, ext)
+            name = f"{Path(name).stem}.mp3"
+            notes.append(f"сконвертирован из {ext or 'неизвестного формата'} в MP3")
+        else:
+            notes.append(f"{ext or 'файл'} загружен как есть (ffmpeg не установлен, Яндекс надёжнее принимает MP3)")
+
+    if name.lower().endswith(".mp3"):
+        if artist and title:
+            data = tag_mp3(data, artist=artist, title=title)
+            name = safe_filename(f"{artist} - {title}") + ".mp3"
+            notes.append(f"теги: {artist} — {title}")
+        else:
+            tag_artist, tag_title = read_mp3_tags(data)
+            new_artist = tag_artist or artist or fallback_artist
+            new_title = tag_title or title or fallback_title
+            if (new_artist, new_title) != (tag_artist, tag_title):
+                data = tag_mp3(data, artist=new_artist, title=new_title)
+    return name, data, notes

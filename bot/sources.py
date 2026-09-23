@@ -11,7 +11,7 @@ from yandex_music import Playlist, Track
 
 from bot.callbacks import BulkCb, PlaylistCb, TrackCb, ViewCb
 from bot.keyboards import fmt_duration, pager, short, track_label
-from bot.ym import YandexMusic, track_artists
+from bot.ym import YandexMusic
 
 PAGE_SIZE = 8
 
@@ -29,6 +29,18 @@ class TrackSource:
     ref: str = ""  # нормализованная ссылка на источник для кнопок (для плейлиста — "<uid>.<kind>")
     items: list[Item] = field(default_factory=list)
     own_playlist: Playlist | None = None  # свой плейлист: можно удалить/загружать в него
+    cover: str | None = None  # шаблон адреса обложки (avatars.yandex.net/...%%)
+    name: str = ""  # название без значков — для мини-приложения
+    subtitle: str = ""
+
+
+def playlist_cover(playlist: Playlist) -> str | None:
+    cover = playlist.cover
+    if cover and cover.uri:
+        return cover.uri
+    if cover and cover.items_uri:
+        return cover.items_uri[0]
+    return playlist.og_image
 
 
 def playlist_ref(playlist: Playlist) -> str:
@@ -42,7 +54,7 @@ def _playlist_items(playlist: Playlist) -> list[Item]:
 
 async def load_source(ym: YandexMusic, src: str, ref: str) -> TrackSource:
     if src == "likes":
-        return TrackSource("❤️ Мне нравится", "", list(await ym.get_liked_track_ids()))
+        return TrackSource("❤️ Мне нравится", "", list(await ym.get_liked_track_ids()), name="Мне нравится")
 
     if src == "pl":
         owner, _, kind = ref.partition(".")
@@ -51,7 +63,11 @@ async def load_source(ym: YandexMusic, src: str, ref: str) -> TrackSource:
             raise SourceNotFoundError("Плейлист не найден")
         ref = playlist_ref(playlist)
         own = playlist if ref.partition(".")[0] == str(ym.uid) else None
-        return TrackSource(f"📃 {playlist.title}", ref, _playlist_items(playlist), own)
+        owner_name = (playlist.owner.name or playlist.owner.login) if playlist.owner else None
+        return TrackSource(
+            f"📃 {playlist.title}", ref, _playlist_items(playlist), own, playlist_cover(playlist),
+            name=playlist.title, subtitle="Мой плейлист" if own else f"Плейлист · {owner_name or 'Яндекс Музыка'}",
+        )
 
     if src == "alb":
         album = await ym.get_album(ref)
@@ -60,12 +76,21 @@ async def load_source(ym: YandexMusic, src: str, ref: str) -> TrackSource:
         artists = ", ".join(a.name for a in album.artists or [] if a.name)
         tracks = [t for volume in album.volumes or [] for t in volume]
         year = f" ({album.year})" if album.year else ""
-        return TrackSource(f"💿 {artists} — {album.title}{year}", ref, list(tracks))
+        return TrackSource(
+            f"💿 {artists} — {album.title}{year}", ref, list(tracks), cover=album.cover_uri,
+            name=album.title, subtitle=f"Альбом · {artists}{year}",
+        )
 
     if src == "art":
         tracks = await ym.get_artist_tracks(ref)
-        name = track_artists(tracks[0]) if tracks else "Артист"
-        return TrackSource(f"👤 {name}: популярные треки", ref, list(tracks))
+        artist = next((a for t in tracks for a in t.artists or [] if str(a.id) == ref), None)
+        if artist is None and tracks and tracks[0].artists:
+            artist = tracks[0].artists[0]
+        name = artist.name if artist else "Артист"
+        cover = artist.cover.uri if artist and artist.cover else None
+        return TrackSource(
+            f"👤 {name}: популярные треки", ref, list(tracks), cover=cover, name=name, subtitle="Популярные треки",
+        )
 
     raise SourceNotFoundError(f"Неизвестный источник {src}")
 

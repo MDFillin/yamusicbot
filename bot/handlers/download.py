@@ -48,9 +48,20 @@ async def on_bulk(call: CallbackQuery, callback_data: BulkCb, bot: Bot, ym: Yand
         await call.answer("Уже идёт скачивание — дождитесь или остановите его", show_alert=True)
         return
     await call.answer("Начинаю скачивание")
-    task = asyncio.create_task(_bulk_download(bot, call.message.chat.id, callback_data, ym, sender))
+    start_bulk_download(bot, user_id, call.message.chat.id, callback_data.src, callback_data.ref, ym, sender)
+
+
+def start_bulk_download(
+    bot: Bot, user_id: int, chat_id: int, src: str, ref: str, ym: YandexMusic, sender: TrackSender
+) -> bool:
+    """Запускает отправку всего списка в чат. False — если у пользователя уже идёт скачивание."""
+    running = _bulk_tasks.get(user_id)
+    if running and not running.done():
+        return False
+    task = asyncio.create_task(_bulk_download(bot, chat_id, src, ref, ym, sender))
     _bulk_tasks[user_id] = task
     task.add_done_callback(lambda t: _bulk_tasks.pop(user_id, None) if _bulk_tasks.get(user_id) is t else None)
+    return True
 
 
 @router.callback_query(CancelBulkCb.filter())
@@ -63,7 +74,7 @@ async def on_cancel_bulk(call: CallbackQuery) -> None:
         await call.answer("Нечего останавливать")
 
 
-async def _bulk_download(bot: Bot, chat_id: int, cb: BulkCb, ym: YandexMusic, sender: TrackSender) -> None:
+async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexMusic, sender: TrackSender) -> None:
     status = await bot.send_message(chat_id, "⏳ Собираю список треков…")
 
     async def update(text: str, with_cancel: bool = True) -> None:
@@ -75,7 +86,7 @@ async def _bulk_download(bot: Bot, chat_id: int, cb: BulkCb, ym: YandexMusic, se
     sent, failed = 0, []
     total = 0
     try:
-        source = await load_source(ym, cb.src, cb.ref)
+        source = await load_source(ym, src, ref)
         tracks = await resolve(ym, source.items)
         total = len(tracks)
         title = html.escape(source.title)
