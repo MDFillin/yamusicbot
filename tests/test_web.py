@@ -18,7 +18,7 @@ from bot.audio import read_mp3_tags, tag_mp3
 from bot.config import Config
 from bot.storage import Storage
 from bot.web.app import create_app
-from bot.ym import UploadResult
+from bot.ym import UploadResult, YandexNotReady
 
 TOKEN = "42:TEST-TOKEN"
 OWNER_ID = 1
@@ -50,6 +50,11 @@ class FakeYM:
     uid = 42
     login = "me"
     has_plus = True
+    start_error = None
+
+    async def ensure_started(self):
+        if self.start_error:
+            raise YandexNotReady(self.start_error)
 
     def __init__(self, upstream_url: str = "") -> None:
         self.upstream_url = upstream_url
@@ -314,3 +319,12 @@ async def test_upload_validation(env):
     form.add_field("file", FAKE_MP3, filename="a.mp3")
     r = await env.client.post("/api/upload", data=form)
     assert r.status == 400 and "плейлист" in (await r.json())["error"]
+
+
+async def test_api_reports_yandex_problem(env):
+    env.ym.start_error = "токен устарел"
+    r = await env.client.get("/api/me")
+    assert r.status == 503
+    assert "токен устарел" in (await r.json())["error"]
+    r = await env.client.get("/api/me", headers={"X-Telegram-Init-Data": init_data(user_id=666)})
+    assert r.status == 403, "чужим не рассказываем про Яндекс"

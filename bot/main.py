@@ -10,20 +10,21 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, ErrorEvent, MenuButtonDefault, MenuButtonWebApp, WebAppInfo
+from aiogram.types import BotCommand, ErrorEvent, MenuButtonDefault, MenuButtonWebApp, User, WebAppInfo
+from aiogram.utils.token import TokenValidationError
 from aiohttp import web
-from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
 from bot.audio import ffmpeg_available
 from bot.config import Config, ConfigError, load_config
 from bot.handlers import build_router
 from bot.handlers.upload import UploadQueue
-from bot.middlewares import AccessMiddleware
+from bot.middlewares import AccessMiddleware, YandexReadyMiddleware
 from bot.sender import TrackSender
 from bot.storage import Storage
 from bot.web.app import create_app
-from bot.ym import YandexMusic
+from bot.ym import YandexMusic, YandexNotReady
 
 log = logging.getLogger("bot")
 
@@ -59,9 +60,12 @@ def build_dependencies(config: Config, bot: Bot, ym: YandexMusic, store: Storage
 def build_dispatcher(config: Config, bot: Bot, ym: YandexMusic, store: Storage) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage(), **build_dependencies(config, bot, ym, store))
 
+    # Сначала доступ (чужим — только «бот приватный»), потом проверка связи с Яндексом.
     access = AccessMiddleware(config.allowed_users)
-    dp.message.outer_middleware(access)
-    dp.callback_query.outer_middleware(access)
+    yandex = YandexReadyMiddleware()
+    for observer in (dp.message, dp.callback_query):
+        observer.outer_middleware(access)
+        observer.outer_middleware(yandex)
     dp.include_router(build_router())
 
     @dp.errors()
@@ -99,6 +103,21 @@ async def setup_menu_button(bot: Bot, config: Config) -> None:
         await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
 
 
+async def check_telegram(bot: Bot) -> User:
+    """Проверяет токен и связь с Telegram; при проблеме завершает программу с понятным объяснением."""
+    try:
+        me = await bot.get_me()
+        # Если у бота когда-то был включён webhook, Telegram не отдаёт сообщения через polling — снимаем его.
+        await bot.delete_webhook()
+        return me
+    except TelegramUnauthorizedError:
+        await bot.session.close()
+        sys.exit("Telegram отклонил BOT_TOKEN: скопируйте токен из @BotFather заново (в .env, строка BOT_TOKEN=)")
+    except TelegramNetworkError as e:
+        await bot.session.close()
+        sys.exit(f"Не удалось связаться с Telegram (api.telegram.org): {e}. Проверьте интернет на сервере.")
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
@@ -110,20 +129,21 @@ async def main() -> None:
     if not ffmpeg_available():
         log.warning("ffmpeg не найден: не-MP3 файлы будут загружаться без конвертации")
 
+    # Сначала Telegram: без него бот бесполезен, и о проблеме надо сказать сразу и понятно.
+    try:
+        bot = build_bot(config)
+    except TokenValidationError:
+        sys.exit("BOT_TOKEN выглядит неправильно: он должен быть вида 123456789:AAH... (скопируйте из @BotFather)")
+    me = await check_telegram(bot)
+    log.info("Бот @%s запущен — пишите ему в Telegram: https://t.me/%s", me.username, me.username)
+
+    # Яндекс не обязателен для старта: если он недоступен, бот объяснит это в чате и попробует снова позже.
     ym = YandexMusic(config.ym_token, max_bitrate=config.max_bitrate)
     try:
-        await ym.start()
-    except UnauthorizedError as e:
-        # Библиотека выдаёт это и на 401, и на 403: второй бывает из-за блокировки по IP, а не токена.
-        sys.exit(
-            f"Яндекс Музыка ответила отказом ({e}). Либо YANDEX_MUSIC_TOKEN неверный/просрочен "
-            "(получите новый: python -m bot.get_token), либо Яндекс не пускает запросы с IP этого сервера."
-        )
-    except YandexMusicError as e:
-        sys.exit(f"Не удалось подключиться к Яндекс Музыке: {e}")
-    log.info("Яндекс Музыка: %s (uid %s), Плюс: %s", ym.login, ym.uid, ym.has_plus)
+        await ym.ensure_started()
+    except YandexNotReady:
+        log.error("Бот работает без Яндекс Музыки: в чате подскажет, что делать, и повторит попытку позже.")
 
-    bot = build_bot(config)
     store = Storage(config.data_dir / "storage.json")
     dp = build_dispatcher(config, bot, ym, store)
     runner = await start_web(config, bot, ym, store, dp["sender"])

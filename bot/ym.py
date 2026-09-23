@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
 import random
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import aiohttp
 from yandex_music import Album, ClientAsync, DownloadInfo, Playlist, Search, Track
-from yandex_music.exceptions import YandexMusicError
+from yandex_music.exceptions import NetworkError, UnauthorizedError, YandexMusicError
 
 from bot.audio import safe_filename, tag_mp3
 
@@ -20,8 +22,27 @@ log = logging.getLogger(__name__)
 WEB_BASE_URL = "https://music.yandex.ru"
 
 
+START_RETRY_INTERVAL = 20  # сек: не долбить Яндекс повторными попытками на каждое сообщение
+
+
 class UploadError(RuntimeError):
     pass
+
+
+class YandexNotReady(RuntimeError):
+    """Бот работает, но подключиться к Яндекс Музыке не удалось; текст — объяснение для человека."""
+
+
+def explain_start_error(e: Exception) -> str:
+    if isinstance(e, UnauthorizedError):
+        # Библиотека выдаёт это и на 401, и на 403: второй бывает из-за блокировки по IP, а не токена.
+        return (
+            "Яндекс Музыка отклонила запрос: токен YANDEX_MUSIC_TOKEN неверный или устарел, "
+            "либо Яндекс не пускает запросы с IP этого сервера."
+        )
+    if isinstance(e, NetworkError):
+        return f"Сервер не может связаться с Яндекс Музыкой (api.music.yandex.net): {e}"
+    return f"Не удалось подключиться к Яндекс Музыке: {type(e).__name__}: {e}"
 
 
 class TrackUnavailableError(RuntimeError):
@@ -69,6 +90,9 @@ class YandexMusic:
         self.uid: int | None = None
         self.login: str | None = None
         self.has_plus = False
+        self.start_error: str | None = None
+        self._start_lock = asyncio.Lock()
+        self._last_attempt = 0.0
 
     @property
     def client(self) -> ClientAsync:
@@ -76,14 +100,41 @@ class YandexMusic:
             raise RuntimeError("YandexMusic.start() ещё не вызывался")
         return self._client
 
+    @property
+    def ready(self) -> bool:
+        return self._client is not None
+
     async def start(self) -> None:
-        self._client = await ClientAsync(self._token).init()
-        me = self._client.me
+        client = await ClientAsync(self._token).init()
+        me = client.me
         if me is None or me.account is None or me.account.uid is None:
             raise YandexMusicError("Не удалось получить аккаунт: проверьте YANDEX_MUSIC_TOKEN")
         self.uid = me.account.uid
         self.login = me.account.login
         self.has_plus = bool(me.plus and me.plus.has_plus)
+        self._client = client
+
+    async def ensure_started(self) -> None:
+        """Подключается к Яндексу, если ещё не подключены. Неудача — YandexNotReady с объяснением.
+
+        Бот при этом продолжает работать: так он может сказать в чате, что не так, вместо того чтобы молчать.
+        """
+        if self.ready:
+            return
+        async with self._start_lock:
+            if self.ready:
+                return
+            if self.start_error and time.monotonic() - self._last_attempt < START_RETRY_INTERVAL:
+                raise YandexNotReady(self.start_error)
+            self._last_attempt = time.monotonic()
+            try:
+                await self.start()
+            except Exception as e:
+                self.start_error = explain_start_error(e)
+                log.error("%s (%r)", self.start_error, e)
+                raise YandexNotReady(self.start_error) from e
+            self.start_error = None
+            log.info("Яндекс Музыка подключена: %s (uid %s), Плюс: %s", self.login, self.uid, self.has_plus)
 
     async def close(self) -> None:
         if self._session is not None:

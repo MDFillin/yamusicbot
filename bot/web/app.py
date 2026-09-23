@@ -28,6 +28,7 @@ from bot.ym import (
     TrackUnavailableError,
     UploadError,
     YandexMusic,
+    YandexNotReady,
     cover_url,
     tagged_filename,
     track_album,
@@ -146,6 +147,8 @@ async def errors_middleware(request: web.Request, handler):
         return await handler(request)
     except AuthError as e:
         return web.json_response({"error": str(e)}, status=e.status)
+    except YandexNotReady as e:
+        return web.json_response({"error": f"Бот не может подключиться к Яндекс Музыке. {e}"}, status=503)
     except web.HTTPException as e:
         if e.status >= 400 and request.path.startswith("/api/"):
             return web.json_response({"error": e.text or e.reason}, status=e.status)
@@ -167,11 +170,13 @@ async def errors_middleware(request: web.Request, handler):
 
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
+    ctx = request.app[CTX]
     if request.path.startswith("/api/"):
-        ctx = request.app[CTX]
         request[USER] = user_from_init_data(
             ctx.config.bot_token, request.headers.get("X-Telegram-Init-Data", ""), ctx.config.allowed_users,
         )
+    if request.path.startswith(("/api/", "/media/")):
+        await ctx.ym.ensure_started()
     return await handler(request)
 
 

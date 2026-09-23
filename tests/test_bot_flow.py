@@ -27,7 +27,7 @@ from bot.callbacks import TrackCb, UploadCb
 from bot.config import Config
 from bot.main import build_dependencies, build_dispatcher
 from bot.storage import Storage
-from bot.ym import UploadResult
+from bot.ym import UploadResult, YandexNotReady
 
 FAKE_MP3 = b"\xff\xfb\x90\x64" + b"\x00" * 2000
 OWNER = User(id=1, is_bot=False, first_name="Owner")
@@ -83,6 +83,11 @@ class FakeYM:
     uid = 42
     login = "me"
     has_plus = True
+    start_error = None
+
+    async def ensure_started(self):
+        if self.start_error:
+            raise YandexNotReady(self.start_error)
 
     def __init__(self) -> None:
         self.uploads: list[tuple[int, str, bytes]] = []
@@ -236,3 +241,56 @@ def test_app_button_opens_webapp():
                     webapp_url="https://music.example.com")
     [[button]] = app_button(config).inline_keyboard
     assert button.web_app.url == "https://music.example.com"
+
+
+async def test_bot_explains_yandex_problem_instead_of_staying_silent(env):
+    env.ym.start_error = "Яндекс Музыка отклонила запрос: токен YANDEX_MUSIC_TOKEN неверный или устарел"
+    await env.dp.feed_update(env.bot, message_update(text="/start"))
+    [text] = env.tg.texts()
+    assert "не может подключиться к Яндекс Музыке" in text and "YANDEX_MUSIC_TOKEN" in text
+    assert "docker compose up -d --force-recreate" in text
+
+
+async def test_stranger_gets_id_even_when_yandex_is_down(env):
+    env.ym.start_error = "нет связи"
+    await env.dp.feed_update(env.bot, message_update(user=STRANGER, text="/start"))
+    [text] = env.tg.texts()
+    assert "приватный" in text and "666" in text, "свой ID можно узнать и без рабочего Яндекса"
+
+
+class _TelegramRejects(FakeTelegram):
+    def __init__(self, error) -> None:
+        super().__init__()
+        self.error = error
+
+    async def make_request(self, bot, method, timeout=None):
+        self.calls.append(method)
+        raise self.error(method=method, message="Unauthorized")
+
+
+async def test_startup_explains_bad_bot_token():
+    from aiogram.exceptions import TelegramUnauthorizedError
+
+    from bot.main import check_telegram
+
+    bot = Bot("42:WRONG", session=_TelegramRejects(TelegramUnauthorizedError))
+    with pytest.raises(SystemExit, match="Telegram отклонил BOT_TOKEN"):
+        await check_telegram(bot)
+
+
+async def test_startup_removes_stale_webhook():
+    from aiogram.methods import DeleteWebhook, GetMe
+
+    from bot.main import check_telegram
+
+    class Ok(FakeTelegram):
+        async def make_request(self, bot, method, timeout=None):
+            self.calls.append(method)
+            if isinstance(method, GetMe):
+                return User(id=42, is_bot=True, first_name="Bot", username="my_music_bot")
+            return True
+
+    session = Ok()
+    me = await check_telegram(Bot("42:OK", session=session))
+    assert me.username == "my_music_bot"
+    assert any(isinstance(c, DeleteWebhook) for c in session.calls), "старый webhook мешает polling"
