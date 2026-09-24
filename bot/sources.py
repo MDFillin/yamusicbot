@@ -10,7 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from yandex_music import Playlist, Track
 
 from bot.callbacks import BulkCb, PlaylistCb, TrackCb, ViewCb
-from bot.keyboards import fmt_duration, pager, short, track_label
+from bot.keyboards import fmt_duration, pager, short, track_label, tracks_word
 from bot.ym import YandexMusic
 
 PAGE_SIZE = 8
@@ -113,11 +113,9 @@ async def render_page(ym: YandexMusic, source: TrackSource, src: str, page: int)
     page = min(max(page, 0), pages - 1)
     tracks = await resolve(ym, source.items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE])
 
-    text = f"<b>{html.escape(source.title)}</b>\nТреков: {total}"
-    if total:
-        text += "\n\nНажмите на трек, чтобы скачать его."
-    else:
-        text += "\n\nЗдесь пока пусто."
+    info = " · ".join(x for x in (source.subtitle, tracks_word(total)) if x)
+    text = f"<b>{html.escape(source.title)}</b>\n{html.escape(info)}"
+    text += "\n\nНажмите на трек — пришлю MP3." if total else "\n\nЗдесь пока пусто."
 
     rows: list[list[InlineKeyboardButton]] = []
     for track in tracks:

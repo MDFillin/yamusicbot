@@ -68,18 +68,18 @@ class UploadError(RuntimeError):
 
 
 class YandexNotReady(RuntimeError):
-    """Бот работает, но подключиться к Яндекс Музыке не удалось; текст — объяснение для человека."""
+    """Подключиться к Яндекс Музыке не удалось; текст — объяснение для человека."""
 
 
 def explain_start_error(e: Exception) -> str:
     if isinstance(e, UnauthorizedError):
-        # Библиотека выдаёт это и на 401, и на 403: второй бывает из-за блокировки по IP, а не токена.
+        # Библиотека выдаёт это и на 401, и на 403: второй бывает из-за блокировки по IP, а не входа.
         return (
-            "Яндекс Музыка отклонила запрос: токен YANDEX_MUSIC_TOKEN неверный или устарел, "
-            "либо Яндекс не пускает запросы с IP этого сервера."
+            "Яндекс Музыка не приняла вход: он устарел или был отозван в настройках Яндекс ID "
+            "(реже — Яндекс не пускает запросы с сервера бота). Подключите аккаунт заново."
         )
     if isinstance(e, NetworkError):
-        return f"Сервер не может связаться с Яндекс Музыкой (api.music.yandex.net): {e}"
+        return f"Сервер бота не может связаться с Яндекс Музыкой (api.music.yandex.net): {e}"
     return f"Не удалось подключиться к Яндекс Музыке: {type(e).__name__}: {e}"
 
 
@@ -152,7 +152,7 @@ class YandexMusic:
         client = await ClientAsync(self._token).init()
         me = client.me
         if me is None or me.account is None or me.account.uid is None:
-            raise YandexMusicError("Не удалось получить аккаунт: проверьте YANDEX_MUSIC_TOKEN")
+            raise YandexMusicError("Яндекс не вернул данные аккаунта")
         self.uid = me.account.uid
         self.login = me.account.login
         self.has_plus = bool(me.plus and me.plus.has_plus)
@@ -162,6 +162,7 @@ class YandexMusic:
         """Подключается к Яндексу, если ещё не подключены. Неудача — YandexNotReady с объяснением.
 
         Бот при этом продолжает работать: так он может сказать в чате, что не так, вместо того чтобы молчать.
+        Повторная попытка — не чаще раза в START_RETRY_INTERVAL секунд.
         """
         if self.ready:
             return
@@ -178,7 +179,7 @@ class YandexMusic:
                 log.error("%s (%r)", self.start_error, e)
                 raise YandexNotReady(self.start_error) from e
             self.start_error = None
-            log.info("Яндекс Музыка подключена: %s (uid %s), Плюс: %s", self.login, self.uid, self.has_plus)
+            log.info("Яндекс Музыка подключена: uid %s, Плюс: %s", self.uid, self.has_plus)
 
     async def close(self) -> None:
         if self._session is not None:
@@ -302,7 +303,7 @@ class YandexMusic:
 
     async def download_tagged(self, track: Track) -> tuple[bytes, int]:
         """MP3 с тегами (исполнитель, название, альбом, год) и обложкой."""
-        data, bitrate = await self.download(track)
+        (data, bitrate), cover = await asyncio.gather(self.download(track), self.download_cover(track, "600x600"))
         album = track_album(track)
         data = tag_mp3(
             data,
@@ -310,7 +311,7 @@ class YandexMusic:
             artist=track_artists(track),
             album=album.title if album else None,
             year=album.year if album else None,
-            cover=await self.download_cover(track, "600x600"),
+            cover=cover,
         )
         return data, bitrate
 
@@ -335,7 +336,7 @@ class YandexMusic:
         Старый адрес сайта handlers/ugc-upload.jsx Яндекс убрал в 2026 году.
         """
         if self.uid is None:
-            raise UploadError("Бот ещё не подключился к Яндекс Музыке")
+            raise UploadError("Яндекс Музыка ещё не подключена")
         playlist_id = f"{self.uid}:{playlist_kind}"
         params = {
             "uid": str(self.uid),

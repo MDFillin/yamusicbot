@@ -19,8 +19,6 @@ class ConfigError(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     bot_token: str
-    ym_token: str
-    allowed_users: frozenset[int]
     data_dir: Path
     bot_api_url: str | None = None
     bot_api_local: bool = False
@@ -31,6 +29,9 @@ class Config:
     web_host: str = "0.0.0.0"
     web_port: int = 8080
     web_max_upload_mb: int = 300
+    # Прежняя однопользовательская настройка: токен YANDEX_MUSIC_TOKEN один раз привязывается к ALLOWED_USERS.
+    legacy_ym_token: str | None = None
+    legacy_users: frozenset[int] = frozenset()
 
     @property
     def max_tg_download(self) -> int:
@@ -44,15 +45,9 @@ class Config:
 
 
 def _parse_users(raw: str) -> frozenset[int]:
-    users = set()
-    for part in raw.replace(";", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if not part.lstrip("-").isdigit():
-            raise ConfigError(f"ALLOWED_USERS: «{part}» не похоже на Telegram ID (нужно число)")
-        users.add(int(part))
-    return frozenset(users)
+    """Telegram ID из прежней настройки ALLOWED_USERS (нужны только для переноса старого токена)."""
+    parts = (p.strip() for p in raw.replace(";", ",").split(","))
+    return frozenset(int(p) for p in parts if p.lstrip("-").isdigit())
 
 
 def _flag(raw: str | None) -> bool:
@@ -63,11 +58,8 @@ def load_config() -> Config:
     load_dotenv()
 
     bot_token = os.getenv("BOT_TOKEN", "").strip()
-    ym_token = os.getenv("YANDEX_MUSIC_TOKEN", "").strip()
     if not bot_token:
         raise ConfigError("Не задан BOT_TOKEN (токен бота от @BotFather)")
-    if not ym_token:
-        raise ConfigError("Не задан YANDEX_MUSIC_TOKEN (OAuth-токен Яндекс Музыки, см. README)")
 
     bitrate = int(os.getenv("MAX_BITRATE", "320"))
     if bitrate not in (64, 128, 192, 320):
@@ -88,8 +80,6 @@ def load_config() -> Config:
 
     return Config(
         bot_token=bot_token,
-        ym_token=ym_token,
-        allowed_users=_parse_users(os.getenv("ALLOWED_USERS", "")),
         data_dir=Path(os.getenv("DATA_DIR", "data")),
         bot_api_url=os.getenv("BOT_API_URL", "").strip() or None,
         bot_api_local=_flag(os.getenv("BOT_API_LOCAL")),
@@ -99,4 +89,6 @@ def load_config() -> Config:
         web_host=os.getenv("WEB_HOST", "0.0.0.0"),
         web_port=int(os.getenv("WEB_PORT", "8080")),
         web_max_upload_mb=int(os.getenv("WEB_MAX_UPLOAD_MB", "300")),
+        legacy_ym_token=os.getenv("YANDEX_MUSIC_TOKEN", "").strip() or None,
+        legacy_users=_parse_users(os.getenv("ALLOWED_USERS", "")),
     )

@@ -39,7 +39,6 @@ def test_webapp_url_must_be_https(monkeypatch):
     from bot.config import ConfigError, load_config
 
     monkeypatch.setenv("BOT_TOKEN", "1:x")
-    monkeypatch.setenv("YANDEX_MUSIC_TOKEN", "y0")
     monkeypatch.setenv("WEBAPP_URL", "http://insecure.example.com")
     with pytest.raises(ConfigError, match="https"):
         load_config()
@@ -52,7 +51,6 @@ def test_telegram_proxy(monkeypatch):
     from bot.main import build_bot
 
     monkeypatch.setenv("BOT_TOKEN", "1:x")
-    monkeypatch.setenv("YANDEX_MUSIC_TOKEN", "y0")
     monkeypatch.setenv("TELEGRAM_PROXY", "1.2.3.4:1080")
     with pytest.raises(ConfigError, match="socks5"):
         load_config()
@@ -68,7 +66,6 @@ def test_fxtunnel_domain_sets_webapp_url(monkeypatch):
     from bot.config import ConfigError, load_config
 
     monkeypatch.setenv("BOT_TOKEN", "1:x")
-    monkeypatch.setenv("YANDEX_MUSIC_TOKEN", "y0")
     monkeypatch.delenv("WEBAPP_URL", raising=False)
     monkeypatch.setenv("FXTUNNEL_DOMAIN", "BobikMusic228")
     assert load_config().webapp_url == "https://bobikmusic228.fxtun.ru"
@@ -80,3 +77,23 @@ def test_fxtunnel_domain_sets_webapp_url(monkeypatch):
         monkeypatch.setenv("FXTUNNEL_DOMAIN", bad)
         with pytest.raises(ConfigError, match="FXTUNNEL_DOMAIN"):
             load_config()
+
+
+def test_only_bot_token_is_required(monkeypatch):
+    from bot.config import ConfigError, load_config
+
+    for name in ("YANDEX_MUSIC_TOKEN", "ALLOWED_USERS", "WEBAPP_URL", "FXTUNNEL_DOMAIN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("BOT_TOKEN", "1:x")
+    config = load_config()
+    assert config.legacy_ym_token is None and config.legacy_users == frozenset()
+
+    monkeypatch.setenv("YANDEX_MUSIC_TOKEN", " y0_old ")
+    monkeypatch.setenv("ALLOWED_USERS", "123, 456; мусор,")
+    config = load_config()
+    assert config.legacy_ym_token == "y0_old" and config.legacy_users == frozenset({123, 456}), \
+        "старые настройки не мешают запуску и нужны только для переноса токена"
+
+    monkeypatch.setenv("BOT_TOKEN", "")
+    with pytest.raises(ConfigError, match="BOT_TOKEN"):
+        load_config()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import sys
 from typing import Any
 
@@ -10,21 +11,22 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, ErrorEvent, MenuButtonDefault, MenuButtonWebApp, User, WebAppInfo
 from aiogram.utils.token import TokenValidationError
 from aiohttp import web
+from yandex_music.exceptions import UnauthorizedError
 
+from bot.accounts import Accounts
 from bot.audio import ffmpeg_available
 from bot.config import Config, ConfigError, load_config
 from bot.handlers import build_router
 from bot.handlers.upload import UploadQueue
-from bot.middlewares import AccessMiddleware, YandexReadyMiddleware
+from bot.middlewares import AccountMiddleware
 from bot.sender import TrackSender
 from bot.storage import Storage
 from bot.web.app import create_app
-from bot.ym import YandexMusic, YandexNotReady
 
 log = logging.getLogger("bot")
 
@@ -34,9 +36,23 @@ COMMANDS = [
     BotCommand(command="playlists", description="📃 Мои плейлисты"),
     BotCommand(command="target", description="📌 Куда загружать мои файлы"),
     BotCommand(command="newplaylist", description="➕ Создать плейлист"),
+    BotCommand(command="menu", description="🏠 Главное меню"),
+    BotCommand(command="login", description="🔑 Подключить Яндекс Музыку"),
+    BotCommand(command="logout", description="🚪 Отключить аккаунт"),
     BotCommand(command="help", description="❓ Справка"),
     BotCommand(command="cancel", description="Отменить действие"),
 ]
+
+# Что видит человек, впервые открыв бота (ставим, только если владелец не задал своё в @BotFather).
+DESCRIPTION = (
+    "🎧 Бот для Яндекс Музыки\n\n"
+    "• Медиатека в удобном приложении: плейлисты, «Мне нравится», поиск и плеер\n"
+    "• Скачивание треков, альбомов и плейлистов в MP3\n"
+    "• Загрузка своих аудиофайлов прямо в Яндекс Музыку\n\n"
+    "Нажмите «Старт» и подключите свой аккаунт Яндекса."
+)
+SHORT_DESCRIPTION = "Слушайте, скачивайте и загружайте музыку в свою Яндекс Музыку"
+REVOKED = "⚠️ Яндекс Музыка не приняла ваш вход — возможно, он устарел или отозван. Подключите аккаунт заново: /login"
 
 
 def build_bot(config: Config) -> Bot:
@@ -49,33 +65,40 @@ def build_bot(config: Config) -> Bot:
     return Bot(config.bot_token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 
-def build_dependencies(config: Config, bot: Bot, ym: YandexMusic, store: Storage) -> dict[str, Any]:
-    """Объекты, которые aiogram подставляет в обработчики по имени аргумента."""
+def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Storage) -> dict[str, Any]:
+    """Объекты, которые aiogram подставляет в обработчики по имени аргумента (ym — AccountMiddleware)."""
     return {
         "config": config,
-        "ym": ym,
+        "accounts": accounts,
         "store": store,
-        "sender": TrackSender(bot, ym, store, config),
+        "sender": TrackSender(bot, store, config),
         "uploads": UploadQueue(),
     }
 
 
-def build_dispatcher(config: Config, bot: Bot, ym: YandexMusic, store: Storage) -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage(), **build_dependencies(config, bot, ym, store))
+def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storage) -> Dispatcher:
+    dp = Dispatcher(storage=MemoryStorage(), **build_dependencies(config, bot, accounts, store))
 
-    # Сначала доступ (чужим — только «бот приватный»), потом проверка связи с Яндексом.
-    access = AccessMiddleware(config.allowed_users)
-    yandex = YandexReadyMiddleware()
+    # У каждого свой аккаунт Яндекса: middleware подставляет его клиент или предлагает войти.
+    account = AccountMiddleware()
     for observer in (dp.message, dp.callback_query):
-        observer.outer_middleware(access)
-        observer.outer_middleware(yandex)
+        observer.middleware(account)
     dp.include_router(build_router())
 
     @dp.errors()
     async def on_error(event: ErrorEvent) -> None:
-        log.exception("Ошибка при обработке апдейта", exc_info=event.exception)
-        text = f"⚠️ Ошибка: {html.escape(type(event.exception).__name__)}: {html.escape(str(event.exception))[:500]}"
         update = event.update
+        source = update.message or update.callback_query
+        user = source.from_user if source else None
+        if isinstance(event.exception, UnauthorizedError):
+            # Вход отозвали уже после подключения: забываем клиент, при следующем запросе бот всё объяснит.
+            if user is not None:
+                await dp["accounts"].reset(user.id)
+            text = REVOKED
+        else:
+            log.exception("Ошибка при обработке апдейта", exc_info=event.exception)
+            name = html.escape(type(event.exception).__name__)
+            text = f"⚠️ Ошибка: {name}: {html.escape(str(event.exception))[:500]}"
         try:
             if update.message:
                 await update.message.answer(text)
@@ -89,8 +112,9 @@ def build_dispatcher(config: Config, bot: Bot, ym: YandexMusic, store: Storage) 
     return dp
 
 
-async def start_web(config: Config, bot: Bot, ym: YandexMusic, store: Storage, sender: TrackSender) -> web.AppRunner:
-    runner = web.AppRunner(create_app(config, bot, ym, store, sender), access_log=None)
+async def start_web(config: Config, bot: Bot, accounts: Accounts, store: Storage,
+                    sender: TrackSender) -> web.AppRunner:
+    runner = web.AppRunner(create_app(config, bot, accounts, store, sender), access_log=None)
     await runner.setup()
     await web.TCPSite(runner, config.web_host, config.web_port).start()
     log.info("Мини-приложение слушает http://%s:%s (публичный адрес: %s)",
@@ -104,6 +128,16 @@ async def setup_menu_button(bot: Bot, config: Config) -> None:
         await bot.set_chat_menu_button(menu_button=button)
     else:
         await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+
+
+async def setup_description(bot: Bot) -> None:
+    try:
+        if not (await bot.get_my_description()).description:
+            await bot.set_my_description(DESCRIPTION)
+        if not (await bot.get_my_short_description()).short_description:
+            await bot.set_my_short_description(SHORT_DESCRIPTION)
+    except TelegramAPIError as e:
+        log.warning("Не удалось задать описание бота: %s", e)
 
 
 async def check_telegram(bot: Bot) -> User:
@@ -132,8 +166,7 @@ async def main() -> None:
         config = load_config()
     except ConfigError as e:
         sys.exit(f"Ошибка настройки: {e}")
-    if not config.allowed_users:
-        log.warning("ALLOWED_USERS пуст — бот никого не пустит. Напишите боту, он покажет ваш ID.")
+    os.umask(0o077)  # база с токенами пользователей — только для владельца сервера
     if not ffmpeg_available():
         log.warning("ffmpeg не найден: не-MP3 файлы будут загружаться без конвертации")
 
@@ -145,21 +178,23 @@ async def main() -> None:
     me = await check_telegram(bot)
     log.info("Бот @%s запущен — пишите ему в Telegram: https://t.me/%s", me.username, me.username)
 
-    # Яндекс не обязателен для старта: если он недоступен, бот объяснит это в чате и попробует снова позже.
-    ym = YandexMusic(config.ym_token, max_bitrate=config.max_bitrate)
-    try:
-        await ym.ensure_started()
-    except YandexNotReady:
-        log.error("Бот работает без Яндекс Музыки: в чате подскажет, что делать, и повторит попытку позже.")
+    # Аккаунты Яндекса у каждого свои: человек подключает его сам (/login или в приложении).
+    store = Storage(config.data_dir / "bot.db")
+    accounts = Accounts(store, max_bitrate=config.max_bitrate)
+    if imported := accounts.import_legacy_token(config.legacy_ym_token, config.legacy_users):
+        log.info("Токен из YANDEX_MUSIC_TOKEN привязан к пользователям %s. Переменные YANDEX_MUSIC_TOKEN и "
+                 "ALLOWED_USERS больше не нужны — их можно убрать из .env.", ", ".join(map(str, imported)))
+    log.info("Подключённых аккаунтов Яндекса: %s", store.account_count())
 
-    store = Storage(config.data_dir / "storage.json")
-    dp = build_dispatcher(config, bot, ym, store)
-    runner = await start_web(config, bot, ym, store, dp["sender"])
+    dp = build_dispatcher(config, bot, accounts, store)
+    runner = await start_web(config, bot, accounts, store, dp["sender"])
     try:
         await bot.set_my_commands(COMMANDS)
         await setup_menu_button(bot, config)
+        await setup_description(bot)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await runner.cleanup()
-        await ym.close()
+        await accounts.close()
+        store.close()
         await bot.session.close()

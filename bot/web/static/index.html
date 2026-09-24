@@ -4,21 +4,23 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
   <title>Моя музыка</title>
-  <script src="https://telegram.org/js/telegram-web-app.js?59"></script>
+  <link rel="preconnect" href="https://avatars.yandex.net" crossorigin>
   <link rel="stylesheet" href="/static/style.css?v=__V__">
+  <script src="https://telegram.org/js/telegram-web-app.js?59" defer></script>
+  <script src="/static/app.js?v=__V__" defer></script>
 </head>
 <body>
-  <main id="view"></main>
+  <main id="view"><div class="boot"><div class="spinner"></div></div></main>
 
   <div id="player" hidden>
     <img class="cover" alt="">
     <div class="meta"><div class="title"></div><div class="sub"></div></div>
     <button class="icon-btn" data-act="toggle" aria-label="Пауза"></button>
     <button class="icon-btn" data-act="next" aria-label="Следующий"></button>
-    <div class="bar"></div>
+    <div class="bar"><div></div></div>
   </div>
 
-  <nav id="tabs">
+  <nav id="tabs" hidden>
     <button data-tab="library"></button>
     <button data-tab="search"></button>
     <button data-tab="upload"></button>
@@ -26,9 +28,7 @@
 
   <div id="backdrop"></div>
   <div id="sheet" role="dialog"></div>
-  <div id="toast"></div>
+  <div id="toast" role="status"></div>
   <audio id="audio" preload="none"></audio>
-
-  <script src="/static/app.js?v=__V__"></script>
 </body>
 </html>

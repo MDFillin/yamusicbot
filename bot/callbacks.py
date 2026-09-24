@@ -44,3 +44,12 @@ class SearchCb(CallbackData, prefix="s"):
 
 class NoopCb(CallbackData, prefix="n"):
     pass
+
+
+class MenuCb(CallbackData, prefix="m"):
+    """Меню и аккаунт.
+
+    action: login | login_cancel | logout | logout_ok | logout_no | account | likes | playlists | target | help
+    """
+
+    action: str

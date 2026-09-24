@@ -33,7 +33,7 @@ async def on_download(
         return
     await call.answer(f"⏳ Скачиваю «{track_title(track)}»…")
     try:
-        await sender.send(call.message.chat.id, track)
+        await sender.send(call.message.chat.id, track, ym)
     except Exception as e:
         log.exception("Не удалось отправить трек %s", track.id)
         title = html.escape(track_title(track))
@@ -93,7 +93,7 @@ async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexM
         for i, track in enumerate(tracks, 1):
             await update(f"⏳ {title}\nСкачиваю {i}/{total}: {html.escape(track_title(track))}")
             try:
-                await sender.send(chat_id, track)
+                await sender.send(chat_id, track, ym)
                 sent += 1
             except asyncio.CancelledError:
                 raise

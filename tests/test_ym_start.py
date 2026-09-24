@@ -8,8 +8,8 @@ from bot.ym import YandexMusic, YandexNotReady, explain_start_error
 
 
 def test_explain_start_error():
-    assert "YANDEX_MUSIC_TOKEN" in explain_start_error(UnauthorizedError("Unknown HTTPError"))
-    assert "IP этого сервера" in explain_start_error(UnauthorizedError("x"))
+    assert "Подключите аккаунт заново" in explain_start_error(UnauthorizedError("Unknown HTTPError"))
+    assert "сервера бота" in explain_start_error(UnauthorizedError("x"))
     assert "api.music.yandex.net" in explain_start_error(NetworkError("timeout"))
     assert "ValueError" in explain_start_error(ValueError("boom"))
 
@@ -23,7 +23,7 @@ async def test_ensure_started_retries_with_pause(monkeypatch):
         raise UnauthorizedError("Unknown HTTPError")
 
     monkeypatch.setattr(ym, "start", failing_start)
-    with pytest.raises(YandexNotReady, match="YANDEX_MUSIC_TOKEN"):
+    with pytest.raises(YandexNotReady, match="заново"):
         await ym.ensure_started()
     with pytest.raises(YandexNotReady):
         await ym.ensure_started()

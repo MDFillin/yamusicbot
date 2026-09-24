@@ -1,4 +1,4 @@
-"""Пускаем к боту только владельцев (ALLOWED_USERS): бот управляет вашим аккаунтом Яндекс Музыки."""
+"""Каждый пользователь работает со своим аккаунтом Яндекс Музыки: подставляем его клиент в обработчики."""
 
 from __future__ import annotations
 
@@ -8,54 +8,36 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.dispatcher.flags import get_flag
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
 
-from bot.ym import YandexMusic, YandexNotReady
+from bot.accounts import Accounts
+from bot.callbacks import MenuCb
+from bot.ym import YandexNotReady
 
 log = logging.getLogger(__name__)
 
-
-class AccessMiddleware(BaseMiddleware):
-    def __init__(self, allowed_users: frozenset[int]) -> None:
-        self._allowed = allowed_users
-
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: dict[str, Any],
-    ) -> Any:
-        user = getattr(event, "from_user", None)
-        if user is not None and user.id in self._allowed:
-            return await handler(event, data)
-
-        user_id = user.id if user else "?"
-        log.warning("Отказано в доступе пользователю %s (@%s)", user_id, getattr(user, "username", None))
-        text = (
-            "⛔ Этот бот приватный.\n"
-            f"Ваш Telegram ID: <code>{user_id}</code>\n"
-            "Если это ваш бот — добавьте ID в ALLOWED_USERS и перезапустите его."
-        )
-        if isinstance(event, Message):
-            await event.answer(text)
-        elif isinstance(event, CallbackQuery):
-            await event.answer("⛔ Нет доступа", show_alert=True)
-        return None
-
-
-YANDEX_HELP = (
-    "⚠️ Бот запущен, но не может подключиться к Яндекс Музыке.\n\n"
-    "{reason}\n\n"
-    "<b>Что сделать на сервере</b> (в папке бота):\n"
-    "1. Получить новый токен: <code>docker compose run --rm bot python -m bot.get_token</code>\n"
-    "2. Вписать его в .env: <code>nano .env</code> → строка YANDEX_MUSIC_TOKEN=…\n"
-    "3. Применить: <code>docker compose up -d --force-recreate</code>\n\n"
-    "Если токен точно свежий — Яндекс может не пускать запросы с IP этого сервера; помогает сервер в России."
+LOGIN_NEEDED = (
+    "🔑 <b>Сначала подключите Яндекс Музыку</b>\n\n"
+    "Бот работает с вашим собственным аккаунтом Яндекса. Вход — через страницу Яндекса, "
+    "пароль бот не видит. Это займёт минуту."
 )
+YANDEX_PROBLEM = "⚠️ <b>Не получается подключиться к вашей Яндекс Музыке</b>\n\n{reason}"
 
 
-class YandexReadyMiddleware(BaseMiddleware):
-    """Если Яндекс Музыка не подключилась, объясняет это в чате вместо молчания."""
+def login_button(text: str = "🔑 Подключить Яндекс Музыку") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data=MenuCb(action="login").pack()),
+    ]])
+
+
+class AccountMiddleware(BaseMiddleware):
+    """Кладёт в data["ym"] клиент Яндекса пользователя.
+
+    Внутренняя middleware: к моменту вызова уже известно, какой обработчик сработал. Обработчикам с флагом
+    public (старт, справка, вход) аккаунт не обязателен — им приходит ym=None и ym_error с причиной;
+    остальным без подключённого аккаунта бот предлагает войти.
+    """
 
     async def __call__(
         self,
@@ -63,13 +45,31 @@ class YandexReadyMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        ym: YandexMusic = data["ym"]
-        try:
-            await ym.ensure_started()
-        except YandexNotReady as e:
-            if isinstance(event, Message):
-                await event.answer(YANDEX_HELP.format(reason=html.escape(str(e))))
-            elif isinstance(event, CallbackQuery):
-                await event.answer(f"⚠️ Нет связи с Яндекс Музыкой: {e}"[:190], show_alert=True)
+        user = data.get("event_from_user")
+        accounts: Accounts = data["accounts"]
+        public = bool(get_flag(data, "public"))
+        ym, error = None, None
+        if user is not None:
+            try:
+                ym = await accounts.get(user.id)
+            except YandexNotReady as e:
+                error = str(e)
+
+        if ym is None and not public:
+            if error:
+                text = YANDEX_PROBLEM.format(reason=html.escape(error))
+                await _tell(event, text, login_button("🔑 Подключить заново"), alert=f"⚠️ {error}")
+            else:
+                await _tell(event, LOGIN_NEEDED, login_button(), alert="🔑 Сначала подключите Яндекс Музыку: /login")
             return None
+
+        data["ym"] = ym
+        data["ym_error"] = error
         return await handler(event, data)
+
+
+async def _tell(event: TelegramObject, text: str, markup: InlineKeyboardMarkup, alert: str) -> None:
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=markup)
+    elif isinstance(event, CallbackQuery):
+        await event.answer(alert[:190], show_alert=True)

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import gzip
 import hashlib
 import logging
 import time
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,8 +18,9 @@ from aiogram import Bot
 from aiogram.utils.web_app import WebAppUser
 from aiohttp import web
 from yandex_music import Album, Artist, Playlist, Track
-from yandex_music.exceptions import YandexMusicError
+from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
+from bot.accounts import Accounts, LoginError, LoginSession
 from bot.audio import ConversionError, ffmpeg_available, prepare_for_upload
 from bot.config import Config
 from bot.handlers.download import start_bulk_download
@@ -43,54 +47,94 @@ SOURCE_TTL = 120  # сек: страницы одного списка («пок
 LINK_TTL = 600  # сек: прямые ссылки Яндекса на MP3 живут недолго
 PAGE_LIMIT = 100
 SOURCES = {"likes", "pl", "alb", "art"}
+# Эти адреса нужны и тем, кто ещё не подключил Яндекс Музыку.
+PUBLIC_API = {"/api/me", "/api/login", "/api/logout"}
+REVOKED = "Яндекс Музыка не приняла ваш вход — возможно, он устарел или отозван. Подключите аккаунт заново."
+COMPRESS_TYPES = {"application/json", "text/html", "text/css", "application/javascript", "image/svg+xml"}
+
+
+class TTLCache:
+    """Небольшой кэш с временем жизни и ограничением размера (у каждого пользователя свои ключи)."""
+
+    def __init__(self, ttl: float, max_size: int) -> None:
+        self.ttl = ttl
+        self.max_size = max_size
+        self._data: dict[Hashable, tuple[float, Any]] = {}
+
+    def get(self, key: Hashable) -> Any | None:
+        item = self._data.get(key)
+        if item is None or time.monotonic() - item[0] >= self.ttl:
+            return None
+        return item[1]
+
+    def set(self, key: Hashable, value: Any) -> None:
+        self._data.pop(key, None)
+        self._data[key] = (time.monotonic(), value)
+        if len(self._data) > self.max_size:
+            now = time.monotonic()
+            for k in [k for k, (t, _) in self._data.items() if now - t >= self.ttl]:
+                del self._data[k]
+            while len(self._data) > self.max_size:
+                del self._data[next(iter(self._data))]  # самый старый
+
+    def pop(self, key: Hashable) -> None:
+        self._data.pop(key, None)
+
+    def drop(self, predicate: Callable[[Hashable], bool]) -> None:
+        for k in [k for k in self._data if predicate(k)]:
+            del self._data[k]
 
 
 @dataclass
 class WebContext:
     config: Config
     bot: Bot
-    ym: YandexMusic
+    accounts: Accounts
     store: Storage
     sender: TrackSender
     signer: MediaSigner
+    static: StaticFiles
     http: aiohttp.ClientSession | None = None
-    sources: dict[tuple[str, str], tuple[float, TrackSource]] = field(default_factory=dict)
-    links: dict[str, tuple[float, str]] = field(default_factory=dict)
+    sources: TTLCache = field(default_factory=lambda: TTLCache(SOURCE_TTL, 300))
+    links: TTLCache = field(default_factory=lambda: TTLCache(LINK_TTL, 2000))
 
-    async def source(self, src: str, ref: str, fresh: bool) -> TrackSource:
-        key = (src, ref)
-        cached = self.sources.get(key)
-        if cached and not fresh and time.monotonic() - cached[0] < SOURCE_TTL:
-            return cached[1]
-        source = await load_source(self.ym, src, ref)
-        self.sources[key] = (time.monotonic(), source)
+    async def source(self, user_id: int, ym: YandexMusic, src: str, ref: str, fresh: bool) -> TrackSource:
+        key = (user_id, src, ref)
+        cached = None if fresh else self.sources.get(key)
+        if cached is not None:
+            return cached
+        source = await load_source(ym, src, ref)
+        self.sources.set(key, source)
         return source
 
-    def invalidate(self) -> None:
-        self.sources.clear()
+    def invalidate(self, user_id: int) -> None:
+        self.sources.drop(lambda key: key[0] == user_id)
 
-    async def track(self, track_id: str) -> Track:
-        track = await self.ym.get_track(track_id)
-        if track is None:
-            raise web.HTTPNotFound(text="Трек не найден")
-        return track
-
-    async def direct_link(self, track_id: str, fresh: bool = False) -> str:
-        cached = self.links.get(track_id)
-        if cached and not fresh and time.monotonic() - cached[0] < LINK_TTL:
-            return cached[1]
-        url = await self.ym.direct_link(await self.track(track_id))
-        self.links[track_id] = (time.monotonic(), url)
+    async def direct_link(self, user_id: int, ym: YandexMusic, track_id: str, fresh: bool = False) -> str:
+        key = (user_id, track_id)  # ссылка зависит от подписки аккаунта — не делимся ей между людьми
+        cached = None if fresh else self.links.get(key)
+        if cached is not None:
+            return cached
+        url = await ym.direct_link(await get_track(ym, track_id))
+        self.links.set(key, url)
         return url
+
+
+async def get_track(ym: YandexMusic, track_id: str) -> Track:
+    track = await ym.get_track(track_id)
+    if track is None:
+        raise web.HTTPNotFound(text="Трек не найден")
+    return track
 
 
 CTX = web.AppKey("ctx", WebContext)
 USER = web.RequestKey("user", WebAppUser)
+YM = web.RequestKey("ym", YandexMusic)
 
 
 # ---------- сериализация ----------
 
-def track_json(t: Track, signer: MediaSigner, index: int | None = None) -> dict[str, Any]:
+def track_json(t: Track, signer: MediaSigner, user_id: int, index: int | None = None) -> dict[str, Any]:
     """Трек для интерфейса; ссылки подписаны заранее, чтобы play() вызывался прямо в обработчике нажатия (iOS)."""
     track_id = str(t.id)
     album = track_album(t)
@@ -105,8 +149,8 @@ def track_json(t: Track, signer: MediaSigner, index: int | None = None) -> dict[
         "duration": (t.duration_ms or 0) // 1000,
         "cover": cover_url(t.cover_uri),
         "available": t.available is not False,
-        "stream": f"/media/stream/{track_id}?{signer.sign('stream', track_id)}",
-        "download": f"/media/download/{track_id}?{signer.sign('download', track_id)}",
+        "stream": f"/media/stream/{track_id}?{signer.sign('stream', user_id, track_id)}",
+        "download": f"/media/download/{track_id}?{signer.sign('download', user_id, track_id)}",
         "filename": tagged_filename(t),
     }
     if index is not None:
@@ -139,44 +183,89 @@ def artist_json(a: Artist) -> dict[str, Any]:
     return {"id": str(a.id), "name": a.name, "cover": cover_url(a.cover.uri if a.cover else None)}
 
 
+def login_json(session: LoginSession | None, connected: bool) -> dict[str, Any]:
+    if session is None:
+        return {"status": "none", "connected": connected}
+    return {
+        "status": session.status,
+        "code": session.code,
+        "url": session.url,
+        "expires_in": session.expires_in,
+        "error": session.error,
+        "connected": connected,
+    }
+
+
 # ---------- middleware ----------
+
+@web.middleware
+async def compress_middleware(request: web.Request, handler):
+    """gzip для JSON и текста: через туннель страница и списки грузятся заметно быстрее."""
+    resp = await handler(request)
+    if (
+        isinstance(resp, web.Response)
+        and resp.content_type in COMPRESS_TYPES
+        and isinstance(resp.body, bytes)
+        and len(resp.body) > 1024
+        and "Content-Encoding" not in resp.headers
+    ):
+        resp.enable_compression()
+    return resp
+
+
+def _error(message: str, status: int, code: str | None = None) -> web.Response:
+    body = {"error": message}
+    if code:
+        body["code"] = code
+    return web.json_response(body, status=status)
+
 
 @web.middleware
 async def errors_middleware(request: web.Request, handler):
     try:
         return await handler(request)
     except AuthError as e:
-        return web.json_response({"error": str(e)}, status=e.status)
+        return _error(str(e), e.status, e.code)
     except YandexNotReady as e:
-        return web.json_response({"error": f"Бот не может подключиться к Яндекс Музыке. {e}"}, status=503)
+        return _error(str(e), 503, "yandex_unavailable")
+    except LoginError as e:
+        return _error(str(e), 422)
     except web.HTTPException as e:
         if e.status >= 400 and request.path.startswith("/api/"):
-            return web.json_response({"error": e.text or e.reason}, status=e.status)
+            return _error(e.text or e.reason, e.status)
         raise
     except (SourceNotFoundError, TrackUnavailableError) as e:
-        return web.json_response({"error": str(e)}, status=404)
+        return _error(str(e), 404)
     except (UploadError, ConversionError, TrackTooLargeError) as e:
-        return web.json_response({"error": str(e)}, status=422)
+        return _error(str(e), 422)
     except ValueError as e:
         log.info("Некорректный запрос %s: %s", request.path, e)
-        return web.json_response({"error": "Некорректный запрос"}, status=400)
+        return _error("Некорректный запрос", 400)
+    except UnauthorizedError:
+        # Вход отозвали уже после подключения: забываем клиент, при следующем запросе объясним подробно.
+        if (user := request.get(USER)) is not None:
+            await request.app[CTX].accounts.reset(user.id)
+        return _error(REVOKED, 503, "yandex_unavailable")
     except YandexMusicError as e:
         log.warning("Ошибка Яндекс Музыки на %s: %r", request.path, e)
-        return web.json_response({"error": f"Яндекс Музыка: {e}"}, status=502)
+        return _error(f"Яндекс Музыка: {e}", 502)
     except Exception as e:
         log.exception("Ошибка на %s", request.path)
-        return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=500)
+        return _error(f"{type(e).__name__}: {e}", 500)
 
 
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
-    ctx = request.app[CTX]
+    """Кто открыл приложение (подпись Telegram) и его аккаунт Яндекса."""
     if request.path.startswith("/api/"):
-        request[USER] = user_from_init_data(
-            ctx.config.bot_token, request.headers.get("X-Telegram-Init-Data", ""), ctx.config.allowed_users,
-        )
-    if request.path.startswith(("/api/", "/media/")):
-        await ctx.ym.ensure_started()
+        ctx = request.app[CTX]
+        user = user_from_init_data(ctx.config.bot_token, request.headers.get("X-Telegram-Init-Data", ""))
+        request[USER] = user
+        if request.path not in PUBLIC_API:
+            ym = await ctx.accounts.get(user.id)
+            if ym is None:
+                raise AuthError(401, "Сначала подключите Яндекс Музыку", code="login_required")
+            request[YM] = ym
     return await handler(request)
 
 
@@ -213,20 +302,53 @@ def _title(body: dict[str, Any]) -> str:
 @routes.get("/api/me")
 async def api_me(request: web.Request) -> web.Response:
     ctx = _ctx(request)
-    return web.json_response({
-        "login": ctx.ym.login,
-        "has_plus": ctx.ym.has_plus,
-        "upload_target": ctx.store.get_upload_target(_user_id(request)),
+    user_id = _user_id(request)
+    info: dict[str, Any] = {
+        "connected": False,
         "can_convert": ffmpeg_available(),
         "max_upload_mb": ctx.config.web_max_upload_mb,
-    })
+    }
+    ym = await ctx.accounts.get(user_id)  # не подключиться — 503 с объяснением
+    if ym is not None:
+        info.update(connected=True, login=ym.login, has_plus=ym.has_plus,
+                    upload_target=ctx.store.get_upload_target(user_id))
+    return web.json_response(info)
+
+
+@routes.post("/api/login")
+async def api_login_start(request: web.Request) -> web.Response:
+    ctx = _ctx(request)
+    session = await ctx.accounts.start_login(_user_id(request))
+    return web.json_response(login_json(session, ctx.accounts.is_connected(_user_id(request))))
+
+
+@routes.get("/api/login")
+async def api_login_status(request: web.Request) -> web.Response:
+    ctx = _ctx(request)
+    user_id = _user_id(request)
+    return web.json_response(login_json(ctx.accounts.login_session(user_id), ctx.accounts.is_connected(user_id)))
+
+
+@routes.delete("/api/login")
+async def api_login_cancel(request: web.Request) -> web.Response:
+    _ctx(request).accounts.cancel_login(_user_id(request))
+    return web.json_response({"ok": True})
+
+
+@routes.post("/api/logout")
+async def api_logout(request: web.Request) -> web.Response:
+    ctx = _ctx(request)
+    user_id = _user_id(request)
+    await ctx.accounts.logout(user_id)
+    ctx.invalidate(user_id)
+    ctx.links.drop(lambda key: key[0] == user_id)
+    return web.json_response({"ok": True})
 
 
 @routes.get("/api/library")
 async def api_library(request: web.Request) -> web.Response:
-    ym = _ctx(request).ym
-    playlists = await ym.get_my_playlists()
-    liked = await ym.get_liked_track_ids()
+    ym = request[YM]
+    playlists, liked = await asyncio.gather(ym.get_my_playlists(), ym.get_liked_track_ids())
     return web.json_response({
         "liked_ids": [i.split(":")[0] for i in liked],
         "playlists": [playlist_json(p) for p in playlists],
@@ -236,14 +358,16 @@ async def api_library(request: web.Request) -> web.Response:
 @routes.get("/api/source/{src}")
 async def api_source(request: web.Request) -> web.Response:
     ctx = _ctx(request)
+    ym = request[YM]
+    user_id = _user_id(request)
     src = request.match_info["src"]
     if src not in SOURCES:
         raise web.HTTPNotFound(text="Неизвестный список")
     ref = request.query.get("ref", "")
     offset = max(int(request.query.get("offset", 0)), 0)
     limit = min(max(int(request.query.get("limit", 50)), 1), PAGE_LIMIT)
-    source = await ctx.source(src, ref, fresh=offset == 0)
-    tracks = await resolve(ctx.ym, source.items[offset:offset + limit])
+    source = await ctx.source(user_id, ym, src, ref, fresh=offset == 0)
+    tracks = await resolve(ym, source.items[offset:offset + limit])
     return web.json_response({
         "src": src,
         "ref": source.ref,
@@ -253,7 +377,7 @@ async def api_source(request: web.Request) -> web.Response:
         "total": len(source.items),
         "own_kind": source.own_playlist.kind if source.own_playlist is not None else None,
         "offset": offset,
-        "tracks": [track_json(t, ctx.signer, offset + i) for i, t in enumerate(tracks)],
+        "tracks": [track_json(t, ctx.signer, user_id, offset + i) for i, t in enumerate(tracks)],
     })
 
 
@@ -266,11 +390,11 @@ async def api_search(request: web.Request) -> web.Response:
     if not query:
         return web.json_response({"type": type_, "items": []})
     ctx = _ctx(request)
-    result = await ctx.ym.search(query, type_)
+    result = await request[YM].search(query, type_)
     items: list[dict[str, Any]] = []
     if result:
         if type_ == "track" and result.tracks:
-            items = [track_json(t, ctx.signer) for t in result.tracks.results]
+            items = [track_json(t, ctx.signer, _user_id(request)) for t in result.tracks.results]
         elif type_ == "album" and result.albums:
             items = [album_json(a) for a in result.albums.results]
         elif type_ == "artist" and result.artists:
@@ -283,61 +407,58 @@ async def api_search(request: web.Request) -> web.Response:
 
 @routes.post(r"/api/likes/{track_id:[\w.\-]+}")
 async def api_like(request: web.Request) -> web.Response:
-    ctx = _ctx(request)
-    await ctx.ym.like(request.match_info["track_id"])
-    ctx.sources.pop(("likes", ""), None)
+    await request[YM].like(request.match_info["track_id"])
+    _ctx(request).sources.pop((_user_id(request), "likes", ""))
     return web.json_response({"liked": True})
 
 
 @routes.delete(r"/api/likes/{track_id:[\w.\-]+}")
 async def api_unlike(request: web.Request) -> web.Response:
-    ctx = _ctx(request)
-    await ctx.ym.unlike(request.match_info["track_id"])
-    ctx.sources.pop(("likes", ""), None)
+    await request[YM].unlike(request.match_info["track_id"])
+    _ctx(request).sources.pop((_user_id(request), "likes", ""))
     return web.json_response({"liked": False})
 
 
 @routes.post("/api/playlists")
 async def api_create_playlist(request: web.Request) -> web.Response:
-    playlist = await _ctx(request).ym.create_playlist(_title(await _json_body(request)))
+    playlist = await request[YM].create_playlist(_title(await _json_body(request)))
     return web.json_response(playlist_json(playlist))
 
 
 @routes.patch(r"/api/playlists/{kind:\d+}")
 async def api_rename_playlist(request: web.Request) -> web.Response:
-    ctx = _ctx(request)
-    playlist = await ctx.ym.rename_playlist(int(request.match_info["kind"]), _title(await _json_body(request)))
-    ctx.invalidate()
+    playlist = await request[YM].rename_playlist(int(request.match_info["kind"]), _title(await _json_body(request)))
+    _ctx(request).invalidate(_user_id(request))
     return web.json_response(playlist_json(playlist) if playlist else {"ok": True})
 
 
 @routes.delete(r"/api/playlists/{kind:\d+}")
 async def api_delete_playlist(request: web.Request) -> web.Response:
     ctx = _ctx(request)
+    user_id = _user_id(request)
     kind = int(request.match_info["kind"])
-    await ctx.ym.delete_playlist(kind)
-    if ctx.store.get_upload_target(_user_id(request)) == kind:
-        ctx.store.set_upload_target(_user_id(request), None)
-    ctx.invalidate()
+    await request[YM].delete_playlist(kind)
+    if ctx.store.get_upload_target(user_id) == kind:
+        ctx.store.set_upload_target(user_id, None)
+    ctx.invalidate(user_id)
     return web.json_response({"ok": True})
 
 
 @routes.post(r"/api/playlists/{kind:\d+}/tracks")
 async def api_add_track(request: web.Request) -> web.Response:
-    ctx = _ctx(request)
+    ym = request[YM]
     body = await _json_body(request)
-    track = await ctx.track(str(body.get("track_id", "")))
-    playlist = await ctx.ym.add_to_playlist(int(request.match_info["kind"]), track)
-    ctx.invalidate()
+    track = await get_track(ym, str(body.get("track_id", "")))
+    playlist = await ym.add_to_playlist(int(request.match_info["kind"]), track)
+    _ctx(request).invalidate(_user_id(request))
     return web.json_response({"ok": True, "title": playlist.title if playlist else None})
 
 
 @routes.delete(r"/api/playlists/{kind:\d+}/tracks/{index:\d+}")
 async def api_remove_track(request: web.Request) -> web.Response:
-    ctx = _ctx(request)
     track_id = request.query.get("track_id", "")
-    await ctx.ym.remove_from_playlist(int(request.match_info["kind"]), int(request.match_info["index"]), track_id)
-    ctx.invalidate()
+    await request[YM].remove_from_playlist(int(request.match_info["kind"]), int(request.match_info["index"]), track_id)
+    _ctx(request).invalidate(_user_id(request))
     return web.json_response({"ok": True})
 
 
@@ -347,7 +468,7 @@ async def api_set_target(request: web.Request) -> web.Response:
     kind = (await _json_body(request)).get("kind")
     if kind is not None:
         kind = int(kind)
-        if await ctx.ym.get_playlist(kind) is None:
+        if await request[YM].get_playlist(kind) is None:
             raise web.HTTPNotFound(text="Плейлист не найден")
     ctx.store.set_upload_target(_user_id(request), kind)
     return web.json_response({"upload_target": kind})
@@ -355,9 +476,9 @@ async def api_set_target(request: web.Request) -> web.Response:
 
 @routes.post(r"/api/tracks/{track_id:[\w.\-]+}/send")
 async def api_send_track(request: web.Request) -> web.Response:
-    ctx = _ctx(request)
-    track = await ctx.track(request.match_info["track_id"])
-    await ctx.sender.send(_user_id(request), track)
+    ym = request[YM]
+    track = await get_track(ym, request.match_info["track_id"])
+    await _ctx(request).sender.send(_user_id(request), track, ym)
     return web.json_response({"ok": True})
 
 
@@ -368,14 +489,15 @@ async def api_send_source(request: web.Request) -> web.Response:
     if src not in SOURCES:
         raise web.HTTPNotFound(text="Неизвестный список")
     user_id = _user_id(request)
-    started = start_bulk_download(ctx.bot, user_id, user_id, src, request.query.get("ref", ""), ctx.ym, ctx.sender)
+    started = start_bulk_download(
+        ctx.bot, user_id, user_id, src, request.query.get("ref", ""), request[YM], ctx.sender,
+    )
     return web.json_response({"started": started})
 
 
 @routes.post("/api/upload")
 async def api_upload(request: web.Request) -> web.Response:
     """Файл с телефона прямо на сервер: лимит Telegram в 20 МБ здесь не действует."""
-    ctx = _ctx(request)
     reader = await request.multipart()
     fields: dict[str, str] = {}
     file_name, data = None, b""
@@ -394,30 +516,37 @@ async def api_upload(request: web.Request) -> web.Response:
         artist=fields.get("artist") or None, title=fields.get("title") or None,
         fallback_artist=fields.get("fallback_artist") or None, fallback_title=fields.get("fallback_title") or None,
     )
-    result = await ctx.ym.upload_track(int(fields["kind"]), name, prepared)
-    ctx.invalidate()
+    result = await request[YM].upload_track(int(fields["kind"]), name, prepared)
+    _ctx(request).invalidate(_user_id(request))
     return web.json_response({"name": name, "notes": notes, "ugc_track_id": result.ugc_track_id})
 
 
 # ---------- аудио по подписанным ссылкам ----------
 
-def _check_media(request: web.Request, kind: str) -> str:
+async def _media_account(request: web.Request, kind: str) -> tuple[int, YandexMusic, str]:
+    """Проверяет подпись ссылки; возвращает (Telegram ID, его аккаунт Яндекса, id трека)."""
+    ctx = _ctx(request)
     track_id = request.match_info["track_id"]
-    if not _ctx(request).signer.verify(kind, track_id, request.query.get("exp"), request.query.get("sig")):
+    user = request.query.get("u", "")
+    if not user.isdigit() or not ctx.signer.verify(kind, int(user), track_id,
+                                                   request.query.get("exp"), request.query.get("sig")):
         raise web.HTTPForbidden(text="Ссылка недействительна или устарела")
-    return track_id
+    ym = await ctx.accounts.get(int(user))
+    if ym is None:
+        raise web.HTTPForbidden(text="Аккаунт Яндекса отключён")
+    return int(user), ym, track_id
 
 
 @routes.get(r"/media/stream/{track_id:[\w.\-]+}")
 async def media_stream(request: web.Request) -> web.StreamResponse:
     """Проксирует MP3 из хранилища Яндекса с поддержкой Range — чтобы работала перемотка."""
     ctx = _ctx(request)
-    track_id = _check_media(request, "stream")
+    user_id, ym, track_id = await _media_account(request, "stream")
     headers = {"Range": request.headers["Range"]} if "Range" in request.headers else {}
 
     upstream = None
     for attempt in range(2):
-        url = await ctx.direct_link(track_id, fresh=attempt > 0)
+        url = await ctx.direct_link(user_id, ym, track_id, fresh=attempt > 0)
         upstream = await ctx.http.get(url, headers=headers)
         if upstream.status < 400 or attempt == 1:
             break
@@ -447,9 +576,9 @@ async def media_stream(request: web.Request) -> web.StreamResponse:
 
 @routes.get(r"/media/download/{track_id:[\w.\-]+}")
 async def media_download(request: web.Request) -> web.Response:
-    ctx = _ctx(request)
-    track = await ctx.track(_check_media(request, "download"))
-    data, _ = await ctx.ym.download_tagged(track)
+    _, ym, track_id = await _media_account(request, "download")
+    track = await get_track(ym, track_id)
+    data, _ = await ym.download_tagged(track)
     name = tagged_filename(track)
     return web.Response(body=data, content_type="audio/mpeg", headers={
         "Content-Disposition": f"attachment; filename=\"track.mp3\"; filename*=UTF-8''{quote(name)}",
@@ -460,16 +589,55 @@ async def media_download(request: web.Request) -> web.Response:
 
 # ---------- статика ----------
 
-def _static_version() -> str:
-    """Меняется при обновлении файлов — чтобы Telegram не держал в кэше старый app.js."""
-    stamp = "".join(f"{f.name}{f.stat().st_mtime_ns}" for f in sorted(STATIC_DIR.iterdir()))
-    return hashlib.sha1(stamp.encode()).hexdigest()[:10]
+class StaticFiles:
+    """Статика из памяти, заранее сжатая gzip.
+
+    Адреса файлов содержат версию (хеш содержимого), поэтому браузер Telegram может хранить их в кэше
+    сколько угодно — после обновления бота изменится адрес, и он скачает новые.
+    """
+
+    TYPES = {".js": "application/javascript", ".css": "text/css", ".html": "text/html", ".svg": "image/svg+xml",
+             ".png": "image/png", ".ico": "image/x-icon", ".webp": "image/webp"}
+
+    def __init__(self, directory: Path) -> None:
+        files = sorted(f for f in directory.iterdir() if f.is_file() and f.suffix in self.TYPES)
+        digest = hashlib.sha1()
+        for f in files:
+            digest.update(f.name.encode() + f.read_bytes())
+        self.version = digest.hexdigest()[:10]
+        self.files: dict[str, tuple[str, bytes, bytes | None]] = {}
+        for f in files:
+            raw = f.read_bytes()
+            if f.name == "index.html":
+                raw = raw.replace(b"__V__", self.version.encode())
+            content_type = self.TYPES[f.suffix]
+            packed = gzip.compress(raw, 9) if content_type in COMPRESS_TYPES else None
+            self.files[f.name] = (content_type, raw, packed)
+
+    def response(self, request: web.Request, name: str, cache: str) -> web.Response:
+        item = self.files.get(name)
+        if item is None:
+            raise web.HTTPNotFound()
+        content_type, raw, packed = item
+        headers = {"Cache-Control": cache, "Vary": "Accept-Encoding"}
+        body = raw
+        if packed is not None and "gzip" in request.headers.get("Accept-Encoding", ""):
+            body = packed
+            headers["Content-Encoding"] = "gzip"
+        return web.Response(body=body, content_type=content_type, headers=headers)
+
+
+@routes.get("/static/{name}")
+async def static_file(request: web.Request) -> web.Response:
+    static = _ctx(request).static
+    versioned = request.query.get("v") == static.version
+    cache = "public, max-age=31536000, immutable" if versioned else "no-cache"
+    return static.response(request, request.match_info["name"], cache)
 
 
 @routes.get("/")
 async def index(request: web.Request) -> web.Response:
-    html = (STATIC_DIR / "index.html").read_text("utf-8").replace("__V__", _static_version())
-    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-cache"})
+    return _ctx(request).static.response(request, "index.html", "no-cache")
 
 
 async def _startup(app: web.Application) -> None:
@@ -481,14 +649,13 @@ async def _cleanup(app: web.Application) -> None:
         await app[CTX].http.close()
 
 
-def create_app(config: Config, bot: Bot, ym: YandexMusic, store: Storage, sender: TrackSender) -> web.Application:
+def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sender: TrackSender) -> web.Application:
     app = web.Application(
         client_max_size=config.web_max_upload_mb * 1024 * 1024,
-        middlewares=[errors_middleware, auth_middleware],
+        middlewares=[compress_middleware, errors_middleware, auth_middleware],
     )
-    app[CTX] = WebContext(config, bot, ym, store, sender, MediaSigner(config.bot_token))
+    app[CTX] = WebContext(config, bot, accounts, store, sender, MediaSigner(config.bot_token), StaticFiles(STATIC_DIR))
     app.add_routes(routes)
-    app.router.add_static("/static/", STATIC_DIR, append_version=False)
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
     return app

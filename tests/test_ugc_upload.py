@@ -118,7 +118,7 @@ async def test_error_lists_every_attempt(fake_yandex):
 
 async def test_upload_needs_connected_account():
     ym = YandexMusic("t")
-    with pytest.raises(UploadError, match="не подключился"):
+    with pytest.raises(UploadError, match="не подключена"):
         await ym.upload_track(1003, "a.mp3", b"x")
     await ym.close()
 

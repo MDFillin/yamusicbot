@@ -4,16 +4,57 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from yandex_music import Playlist, Track
 
-from bot.callbacks import CancelBulkCb, NoopCb, PlaylistCb, SearchCb, TrackCb, UploadCb, ViewCb
+from bot.callbacks import CancelBulkCb, MenuCb, NoopCb, PlaylistCb, SearchCb, TrackCb, UploadCb, ViewCb
 from bot.ym import track_artists, track_title
 
 
 def short(text: str, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def tracks_word(n: int) -> str:
+    return f"{n} {plural(n, 'трек', 'трека', 'треков')}"
+
+
+def app_button(webapp_url: str | None, text: str = "🎧 Открыть медиатеку") -> InlineKeyboardButton | None:
+    return InlineKeyboardButton(text=text, web_app=WebAppInfo(url=webapp_url)) if webapp_url else None
+
+
+def main_menu(webapp_url: str | None) -> InlineKeyboardMarkup:
+    """Меню для того, кто уже подключил Яндекс Музыку."""
+    kb = InlineKeyboardBuilder()
+    rows = [1]
+    if app := app_button(webapp_url):
+        kb.add(app)
+    else:
+        rows = []
+    kb.button(text="❤️ Мне нравится", callback_data=MenuCb(action="likes"))
+    kb.button(text="📃 Плейлисты", callback_data=MenuCb(action="playlists"))
+    kb.button(text="📌 Куда загружать", callback_data=MenuCb(action="target"))
+    kb.button(text="👤 Аккаунт", callback_data=MenuCb(action="account"))
+    kb.adjust(*rows, 2, 2)
+    return kb.as_markup()
+
+
+def welcome_menu(webapp_url: str | None) -> InlineKeyboardMarkup:
+    """Меню для нового пользователя: подключить Яндекс (в приложении тоже можно войти)."""
+    rows = [[InlineKeyboardButton(text="🔑 Подключить Яндекс Музыку", callback_data=MenuCb(action="login").pack())]]
+    if app := app_button(webapp_url, "🎧 Открыть приложение"):
+        rows.append([app])
+    rows.append([InlineKeyboardButton(text="❓ Что умеет бот", callback_data=MenuCb(action="help").pack())])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def fmt_duration(ms: int | None) -> str:

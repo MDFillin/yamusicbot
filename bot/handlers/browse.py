@@ -96,7 +96,7 @@ async def open_link(message: Message, link: YMLink, ym: YandexMusic, sender: Tra
             await message.answer("😕 Трек не найден")
             return
         status = await message.answer(f"⏳ Скачиваю «{html.escape(track_title(track))}»…")
-        await sender.send(message.chat.id, track)
+        await sender.send(message.chat.id, track, ym)
         await status.delete()
     elif link.kind == "album":
         await show_source(message, ym, "alb", link.album)
@@ -205,18 +205,21 @@ async def on_insert(call: CallbackQuery, callback_data: PlaylistCb, ym: YandexMu
 
 # ---------- управление плейлистами ----------
 
-@router.message(Command("target"))
-async def cmd_target(message: Message, ym: YandexMusic, store: Storage) -> None:
+async def target_prompt(ym: YandexMusic, store: Storage, user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     playlists = await ym.get_my_playlists()
-    current = store.get_upload_target(message.from_user.id)
+    current = store.get_upload_target(user_id)
     name = next((p.title for p in playlists if p.kind == current), None)
     text = (f"📌 Сейчас присланные файлы сразу загружаются в «{html.escape(name)}»." if name
-            else "Сейчас бот спрашивает, куда загружать каждый файл.")
+            else "📌 Сейчас бот спрашивает, куда загружать каждый файл.")
     if not playlists:
-        await message.answer(text + "\n\nПлейлистов пока нет: /newplaylist название")
-        return
-    await message.answer(text + "\n\nВыберите плейлист по умолчанию:",
-                         reply_markup=target_menu(playlists, current is not None))
+        return text + "\n\nПлейлистов пока нет: /newplaylist название", None
+    return text + "\n\nВыберите плейлист по умолчанию:", target_menu(playlists, current is not None)
+
+
+@router.message(Command("target"))
+async def cmd_target(message: Message, ym: YandexMusic, store: Storage) -> None:
+    text, markup = await target_prompt(ym, store, message.from_user.id)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(PlaylistCb.filter(F.action == "target"))

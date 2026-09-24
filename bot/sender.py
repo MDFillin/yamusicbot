@@ -47,18 +47,20 @@ def track_caption(track: Track) -> str:
 
 
 class TrackSender:
-    def __init__(self, bot: Bot, ym: YandexMusic, store: Storage, config: Config) -> None:
+    def __init__(self, bot: Bot, store: Storage, config: Config) -> None:
         self._bot = bot
-        self._ym = ym
         self._store = store
         self._config = config
 
-    async def send(self, chat_id: int, track: Track) -> Message:
+    async def send(self, chat_id: int, track: Track, ym: YandexMusic) -> Message:
+        """Отправляет трек из аккаунта ym; повторно тот же трек уходит по file_id без скачивания."""
         track_id = str(track.id)
         markup = track_actions(track_id)
         caption = track_caption(track)
+        # Кэш — на аккаунт Яндекса: без Плюса Яндекс отдаёт другой файл (отрывок).
+        account = ym.uid or 0
 
-        cached = self._store.get_file_id(track_id, self._config.max_bitrate)
+        cached = self._store.get_file_id(account, track_id, self._config.max_bitrate)
         if cached:
             try:
                 return await retry_telegram(
@@ -67,13 +69,12 @@ class TrackSender:
             except TelegramBadRequest:
                 log.info("file_id для %s устарел, скачиваю заново", track_id)
 
-        data, bitrate = await self._ym.download_tagged(track)
+        (data, bitrate), thumb = await asyncio.gather(ym.download_tagged(track), ym.download_cover(track, "200x200"))
         if len(data) > self._config.max_tg_upload:
             raise TrackTooLargeError(
                 f"Файл {len(data) // (1024 * 1024)} МБ — больше лимита Telegram для ботов "
                 f"({self._config.max_tg_upload // (1024 * 1024)} МБ)"
             )
-        thumb = await self._ym.download_cover(track, "200x200")
 
         msg = await retry_telegram(
             lambda: self._bot.send_audio(
@@ -89,6 +90,6 @@ class TrackSender:
             )
         )
         if msg.audio:
-            self._store.set_file_id(track_id, self._config.max_bitrate, msg.audio.file_id)
+            self._store.set_file_id(account, track_id, self._config.max_bitrate, msg.audio.file_id)
         log.info("Отправлен трек %s (%s kbps)", track_id, bitrate)
         return msg
