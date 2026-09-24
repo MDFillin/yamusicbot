@@ -553,3 +553,93 @@ async def test_token_is_shown_only_to_its_owner(env):
     r = await env.client.get("/api/token", headers=as_user(NEWBIE_ID))
     assert r.status == 401 and (await r.json())["code"] == "login_required"
     assert (await env.client.get("/api/token", headers={"X-Telegram-Init-Data": ""})).status == 401
+    stale = init_data(auth_date=int(time.time()) - 2 * 3600)
+    r = await env.client.get("/api/token", headers={"X-Telegram-Init-Data": stale})
+    assert r.status == 401 and (await r.json())["code"] == "stale_session", "токен — только свежеоткрытому приложению"
+    assert (await env.client.get("/api/library", headers={"X-Telegram-Init-Data": stale})).status == 200
+
+
+# ---------- защита ----------
+
+async def test_security_headers_everywhere(env):
+    stream = (await (await env.client.get("/api/source/likes")).json())["tracks"][0]["stream"]
+    for path in ("/", "/api/me", "/static/nope.js", stream, "/media/stream/1?u=1&exp=1&sig=x"):
+        r = await env.client.get(path)
+        assert r.headers["X-Content-Type-Options"] == "nosniff", path
+        csp = r.headers["Content-Security-Policy"]
+        assert "script-src 'self' https://telegram.org" in csp and "object-src 'none'" in csp, path
+
+
+async def test_internal_errors_are_not_shown(env):
+    async def broken():
+        raise RuntimeError("/srv/secret/path token=abc")
+
+    env.ym.get_my_playlists = broken
+    r = await env.client.get("/api/library")
+    body = await r.json()
+    assert r.status == 500 and "secret" not in body["error"] and "RuntimeError" not in body["error"]
+    assert "код" in body["error"]
+
+
+async def test_json_body_is_limited(env):
+    r = await env.client.post("/api/playlists", json={"title": "x" * 100_000})
+    assert r.status == 400 and "большой" in (await r.json())["error"]
+
+    async def chunked():  # без Content-Length
+        yield b'{"title": "' + b"x" * 100_000 + b'"}'
+
+    r = await env.client.post("/api/playlists", data=chunked(), headers={"Content-Type": "application/json"})
+    assert r.status == 400
+
+
+async def test_upload_size_is_limited(env, tmp_path):
+    config = Config(bot_token=TOKEN, data_dir=tmp_path, web_max_upload_mb=1)
+    bot = Bot(TOKEN)
+    client = TestClient(TestServer(create_app(config, bot, env.accounts, env.store, env.sender, env.placer)))
+    await client.start_server()
+    try:
+        form = FormData()
+        form.add_field("kind", "1003")
+        form.add_field("file", FAKE_MP3 * 200, filename="big.mp3")  # ~2 МБ
+        r = await client.post("/api/upload", data=form, headers=as_user(OWNER_ID))
+        assert r.status == 413 and "до 1 МБ" in (await r.json())["error"]
+
+        form = FormData()
+        form.add_field("kind", "1003")
+        form.add_field("cover", b"\xff\xd8" + b"0" * (11 * 1024 * 1024), filename="c.jpg")
+        form.add_field("file", FAKE_MP3, filename="x.mp3")
+        r = await env.client.post("/api/upload", data=form)
+        assert r.status == 400 and "10 МБ" in (await r.json())["error"]
+        assert not [c for c in env.ym.calls if c[0] == "upload"]
+    finally:
+        await client.close()
+        await bot.session.close()
+
+
+async def test_uploads_are_queued_per_user(env):
+    running = {"me": 0, "friend": 0}
+    peak = {"me": 0, "friend": 0, "all": 0}
+
+    def slow(ym):
+        async def upload_track(kind, filename, data):
+            running[ym.login] += 1
+            peak[ym.login] = max(peak[ym.login], running[ym.login])
+            peak["all"] = max(peak["all"], sum(running.values()))
+            await asyncio.sleep(0.05)
+            running[ym.login] -= 1
+            return UploadResult("ugc", "CREATED")
+        return upload_track
+
+    env.ym.upload_track = slow(env.ym)
+    env.friend.upload_track = slow(env.friend)
+
+    def post(user_id):
+        form = FormData()
+        form.add_field("kind", "1003")
+        form.add_field("file", FAKE_MP3, filename="x.mp3")
+        return env.client.post("/api/upload", data=form, headers=as_user(user_id))
+
+    replies = await asyncio.gather(post(OWNER_ID), post(OWNER_ID), post(FRIEND_ID))
+    assert [r.status for r in replies] == [200, 200, 200]
+    assert peak["me"] == 1, "свои файлы — по одному"
+    assert peak["all"] == 2, "а разные люди загружают одновременно"

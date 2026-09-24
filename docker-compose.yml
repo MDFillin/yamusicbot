@@ -7,6 +7,13 @@ services:
     ports:
       # мини-приложение; наружу его публикует Caddy (ниже) или туннель
       - "127.0.0.1:8080:8080"
+    # Меньше прав процессу: если через разбор чужого файла (ffmpeg) что-то пойдёт не так, выбраться из контейнера
+    # будет сложнее. Остаются только права на свои файлы в ./data.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    pids_limit: 512
     restart: unless-stopped
 
   # HTTPS для мини-приложения на своём домене. Включается строкой COMPOSE_PROFILES=https в .env
@@ -35,6 +42,9 @@ services:
     # Токен entrypoint.sh проверяет и передаёт клиенту флагом --token.
     environment:
       FXTUNNEL_TOKEN: ${FXTUNNEL_TOKEN:-}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
     restart: unless-stopped
 
 volumes:

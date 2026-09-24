@@ -7,7 +7,7 @@ import hmac
 import time
 from datetime import UTC, datetime
 
-from aiogram.utils.web_app import WebAppUser, safe_parse_webapp_init_data
+from aiogram.utils.web_app import WebAppInitData, safe_parse_webapp_init_data
 
 INIT_DATA_MAX_AGE = 24 * 3600  # initData выдаётся при открытии приложения; сутки — с запасом
 MEDIA_LINK_TTL = 6 * 3600
@@ -20,20 +20,25 @@ class AuthError(Exception):
         self.code = code
 
 
-def user_from_init_data(bot_token: str, init_data: str) -> WebAppUser:
-    """initData подписан Telegram ключом из токена бота — подделать его без токена нельзя."""
+def verify_init_data(bot_token: str, init_data: str) -> WebAppInitData:
+    """Проверяет initData (его подписывает Telegram ключом из токена бота — подделать нельзя), в нём есть user."""
     if not init_data:
         raise AuthError(401, "Откройте приложение через бота в Telegram")
     try:
         data = safe_parse_webapp_init_data(bot_token, init_data)
     except ValueError as e:
         raise AuthError(401, "Неверная подпись Telegram") from e
-    auth_date = data.auth_date if data.auth_date.tzinfo else data.auth_date.replace(tzinfo=UTC)
-    if (datetime.now(UTC) - auth_date).total_seconds() > INIT_DATA_MAX_AGE:
+    if init_data_age(data) > INIT_DATA_MAX_AGE:
         raise AuthError(401, "Сессия устарела — закройте и откройте приложение заново")
     if data.user is None:
         raise AuthError(401, "Откройте приложение через бота в Telegram")
-    return data.user
+    return data
+
+
+def init_data_age(data: WebAppInitData) -> float:
+    """Сколько секунд назад Telegram выдал initData (открыли приложение)."""
+    auth_date = data.auth_date if data.auth_date.tzinfo else data.auth_date.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - auth_date).total_seconds()
 
 
 class MediaSigner:

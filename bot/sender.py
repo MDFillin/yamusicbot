@@ -10,7 +10,7 @@ from typing import TypeVar
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, Message
 from yandex_music import Track
 
 from bot.config import Config
@@ -21,6 +21,7 @@ from bot.ym import YandexMusic, tagged_filename, track_album, track_artists, tra
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
+PARALLEL_DOWNLOADS = 4  # треков, которые сервер одновременно качает из Яндекса и отправляет (каждый — в памяти)
 
 
 class TrackTooLargeError(RuntimeError):
@@ -52,6 +53,7 @@ class TrackSender:
         self._bot = bot
         self._store = store
         self._config = config
+        self._slots = asyncio.Semaphore(PARALLEL_DOWNLOADS)  # бот открыт всем: очередь, а не десятки файлов сразу
 
     async def send(self, chat_id: int, track: Track, ym: YandexMusic, user_id: int | None = None) -> Message:
         """Отправляет трек из аккаунта ym; повторно тот же трек уходит по file_id без скачивания.
@@ -74,6 +76,12 @@ class TrackSender:
             except TelegramBadRequest:
                 log.info("file_id для %s устарел, скачиваю заново", track_id)
 
+        async with self._slots:
+            return await self._upload(chat_id, track, ym, quality, account, caption, markup)
+
+    async def _upload(self, chat_id: int, track: Track, ym: YandexMusic, quality: int, account: int,
+                      caption: str, markup: InlineKeyboardMarkup) -> Message:
+        track_id = str(track.id)
         (data, bitrate), thumb = await asyncio.gather(
             ym.download_tagged(track, quality), ym.download_cover(track, "200x200"),
         )

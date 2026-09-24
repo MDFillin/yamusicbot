@@ -34,10 +34,19 @@ API_HEADERS = {
     },
 }
 TOO_MANY_FILES = "TOO_MANY_FILES"
+# Токен уходит только на эти домены (и на адреса API из настроек): post-target приходит в ответе сервера,
+# и чужой адрес в нём не должен получить вход в аккаунт.
+YANDEX_DOMAINS = ("yandex.ru", "yandex.net", "yandex.com")
 
 
 def _host(url: str) -> str:
     return urlsplit(url).netloc
+
+
+def _is_yandex(url: str) -> bool:
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and any(host == d or host.endswith("." + d) for d in YANDEX_DOMAINS)
 
 
 def _parse_upload_target(body: str) -> dict | str | None:
@@ -199,12 +208,17 @@ class YandexMusic:
 
     def _http(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15 * 60),
-                headers={"Authorization": f"OAuth {self._token}"},
-                trust_env=True,
-            )
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15 * 60), trust_env=True)
         return self._session
+
+    def _auth(self, url: str) -> dict[str, str]:
+        """Заголовок с токеном — только для Яндекса по HTTPS и для адресов API из настроек."""
+        origin = urlsplit(url)[:2]
+        trusted = _is_yandex(url) or any(origin == urlsplit(base)[:2] for base in self._api_base_urls)
+        if not trusted:
+            log.warning("Не отправляю токен на %s: это не адрес Яндекса", _host(url))
+            return {}
+        return {"Authorization": f"OAuth {self._token}"}
 
     # ---------- каталог ----------
 
@@ -398,7 +412,7 @@ class YandexMusic:
         attempts = []
         for base in self._api_base_urls:
             url = f"{base}/loader/upload-url"
-            headers = API_HEADERS.get(_host(base), {})
+            headers = {**API_HEADERS.get(_host(base), {}), **self._auth(url)}
             try:
                 async with self._http().post(url, params=params, data=params, headers=headers) as resp:
                     body = await resp.text()
@@ -454,7 +468,7 @@ class YandexMusic:
             content_type=mimetypes.guess_type(filename)[0] or "application/octet-stream",
         )
         try:
-            async with http.post(target, data=form) as resp:
+            async with http.post(target, data=form, headers=self._auth(target)) as resp:
                 reply = (await resp.text()).strip()
                 status = resp.status
         except aiohttp.ClientError as e:

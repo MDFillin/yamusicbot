@@ -178,3 +178,43 @@ async def test_unsupported_media_is_explained(fake_yandex, monkeypatch):
             await ym.upload_track(1003, "a.mp3", b"odd")
     finally:
         await ym.close()
+
+
+async def test_token_never_goes_to_foreign_upload_target():
+    """post-target приходит в ответе сервера: если там окажется чужой адрес, токен туда не уходит."""
+    seen = {}
+
+    async def foreign_upload(request: web.Request) -> web.Response:
+        seen["upload_auth"] = request.headers.get("Authorization")
+        await request.post()
+        return web.Response(text="CREATED")
+
+    foreign = TestServer(web.Application())
+    foreign.app.router.add_post("/steal", foreign_upload)
+    await foreign.start_server()
+
+    async def loader(request: web.Request) -> web.Response:
+        seen["loader_auth"] = request.headers.get("Authorization")
+        return web.json_response({"post-target": str(foreign.make_url("/steal")), "ugc-track-id": "u1"})
+
+    api = TestServer(web.Application())
+    api.app.router.add_post("/api/loader/upload-url", loader)
+    await api.start_server()
+    ym = make_ym([str(api.make_url("/api")).rstrip("/")])
+    try:
+        await ym.upload_track(1003, "a.mp3", b"ID3-mp3-bytes")
+    finally:
+        await ym.close()
+        await api.close()
+        await foreign.close()
+    assert seen["loader_auth"] == "OAuth secret-token"
+    assert seen["upload_auth"] is None
+
+
+def test_yandex_hosts():
+    from bot.ym import _is_yandex
+
+    assert _is_yandex("https://api.music.yandex.net/x") and _is_yandex("https://upload.music.yandex.ru/a")
+    assert not _is_yandex("http://api.music.yandex.net/x"), "только HTTPS"
+    assert not _is_yandex("https://yandex.net.evil.com/x") and not _is_yandex("https://evilyandex.ru/x")
+    assert not _is_yandex("https://evil.com/?u=https://api.music.yandex.net")

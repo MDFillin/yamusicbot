@@ -85,6 +85,9 @@
     return el;
   }
 
+  // Адрес картинки для CSS url(""): кавычка, обратная косая или перевод строки из данных не должны менять стиль.
+  const cssUrl = (url) => `url("${String(url).replace(/["\\\s]/g, encodeURIComponent)}")`;
+
   function coverEl(url, cls = '', fallback = 'music') {
     if (url) {
       const img = h('img', { class: `cover ${cls}`, src: url, loading: 'lazy', decoding: 'async', alt: '' });
@@ -833,7 +836,7 @@
           ? coverEl(info.cover, shape, fallback)
           : h('div', { class: `cover ${shape}`, style: src === 'likes' ? 'background:radial-gradient(120% 140% at 0% 0%,#ff7a8a,#ff2e63 45%,#b3136b)' : null }, icon(fallback));
         put(hero,
-          info.cover ? h('div', { class: 'hero-bg' }, h('div', { style: `background-image:url("${info.cover}")` })) : '',
+          info.cover ? h('div', { class: 'hero-bg' }, h('div', { style: `background-image:${cssUrl(info.cover)}` })) : '',
           cover, h('h1', {}, info.title), h('div', { class: 'sub' }, sub),
           info.total ? h('div', { class: 'actions' }, play, mix, more) : null);
       }
@@ -1676,7 +1679,7 @@
   function drawNow() {
     const t = current();
     if (!t || !now) return;
-    now.bg.style.backgroundImage = t.cover ? `url("${bigCover(t.cover)}")` : 'none';
+    now.bg.style.backgroundImage = t.cover ? cssUrl(bigCover(t.cover)) : 'none';
     now.cover.replaceWith(now.cover = coverEl(bigCover(t.cover)));
     now.title.textContent = t.title;
     now.sub.textContent = t.artists;

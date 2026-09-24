@@ -51,7 +51,7 @@ async def show_source(
     try:
         source = await load_source(ym, src, ref)
     except SourceNotFoundError as e:
-        await target.answer(f"😕 {e}")
+        await target.answer(f"😕 {html.escape(str(e))}")
         return
     text, markup = await render_page(ym, source, src, page)
     if edit:

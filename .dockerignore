@@ -1,0 +1,15 @@
+# В образ попадают только requirements.txt и bot/ (см. Dockerfile), но контекст сборки уходит демону Docker целиком:
+# секреты, данные и лишнее туда не отправляем.
+.env
+.env.*
+!.env.example
+data/
+.git/
+tests/
+docs/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/

@@ -13,6 +13,7 @@ from bot.audio import (
     prepare_for_upload,
     read_mp3_tags,
     read_tags,
+    reencode_mp3,
     safe_filename,
     tag_mp3,
 )
@@ -202,3 +203,69 @@ async def test_m4a_named_mp3_is_converted(tmp_path):
     assert name == "fake.mp3" and audio_format(data) == "mp3"
     assert read_tags(data).title == "Rusted Citadel"
     assert notes == ["внутри файла не MP3, а M4A/AAC — сконвертирован в MP3"]
+
+
+# ---------- ffmpeg и чужие файлы ----------
+
+def _ff(tmp_path, *args):
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args], check=True, cwd=tmp_path)
+
+
+@needs_ffmpeg
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["track.m3u8", "track.flac"])
+async def test_playlist_disguised_as_audio_cannot_read_server_files(tmp_path, name):
+    """HLS-плейлист вместо аудио: раньше ffmpeg открывал по нему файлы сервера и бот загружал их в Яндекс."""
+    _ff(tmp_path, "-f", "lavfi", "-i", "sine=duration=1", "secret.wav")
+    playlist = f"#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:1.0,\n{tmp_path / 'secret.wav'}\n#EXT-X-ENDLIST\n"
+    concat = f"ffconcat version 1.0\nfile '{tmp_path / 'secret.wav'}'\n"
+    for payload in (playlist.encode(), concat.encode()):
+        with pytest.raises(ConversionError, match="распознать"):
+            await prepare_for_upload(name, payload)
+        # «.mp3» с непонятным содержимым уходит в Яндекс как есть, а перекодировка после 415 читает его только как MP3
+        assert (await prepare_for_upload("track.mp3", payload))[1] == payload
+        with pytest.raises(ConversionError):
+            await reencode_mp3(payload)
+
+
+@needs_ffmpeg
+@pytest.mark.asyncio
+async def test_unrecognized_audio_is_still_converted(tmp_path):
+    """Формат, который бот сам не узнаёт (AC3), ffmpeg угадывает — но только среди аудиоформатов."""
+    _ff(tmp_path, "-f", "lavfi", "-i", "sine=duration=1", "-c:a", "ac3", "-f", "ac3", "song.ac3")
+    source = (tmp_path / "song.ac3").read_bytes()
+    assert audio_format(source) is None
+    name, data, _ = await prepare_for_upload("song.ac3", source)
+    assert name == "song.mp3" and audio_format(data) == "mp3"
+
+
+@needs_ffmpeg
+@pytest.mark.asyncio
+async def test_silence_bomb_does_not_fill_the_disk(tmp_path, monkeypatch):
+    """Маленький FLAC с часами тишины превратился бы в гигабайты MP3."""
+    monkeypatch.setattr("bot.audio.MAX_CONVERTED_BYTES", 200_000)
+    _ff(tmp_path, "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "60", "-c:a", "flac", "silence.flac")
+    with pytest.raises(ConversionError, match="больше"):
+        await prepare_for_upload("silence.flac", (tmp_path / "silence.flac").read_bytes())
+
+
+@needs_ffmpeg
+@pytest.mark.asyncio
+async def test_slow_conversion_is_killed(tmp_path, monkeypatch):
+    monkeypatch.setattr("bot.audio.FFMPEG_TIMEOUT", 0.05)
+    _ff(tmp_path, "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "600", "-c:a", "flac", "long.flac")
+    with pytest.raises(ConversionError, match="слишком долго"):
+        await prepare_for_upload("long.flac", (tmp_path / "long.flac").read_bytes())
+
+
+@needs_ffmpeg
+@pytest.mark.asyncio
+async def test_huge_cover_image_is_rejected(tmp_path):
+    """PNG 8000×8000 весит мало, а в памяти занял бы сотни мегабайт."""
+    _ff(tmp_path, "-f", "lavfi", "-i", "color=c=black:s=8000x8000", "-frames:v", "1", "-f", "image2", "bomb.png")
+    bomb = (tmp_path / "bomb.png").read_bytes() + b"\0" * 1_600_000  # крупнее 1,5 МБ — пойдёт через ffmpeg
+    with pytest.raises(ConversionError, match="мегапикселей"):
+        await normalize_cover(bomb)
+    _ff(tmp_path, "-f", "lavfi", "-i", "color=c=red:s=2000x1500", "-frames:v", "1", "-f", "image2", "big.png")
+    big = (tmp_path / "big.png").read_bytes() + b"\0" * 1_600_000
+    assert (await normalize_cover(big))[:2] == b"\xff\xd8", "обычная большая картинка пережимается в JPEG"

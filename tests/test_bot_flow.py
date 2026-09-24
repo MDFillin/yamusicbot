@@ -538,3 +538,48 @@ async def test_settings_change_download_quality(env):
 
     await env.dp.feed_update(env.bot, callback_update(SettingsCb(kind="download", value=999).pack()))
     assert env.store.get_setting(OWNER.id, "download_quality") == "320", "чужие значения не принимаем"
+
+
+# ---------- защита ----------
+
+async def test_errors_do_not_reveal_details(env):
+    async def broken(query, type_):
+        raise RuntimeError("/srv/bot/secret.py: что-то внутри")
+
+    env.ym.search = broken
+    await env.dp.feed_update(env.bot, message_update(text="кино"))
+    text = env.tg.texts()[-1]
+    assert "Что-то пошло не так" in text and "код" in text
+    assert "secret" not in text and "RuntimeError" not in text
+
+
+async def test_failed_telegram_download_does_not_leak_bot_token(env):
+    """В тексте ошибки aiohttp — адрес api.telegram.org/file/bot<токен>/…, его нельзя показывать в чате."""
+    import aiohttp
+    from multidict import CIMultiDict, CIMultiDictProxy
+    from yarl import URL
+
+    url = URL("https://api.telegram.org/file/bot42:TEST/music/file_1.mp3")
+    info = aiohttp.RequestInfo(url, "GET", CIMultiDictProxy(CIMultiDict()), url)
+    error = aiohttp.ClientResponseError(info, (), status=404, message="Not Found")
+    assert "42:TEST" in str(error)
+
+    async def failing(*args, **kwargs):
+        raise error
+        yield b""  # noqa: RET503 — это асинхронный генератор
+
+    env.tg.stream_content = failing
+    await env.dp.feed_update(env.bot, audio_update("F1"))
+    await env.dp.feed_update(env.bot, callback_update(UploadCb(action="to", kind=1003).pack()))
+    await settle()
+    status = env.tg.texts()[-1]
+    assert "Не загрузилось: 1" in status and "HTTP 404" in status
+    assert all("42:TEST" not in t for t in env.tg.texts())
+
+
+async def test_upload_queue_is_limited(env, monkeypatch):
+    monkeypatch.setattr("bot.handlers.upload.MAX_QUEUE", 2)
+    for file_id in ("F1", "F2", "F3"):
+        await env.dp.feed_update(env.bot, audio_update(file_id))
+    assert "В очереди уже 2 файлов" in env.tg.texts()[-1]
+    assert [f.file_id for f in env.dp.workflow_data["uploads"].pending[OWNER.id]] == ["F1", "F2"]

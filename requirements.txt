@@ -1,5 +1,5 @@
 aiogram==3.31.0
-aiohttp>=3.9,<4
+aiohttp>=3.14.3,<4  # в более ранних версиях есть известные уязвимости (DoS, обход лимитов)
 aiohttp-socks==0.12.0
 yandex-music==3.0.0
 mutagen==1.48.1

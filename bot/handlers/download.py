@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
 
 from bot.callbacks import BulkCb, CancelBulkCb, TrackCb
+from bot.errors import describe_error
 from bot.keyboards import cancel_bulk
 from bot.sender import TrackSender, retry_telegram
 from bot.sources import SourceNotFoundError, load_source, resolve
@@ -37,7 +38,7 @@ async def on_download(
     except Exception as e:
         log.exception("Не удалось отправить трек %s", track.id)
         title = html.escape(track_title(track))
-        await call.message.answer(f"😕 Не получилось скачать «{title}»: {html.escape(str(e))}")
+        await call.message.answer(f"😕 Не получилось скачать «{title}»: {html.escape(describe_error(e))}")
 
 
 @router.callback_query(BulkCb.filter())
@@ -99,7 +100,7 @@ async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexM
                 raise
             except Exception as e:
                 log.warning("Трек %s не скачался: %s", track.id, e)
-                failed.append(f"{track_title(track)} — {e}")
+                failed.append(f"{track_title(track)} — {describe_error(e)}")
         text = f"✅ {title}\nГотово: {sent} из {total}."
     except asyncio.CancelledError:
         await update(f"⛔ Остановлено. Отправлено {sent} из {total}.", with_cancel=False)
@@ -108,7 +109,7 @@ async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexM
         text = f"😕 {html.escape(str(e))}"
     except Exception as e:
         log.exception("Ошибка массового скачивания")
-        text = f"⚠️ Скачивание прервалось: {html.escape(str(e))}\nОтправлено {sent} из {total}."
+        text = f"⚠️ Скачивание прервалось: {html.escape(describe_error(e))}\nОтправлено {sent} из {total}."
 
     if failed:
         text += "\n\nНе удалось:\n" + "\n".join(f"• {html.escape(f)}" for f in failed[:20])

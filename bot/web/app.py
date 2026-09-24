@@ -7,7 +7,9 @@ import gzip
 import hashlib
 import json
 import logging
+import secrets
 import time
+from collections import defaultdict
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +18,7 @@ from urllib.parse import quote
 
 import aiohttp
 from aiogram import Bot
-from aiogram.utils.web_app import WebAppUser
+from aiogram.utils.web_app import WebAppInitData, WebAppUser
 from aiohttp import web
 from yandex_music import Album, Artist, Playlist, Track
 from yandex_music.exceptions import UnauthorizedError, YandexMusicError
@@ -34,11 +36,11 @@ from bot.audio import (
 from bot.config import Config
 from bot.handlers.download import start_bulk_download
 from bot.placer import TopPlacer
-from bot.sender import TrackSender, TrackTooLargeError
+from bot.sender import PARALLEL_DOWNLOADS, TrackSender, TrackTooLargeError
 from bot.settings import QUALITY_LABELS, available_qualities, get_quality, set_quality
 from bot.sources import SourceNotFoundError, TrackSource, load_source, playlist_cover, playlist_ref, resolve
 from bot.storage import Storage
-from bot.web.auth import AuthError, MediaSigner, user_from_init_data
+from bot.web.auth import AuthError, MediaSigner, init_data_age, verify_init_data
 from bot.ym import (
     TrackUnavailableError,
     UploadError,
@@ -62,6 +64,21 @@ SOURCES = {"likes", "pl", "alb", "art"}
 PUBLIC_API = {"/api/me", "/api/login", "/api/logout"}
 REVOKED = "Яндекс Музыка не приняла ваш вход — возможно, он устарел или отозван. Подключите аккаунт заново."
 COMPRESS_TYPES = {"application/json", "text/html", "text/css", "application/javascript", "image/svg+xml"}
+MAX_JSON_BYTES = 64 * 1024  # запросы с JSON крошечные; большие тела нужны только /api/upload
+UPLOAD_SLOTS = 3  # файлов, которые сервер принимает одновременно (каждый держит в памяти до WEB_MAX_UPLOAD_MB)
+TOKEN_MAX_AGE = 3600  # сек: токен показываем только недавно открытому приложению
+# Страница берёт скрипты только у себя и у Telegram: даже если в данных окажется разметка, чужой код не запустится.
+CSP = "; ".join((
+    "default-src 'self'",
+    "script-src 'self' https://telegram.org",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' https: data: blob:",
+    "media-src 'self' blob:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+))
 
 
 class TTLCache:
@@ -109,6 +126,9 @@ class WebContext:
     http: aiohttp.ClientSession | None = None
     sources: TTLCache = field(default_factory=lambda: TTLCache(SOURCE_TTL, 300))
     links: TTLCache = field(default_factory=lambda: TTLCache(LINK_TTL, 2000))
+    upload_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(UPLOAD_SLOTS))
+    upload_locks: defaultdict[int, asyncio.Lock] = field(default_factory=lambda: defaultdict(asyncio.Lock))
+    download_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(PARALLEL_DOWNLOADS))
 
     async def source(self, user_id: int, ym: YandexMusic, src: str, ref: str, fresh: bool) -> TrackSource:
         key = (user_id, src, ref)
@@ -142,6 +162,7 @@ async def get_track(ym: YandexMusic, track_id: str) -> Track:
 
 CTX = web.AppKey("ctx", WebContext)
 USER = web.RequestKey("user", WebAppUser)
+INIT_DATA = web.RequestKey("init_data", WebAppInitData)
 YM = web.RequestKey("ym", YandexMusic)
 
 
@@ -211,6 +232,12 @@ def login_json(session: LoginSession | None, connected: bool) -> dict[str, Any]:
 
 # ---------- middleware ----------
 
+async def security_headers(request: web.Request, resp: web.StreamResponse) -> None:
+    """Заголовки безопасности на всех ответах, включая ошибки и потоковые (вызывается перед отправкой)."""
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Content-Security-Policy", CSP)
+
+
 @web.middleware
 async def compress_middleware(request: web.Request, handler):
     """gzip для JSON и текста: через туннель страница и списки грузятся заметно быстрее."""
@@ -244,6 +271,9 @@ async def errors_middleware(request: web.Request, handler):
     except LoginError as e:
         return _error(str(e), 422)
     except web.HTTPException as e:
+        if e.status == 413:  # aiohttp отвечает по-английски
+            limit = request.app[CTX].config.web_max_upload_mb
+            return _error(f"Файл слишком большой: сервер принимает до {limit} МБ", 413)
         if e.status >= 400 and request.path.startswith("/api/"):
             return _error(e.text or e.reason, e.status)
         raise
@@ -261,10 +291,12 @@ async def errors_middleware(request: web.Request, handler):
         return _error(REVOKED, 503, "yandex_unavailable")
     except YandexMusicError as e:
         log.warning("Ошибка Яндекс Музыки на %s: %r", request.path, e)
-        return _error(f"Яндекс Музыка: {e}", 502)
-    except Exception as e:
-        log.exception("Ошибка на %s", request.path)
-        return _error(f"{type(e).__name__}: {e}", 500)
+        return _error(f"Яндекс Музыка: {str(e)[:300]}", 502)
+    except Exception:
+        # Подробности — только в лог сервера: пользователю незачем видеть внутренности бота.
+        ref = secrets.token_hex(3)
+        log.exception("Ошибка на %s [%s]", request.path, ref)
+        return _error(f"Что-то пошло не так на сервере (код {ref}). Попробуйте ещё раз", 500)
 
 
 @web.middleware
@@ -272,8 +304,9 @@ async def auth_middleware(request: web.Request, handler):
     """Кто открыл приложение (подпись Telegram) и его аккаунт Яндекса."""
     if request.path.startswith("/api/"):
         ctx = request.app[CTX]
-        user = user_from_init_data(ctx.config.bot_token, request.headers.get("X-Telegram-Init-Data", ""))
-        request[USER] = user
+        data = verify_init_data(ctx.config.bot_token, request.headers.get("X-Telegram-Init-Data", ""))
+        request[INIT_DATA] = data
+        request[USER] = user = data.user
         if request.path not in PUBLIC_API:
             ym = await ctx.accounts.get(user.id)
             if ym is None:
@@ -295,9 +328,28 @@ def _user_id(request: web.Request) -> int:
     return request[USER].id
 
 
+async def _read_limited(chunks, limit: int, what: str) -> bytes:
+    """Читает поток по кусочкам и прерывает, как только он превысил limit (не дожидаясь конца)."""
+    buf = bytearray()
+    async for chunk in chunks:
+        buf += chunk
+        if len(buf) > limit:
+            raise web.HTTPRequestEntityTooLarge(limit, len(buf), text=f"{what} больше {limit // 1024} КБ")
+    return bytes(buf)
+
+
+async def _part_chunks(part):
+    while chunk := await part.read_chunk(256 * 1024):
+        yield chunk
+
+
 async def _json_body(request: web.Request) -> dict[str, Any]:
+    if (request.content_length or 0) > MAX_JSON_BYTES:
+        raise web.HTTPBadRequest(text="Слишком большой запрос")
     try:
-        body = await request.json()
+        body = json.loads(await _read_limited(request.content.iter_chunked(64 * 1024), MAX_JSON_BYTES, "Запрос"))
+    except web.HTTPRequestEntityTooLarge as e:
+        raise web.HTTPBadRequest(text="Слишком большой запрос") from e
     except ValueError as e:
         raise web.HTTPBadRequest(text="Ожидался JSON") from e
     if not isinstance(body, dict):
@@ -359,7 +411,14 @@ async def api_update_settings(request: web.Request) -> web.Response:
 
 @routes.get("/api/token")
 async def api_token(request: web.Request) -> web.Response:
-    """Свой OAuth-токен Яндекс Музыки — только его владельцу (подпись Telegram проверена), без кэширования."""
+    """Свой OAuth-токен Яндекс Музыки — только его владельцу (подпись Telegram проверена), без кэширования.
+
+    Остальные запросы принимают подпись до суток, а здесь нужна свежая: если кто-то добыл ссылку на открытое
+    приложение (в ней подпись), вечный токен он с неё уже не получит.
+    """
+    if init_data_age(request[INIT_DATA]) > TOKEN_MAX_AGE:
+        raise AuthError(401, "Для безопасности закройте и снова откройте приложение — тогда токен можно показать",
+                        code="stale_session")
     account = _ctx(request).store.get_account(_user_id(request))
     if account is None:
         raise AuthError(401, "Сначала подключите Яндекс Музыку", code="login_required")
@@ -582,6 +641,15 @@ def parse_meta(fields: dict[str, str], cover: bytes | None) -> TrackMeta:
 async def api_upload(request: web.Request) -> web.Response:
     """Файл с телефона прямо на сервер: лимит Telegram в 20 МБ здесь не действует."""
     ctx = _ctx(request)
+    if (request.content_length or 0) > request.client_max_size:
+        raise web.HTTPRequestEntityTooLarge(request.client_max_size, request.content_length)
+    # Файл целиком лежит в памяти, пока идёт в Яндекс, поэтому принимаем по одному на человека и немного сразу:
+    # тело запроса читаем, только когда подошла очередь.
+    async with ctx.upload_locks[_user_id(request)], ctx.upload_slots:
+        return await _upload(request, ctx)
+
+
+async def _upload(request: web.Request, ctx: WebContext) -> web.Response:
     ym = request[YM]
     reader = await request.multipart()
     fields: dict[str, str] = {}
@@ -589,13 +657,17 @@ async def api_upload(request: web.Request) -> web.Response:
     while (part := await reader.next()) is not None:
         if part.name == "file":
             file_name = part.filename or "track.mp3"
-            data = bytes(await part.read())
+            data = await _read_limited(_part_chunks(part), request.client_max_size, "Файл")
         elif part.name == "cover":
-            cover = bytes(await part.read())
-            if len(cover) > MAX_COVER_BYTES:
-                raise web.HTTPBadRequest(text="Обложка больше 10 МБ")
+            try:
+                cover = await _read_limited(_part_chunks(part), MAX_COVER_BYTES, "Обложка")
+            except web.HTTPRequestEntityTooLarge as e:
+                raise web.HTTPBadRequest(text="Обложка больше 10 МБ") from e
         elif part.name:
-            fields[part.name] = (await part.text()).strip()
+            if len(fields) >= 20:
+                raise web.HTTPBadRequest(text="Слишком много полей")
+            raw = await _read_limited(_part_chunks(part), MAX_JSON_BYTES, "Поле")
+            fields[part.name] = raw.decode("utf-8", errors="replace").strip()
     if not file_name or not data:
         raise web.HTTPBadRequest(text="Файл не передан")
     if not fields.get("kind", "").isdigit():
@@ -673,7 +745,8 @@ async def media_download(request: web.Request) -> web.Response:
     ctx = _ctx(request)
     user_id, ym, track_id = await _media_account(request, "download")
     track = await get_track(ym, track_id)
-    data, _ = await ym.download_tagged(track, get_quality(ctx.store, ctx.config, user_id, "download"))
+    async with ctx.download_slots:  # файл собирается в памяти целиком — не больше нескольких сразу
+        data, _ = await ym.download_tagged(track, get_quality(ctx.store, ctx.config, user_id, "download"))
     name = tagged_filename(track)
     return web.Response(body=data, content_type="audio/mpeg", headers={
         "Content-Disposition": f"attachment; filename=\"track.mp3\"; filename*=UTF-8''{quote(name)}",
@@ -753,6 +826,7 @@ def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sen
     app[CTX] = WebContext(config, bot, accounts, store, sender, MediaSigner(config.bot_token), StaticFiles(STATIC_DIR),
                           placer or TopPlacer())
     app.add_routes(routes)
+    app.on_response_prepare.append(security_headers)
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
     return app

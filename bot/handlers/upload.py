@@ -7,10 +7,12 @@ import html
 import io
 import itertools
 import logging
+import secrets
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import aiohttp
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -29,6 +31,7 @@ from bot.audio import (
 )
 from bot.callbacks import EditCb, UploadCb
 from bot.config import Config
+from bot.errors import describe_error
 from bot.keyboards import short, track_editor, upload_card
 from bot.placer import TopPlacer
 from bot.sender import retry_telegram
@@ -41,6 +44,7 @@ router = Router(name="upload")
 
 # Фоновые задачи «сообщить, что треки встали в начало плейлиста».
 _reports: set[asyncio.Task] = set()
+MAX_QUEUE = 30  # файлов в очереди у одного человека: бот открыт всем, а очередь хранится в памяти
 
 FIELDS = {
     "title": ("🎵", "Название", "новое название"),
@@ -152,7 +156,10 @@ async def prepare_file(qf: QueuedFile, data: bytes) -> tuple[str, bytes, list[st
 
 async def download_from_telegram(bot: Bot, file_id: str) -> bytes:
     buf = io.BytesIO()
-    await bot.download(file_id, destination=buf, timeout=600)
+    try:
+        await bot.download(file_id, destination=buf, timeout=600)
+    except (aiohttp.ClientError, TimeoutError) as e:  # в тексте таких ошибок адрес файла вместе с токеном бота
+        raise UploadError(f"Не удалось скачать файл из Telegram: {describe_error(e)}") from e
     return buf.getvalue()
 
 
@@ -219,6 +226,9 @@ async def on_audio(message: Message, bot: Bot, ym: YandexMusic, store: Storage, 
         return
     # Файлы, присланные разом, копятся в одну очередь с одной карточкой.
     async with uploads.queue_locks[user_id]:
+        if len(uploads.pending[user_id]) >= MAX_QUEUE:
+            await message.reply(f"😕 В очереди уже {MAX_QUEUE} файлов — сначала загрузите или отмените их.")
+            return
         uploads.pending[user_id].append(qf)
         await show_queue(bot, message.chat.id, user_id, ym, store, uploads)
 
@@ -332,7 +342,10 @@ async def show_editor(bot: Bot, chat_id: int, user_id: int, qf: QueuedFile, uplo
     uploads.editors[user_id] = await bot.send_message(chat_id, text, reply_markup=markup)
 
 
-async def _load_file(bot: Bot, qf: QueuedFile) -> None:
+async def _load_file(bot: Bot, qf: QueuedFile, uploads: UploadQueue, user_id: int) -> None:
+    for other in uploads.pending.get(user_id, []):
+        if other is not qf:
+            other.data = None  # в памяти держим только файл из открытого редактора (теги и обложка остаются)
     if qf.data is None:
         qf.data = await download_from_telegram(bot, qf.file_id)
         qf.tags = read_tags(qf.data)
@@ -345,7 +358,7 @@ async def on_edit_open(call: CallbackQuery, callback_data: EditCb, bot: Bot, upl
         await call.answer("Этого файла уже нет в очереди", show_alert=True)
         return
     await call.answer("⏳ Читаю данные трека…")
-    await _load_file(bot, qf)
+    await _load_file(bot, qf, uploads, call.from_user.id)
     await show_editor(bot, call.message.chat.id, call.from_user.id, qf, uploads)
 
 
@@ -500,8 +513,9 @@ async def upload_files(
             except (UploadError, ConversionError) as e:
                 failed.append(f"{html.escape(qf.file_name)} — {html.escape(str(e))}")
             except Exception as e:
-                log.exception("Ошибка загрузки %s", qf.file_name)
-                failed.append(f"{html.escape(qf.file_name)} — {html.escape(type(e).__name__)}: {html.escape(str(e))}")
+                ref = secrets.token_hex(3)
+                log.exception("Ошибка загрузки %s [%s]", qf.file_name, ref)
+                failed.append(f"{html.escape(qf.file_name)} — {html.escape(describe_error(e))} (код {ref})")
             finally:
                 qf.data = None  # байты больше не нужны
 

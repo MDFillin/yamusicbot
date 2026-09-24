@@ -127,8 +127,6 @@ def read_mp3_tags(data: bytes) -> tuple[str | None, str | None]:
 # называется .mp3, а внутри M4A или WebM — такое Яндекс отвергает с UNSUPPORTED_MEDIA_TYPE).
 FORMAT_NAMES = {"mp4": "M4A/AAC", "webm": "WebM", "ogg": "OGG", "flac": "FLAC", "wav": "WAV", "aiff": "AIFF",
                 "wma": "WMA", "ape": "APE", "aac": "AAC"}
-_FORMAT_EXT = {"mp3": ".mp3", "mp4": ".m4a", "webm": ".webm", "ogg": ".ogg", "flac": ".flac", "wav": ".wav",
-               "aiff": ".aiff", "wma": ".wma", "ape": ".ape", "aac": ".aac"}
 
 
 def _mpeg_frame(b0: int, b1: int, b2: int) -> str | None:
@@ -301,20 +299,64 @@ def write_mp3_tags(data: bytes, meta: TrackMeta) -> bytes:
     return buf.getvalue()
 
 
-async def _ffmpeg(args: list[str], src_name: str, src: bytes, dst_name: str) -> bytes:
-    with tempfile.TemporaryDirectory() as tmp:
-        src_path = Path(tmp) / src_name
-        dst_path = Path(tmp) / dst_name
-        src_path.write_bytes(src)
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src_path), *args, str(dst_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0 or not dst_path.exists():
-            raise ConversionError(stderr.decode(errors="replace").strip()[-500:] or "ffmpeg завершился с ошибкой")
-        return dst_path.read_bytes()
+# ffmpeg разбирает файлы от кого угодно, поэтому формат ему называем сами (по содержимому, а не по имени):
+# иначе файл «x.m3u8» с HLS-плейлистом внутри заставил бы его читать файлы сервера или ходить по ссылкам.
+_AUDIO_DEMUXERS = {"mp3": "mp3", "mp4": "mov", "webm": "matroska", "ogg": "ogg", "flac": "flac", "wav": "wav",
+                   "aiff": "aiff", "wma": "asf", "ape": "ape", "aac": "aac"}
+# Что ffmpeg может угадать сам, если формат по содержимому не опознали: без плейлистов (hls, concat) и прочего,
+# что открывает другие файлы или адреса.
+_PROBE_FORMATS = ",".join(sorted({*_AUDIO_DEMUXERS.values(), "ac3", "eac3", "dts", "amr", "wv", "tta", "caf", "w64",
+                                  "mpc", "mpc8"}))
+_IMAGE_DEMUXERS = {"jpeg": "jpeg_pipe", "png": "png_pipe", "webp": "webp_pipe", "gif": "gif"}
+FFMPEG_TIMEOUT = 600  # сек: трёхчасовой FLAC конвертируется за пару минут
+COVER_TIMEOUT = 60
+MAX_CONVERTED_BYTES = 400 * 1024 * 1024  # ~2 ч 50 мин в MP3 320 kbps; защищает диск от «бомб» из тишины
+MAX_COVER_PIXELS = 40_000_000  # картинка 50000×50000 из 10 МБ PNG заняла бы гигабайты памяти
+_ffmpeg_slots = asyncio.Semaphore(2)  # одновременно работающих ffmpeg на весь сервер
+
+
+class ConversionError(RuntimeError):
+    pass
+
+
+class FFmpegFailed(ConversionError):
+    """ffmpeg не смог разобрать или сконвертировать файл."""
+
+
+async def _ffmpeg(src: bytes, out_args: list[str], dst_name: str, *, demuxer: str | None = None,
+                  in_args: tuple[str, ...] = (), timeout: float | None = None,
+                  max_output: int | None = None) -> bytes:
+    """Запускает ffmpeg над байтами src: только локальный файл, заданный формат, ограничены время и размер."""
+    timeout = timeout or FFMPEG_TIMEOUT
+    max_output = max_output or MAX_CONVERTED_BYTES
+    async with _ffmpeg_slots:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = Path(tmp) / "input"
+            dst_path = Path(tmp) / dst_name
+            src_path.write_bytes(src)
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "-protocol_whitelist", "file", *in_args, *(("-f", demuxer) if demuxer else ()), "-i", str(src_path),
+                *out_args, "-fs", str(max_output), str(dst_path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+            except TimeoutError:
+                raise ConversionError("ffmpeg работал слишком долго — файл слишком длинный или повреждён") from None
+            finally:
+                if proc.returncode is None:  # таймаут или отмена запроса: процесс не должен остаться висеть
+                    proc.kill()
+                    await proc.wait()
+            if proc.returncode != 0 or not dst_path.exists():
+                message = stderr.decode(errors="replace").replace(tmp, "").strip()[-500:]
+                raise FFmpegFailed(message or "ffmpeg завершился с ошибкой")
+            if dst_path.stat().st_size >= max_output:  # -fs обрезает молча
+                raise ConversionError(f"После конвертации файл больше {max_output // (1024 * 1024)} МБ — "
+                                      "слишком длинная запись, разделите её на части")
+            return dst_path.read_bytes()
 
 
 async def normalize_cover(data: bytes) -> bytes:
@@ -332,28 +374,42 @@ async def normalize_cover(data: bytes) -> bytes:
         raise ConversionError("Пришлите обложку в JPEG или PNG")
     side = COVER_MAX_SIDE
     scale = f"scale='min({side},iw)':'min({side},ih)':force_original_aspect_ratio=decrease"
-    return await _ffmpeg(["-vf", scale, "-frames:v", "1", "-q:v", "3"], f"cover.{kind}", data, "cover.jpg")
+    try:
+        return await _ffmpeg(
+            data, ["-vf", scale, "-frames:v", "1", "-q:v", "3"], "cover.jpg", demuxer=_IMAGE_DEMUXERS[kind],
+            in_args=("-max_pixels", str(MAX_COVER_PIXELS)), timeout=COVER_TIMEOUT, max_output=MAX_COVER_BYTES,
+        )
+    except FFmpegFailed as e:
+        raise ConversionError("Не получилось прочитать картинку: она повреждена или слишком большая "
+                              f"(больше {MAX_COVER_PIXELS // 1_000_000} мегапикселей)") from e
 
 
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-class ConversionError(RuntimeError):
-    pass
+UNKNOWN_FORMAT = "Не удалось распознать аудио: пришлите MP3, M4A, FLAC, OGG/Opus, WAV, AIFF, WMA, APE или AAC"
 
 
-async def convert_to_mp3(data: bytes, source_ext: str, bitrate: int = 320) -> bytes:
-    """Конвертирует аудио в MP3 через ffmpeg (текстовые теги переносятся, обложку допишет prepare_for_upload)."""
+async def convert_to_mp3(data: bytes, fmt: str | None, bitrate: int = 320) -> bytes:
+    """Конвертирует аудио формата fmt (см. audio_format) в MP3 через ffmpeg.
+
+    Текстовые теги переносятся, обложку допишет prepare_for_upload.
+    """
     args = ["-map", "0:a:0", "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", f"{bitrate}k",
             "-id3v2_version", "3"]
-    return await _ffmpeg(args, f"in{source_ext or '.bin'}", data, "out.mp3")
+    if (demuxer := _AUDIO_DEMUXERS.get(fmt or "")) is not None:
+        return await _ffmpeg(data, args, "out.mp3", demuxer=demuxer)
+    try:  # формат не опознали: пусть ffmpeg угадает сам, но только среди обычных аудиоформатов
+        return await _ffmpeg(data, args, "out.mp3", in_args=("-format_whitelist", _PROBE_FORMATS))
+    except FFmpegFailed as e:
+        raise ConversionError(UNKNOWN_FORMAT) from e
 
 
 async def reencode_mp3(data: bytes) -> bytes:
     """Перекодирует файл в обычный MP3 320 kbps, сохраняя теги и обложку (когда Яндекс не принял файл как есть)."""
     meta = read_tags(data)
-    converted = await convert_to_mp3(data, _FORMAT_EXT.get(audio_format(data) or "", ".mp3"))
+    converted = await convert_to_mp3(data, audio_format(data) or "mp3")
     return write_mp3_tags(converted, meta)
 
 
@@ -391,7 +447,7 @@ async def prepare_for_upload(
 
     if needs_mp3:
         if ffmpeg_available():
-            data = await convert_to_mp3(data, _FORMAT_EXT.get(fmt or "", ext))
+            data = await convert_to_mp3(data, fmt)
             if ext == ".mp3":
                 notes.append(f"внутри файла не MP3, а {FORMAT_NAMES.get(fmt, fmt)} — сконвертирован в MP3")
             else:

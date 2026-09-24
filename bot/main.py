@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import html
 import logging
 import os
+import secrets
 import sys
 from typing import Any
 
@@ -101,9 +101,10 @@ def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storag
                 await dp["accounts"].reset(user.id)
             text = REVOKED
         else:
-            log.exception("Ошибка при обработке апдейта", exc_info=event.exception)
-            name = html.escape(type(event.exception).__name__)
-            text = f"⚠️ Ошибка: {name}: {html.escape(str(event.exception))[:500]}"
+            # Подробности — только в лог: бот открыт всем, внутренности сервера им ни к чему. Код поможет найти запись.
+            ref = secrets.token_hex(3)
+            log.error("Ошибка при обработке апдейта [%s]", ref, exc_info=event.exception)
+            text = f"⚠️ Что-то пошло не так (код <code>{ref}</code>). Попробуйте ещё раз."
         try:
             if update.message:
                 await update.message.answer(text)
