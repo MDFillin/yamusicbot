@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import mimetypes
-import random
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -20,11 +19,8 @@ from bot.audio import safe_filename, tag_mp3
 
 log = logging.getLogger(__name__)
 
-WEB_BASE_URL = "https://music.yandex.ru"
-
-
 START_RETRY_INTERVAL = 20  # сек: не долбить Яндекс повторными попытками на каждое сообщение
-API_BASE_URLS = ("https://api.music.yandex.net", "https://api.music.yandex.ru")
+API_BASE_URLS = ("https://api.music.yandex.ru", "https://api.music.yandex.net")
 # Заголовки, с которыми к этим хостам ходят приложение (.net) и новый сайт (.ru).
 API_HEADERS = {
     "api.music.yandex.net": {"X-Yandex-Music-Client": "YandexMusicAndroid/24023621"},
@@ -61,10 +57,10 @@ def _parse_upload_target(body: str) -> dict | str | None:
 
 
 def _describe_body(body: str) -> str:
-    body = body.strip()
+    body = " ".join(body.split())
     if body.startswith("<"):
         return "(HTML-страница вместо ответа API)"
-    return body[:150]
+    return body[:200]
 
 
 class UploadError(RuntimeError):
@@ -128,12 +124,10 @@ class YandexMusic:
         token: str,
         *,
         max_bitrate: int = 320,
-        web_base_url: str = WEB_BASE_URL,
         api_base_urls: Sequence[str] = API_BASE_URLS,
     ) -> None:
         self._token = token
         self._max_bitrate = max_bitrate
-        self._web_base_url = web_base_url.rstrip("/")
         self._api_base_urls = [u.rstrip("/") for u in api_base_urls]
         self._client: ClientAsync | None = None
         self._session: aiohttp.ClientSession | None = None
@@ -336,35 +330,26 @@ class YandexMusic:
 
         Новый сайт (music.yandex.ru v4) делает это так:
             loaderResource.getUploadUrl({playlistId: `${uid}:${kind}`, uid, path: fileName})
-        — это запрос loader/upload-url к API. Пробуем его на обоих хостах API, а старый адрес
-        сайта (handlers/ugc-upload.jsx, до 2026 года) оставляем последним запасным вариантом.
+        — это POST на loader/upload-url (на GET сервер отвечает 405 «method GET is not supported»).
+        Параметры кладём и в адрес, и в тело формы: Java-сервлет загрузчика читает их откуда угодно.
+        Старый адрес сайта handlers/ugc-upload.jsx Яндекс убрал в 2026 году.
         """
         if self.uid is None:
             raise UploadError("Бот ещё не подключился к Яндекс Музыке")
         playlist_id = f"{self.uid}:{playlist_kind}"
-        loader_params = {
+        params = {
             "uid": str(self.uid),
             "playlist-id": playlist_id,
             "playlistId": playlist_id,  # имя параметра в коде сайта; сервер лишний проигнорирует
             "path": filename,
         }
-        candidates = [
-            (f"{base}/loader/upload-url", loader_params, API_HEADERS.get(_host(base), {}))
-            for base in self._api_base_urls
-        ]
-        candidates.append((f"{self._web_base_url}/handlers/ugc-upload.jsx", {
-            "filename": filename,
-            "kind": str(playlist_kind),
-            "visibility": "private",
-            "external-domain": "music.yandex.ru",
-            "overembed": "false",
-            "ncrnd": repr(random.random()),
-        }, {}))
 
         attempts = []
-        for url, params, headers in candidates:
+        for base in self._api_base_urls:
+            url = f"{base}/loader/upload-url"
+            headers = API_HEADERS.get(_host(base), {})
             try:
-                async with self._http().get(url, params=params, headers=headers) as resp:
+                async with self._http().post(url, params=params, data=params, headers=headers) as resp:
                     body = await resp.text()
                     status = resp.status
             except aiohttp.ClientError as e:
