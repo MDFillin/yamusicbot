@@ -32,8 +32,9 @@ services:
     # Сервер управления fxTunnel переехал на fxtun.ru; только TLS, без старого открытого порта 4443.
     command: ["http", "${WEB_PORT:-8080}", "--domain", "${FXTUNNEL_DOMAIN:-}", "--server", "${FXTUNNEL_SERVER:-tunnel.fxtun.ru:443}",
               "--no-inspect", "--log-level", "info"]
+    # Токен entrypoint.sh проверяет и передаёт клиенту флагом --token.
     environment:
-      FXTUNNEL_SERVER_TOKEN: ${FXTUNNEL_TOKEN:-}
+      FXTUNNEL_TOKEN: ${FXTUNNEL_TOKEN:-}
     restart: unless-stopped
 
 volumes:

@@ -102,7 +102,7 @@ docker compose up -d --build --force-recreate
 (туннели Cloudflare там сейчас замедляют). Зарегистрируйтесь на https://fxtun.ru, создайте токен в разделе «Токены»
 и впишите в `.env`:
 ```bash
-FXTUNNEL_TOKEN=sk_...
+FXTUNNEL_TOKEN=sk_fxtunnel_...   # показывается один раз при создании
 FXTUNNEL_DOMAIN=my-music        # 3–32 символа: латиница, цифры, дефис
 COMPOSE_PROFILES=tunnel
 ```

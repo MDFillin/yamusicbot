@@ -294,16 +294,18 @@ docker compose up -d --build --force-recreate
 Туннель: сервер сам подключается к [fxTunnel](https://github.com/mephistofox/fxtun.dev) и получает адрес
 `https://имя.fxtun.ru`. Это российский сервис, бесплатный, открывается из России.
 
-1. Зарегистрируйся на **https://fxtun.ru**. В личном кабинете, в разделе **«Токены»**, создай токен. Он начинается с `sk_`.
+1. Зарегистрируйся на **https://fxtun.ru**. В личном кабинете, в разделе **«Токены»**, создай токен и сразу скопируй его:
+   он показывается один раз и выглядит как `sk_fxtunnel_` и ещё 48 букв и цифр.
 2. Придумай имя поддомена: 3–32 символа, латиница, цифры и дефис, например `bobik-music`.
 3. Если раньше настраивал DuckDNS (шаги 8.1–8.3), убери те настройки и останови Caddy:
    ```bash
    docker compose --profile https down
    sed -i '/^WEBAPP_URL=/d;/^DOMAIN=/d;/^COMPOSE_PROFILES=/d' .env
    ```
-4. Допиши настройки. В строке `printf` подставь свой токен и имя вместо `sk_ТОКЕН` и `bobik-music`:
+4. Допиши настройки. Первая команда попросит вставить токен (вставь и нажми Enter), во второй замени `bobik-music` на своё имя:
    ```bash
-   printf 'FXTUNNEL_TOKEN=%s\nFXTUNNEL_DOMAIN=%s\nCOMPOSE_PROFILES=tunnel\n' 'sk_ТОКЕН' 'bobik-music' >> .env
+   sed -i '/^FXTUNNEL_TOKEN=/d' .env; read -r -p "Токен fxTunnel: " T; printf 'FXTUNNEL_TOKEN=%s\n' "$T" >> .env; unset T
+   printf 'FXTUNNEL_DOMAIN=%s\nCOMPOSE_PROFILES=tunnel\n' 'bobik-music' >> .env
    ```
 5. Запусти:
    ```bash
@@ -407,7 +409,10 @@ curl -m 15 -sS -o /dev/null -w '%{http_code}\n' https://api.telegram.org
 | в логах `Conflict: terminated by other getUpdates request` | Этот же бот запущен где-то ещё (например, на твоём компьютере). Останови вторую копию |
 | бот пишет «Этот бот приватный» | Твоего ID нет в `ALLOWED_USERS`, или ты забыл `docker compose up -d --force-recreate` |
 | нет кнопки «Медиатека», а `/app` пишет «не настроено» | `WEBAPP_URL` не заполнен или не применён: шаг 8.2 и 8.3. Потом перезапусти Telegram |
-| в логах туннеля `all endpoints failed` или `unauthorized` | Проверь `FXTUNNEL_TOKEN` в `.env` (без пробелов и кавычек). Если токен верный, с сервера недоступен fxtun.ru |
+| в логах туннеля `fxTunnel: … FXTUNNEL_TOKEN …` | Туннель сам пишет, что не так с токеном. Впиши токен заново командой из шага 8Б, пункт 4, и выполни `docker compose up -d --force-recreate tunnel` |
+| в логах туннеля `invalid token` | Сначала обнови бота: `git pull` и `docker compose up -d --build --force-recreate` (старая версия не передавала токен туннелю). Не помогло — fxTunnel не знает такой токен: создай в кабинете fxtun.ru новый, скопируй целиком и впиши командой из шага 8Б, пункт 4 |
+| в логах туннеля `session shutdown` | После многих неудачных попыток fxTunnel на несколько минут перестаёт пускать. Останови туннель (`docker compose stop tunnel`), подожди 5 минут, исправь токен и запусти снова |
+| в логах туннеля `all endpoints failed` | С сервера недоступен fxtun.ru: проверь `curl -sS -o /dev/null -w '%{http_code}\n' https://fxtun.ru` |
 | `https://...duckdns.org` не открывается | Проверь IP на duckdns.org и открытые порты 80/443. Логи Caddy: `docker compose logs --tail 50 caddy` |
 | в «Медиатеке» «Нет доступа» | Твоего ID нет в `ALLOWED_USERS` |
 | в «Медиатеке» «Сессия устарела» | Закрой приложение и открой заново |
