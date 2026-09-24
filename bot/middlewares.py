@@ -9,9 +9,19 @@ from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.dispatcher.flags import get_flag
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultsButton,
+    Message,
+    TelegramObject,
+    Update,
+)
 
 from bot.accounts import Accounts
+from bot.admin import Admin
 from bot.callbacks import MenuCb
 from bot.ym import YandexNotReady
 
@@ -73,3 +83,37 @@ async def _tell(event: TelegramObject, text: str, markup: InlineKeyboardMarkup, 
         await event.answer(text, reply_markup=markup)
     elif isinstance(event, CallbackQuery):
         await event.answer(alert[:190], show_alert=True)
+    elif isinstance(event, InlineQuery):
+        button = InlineQueryResultsButton(text="🔑 Подключите Яндекс Музыку в боте", start_parameter="login")
+        await event.answer([], cache_time=5, is_personal=True, button=button)
+
+
+class AccessMiddleware(BaseMiddleware):
+    """Внешняя middleware на все апдейты: отмечает, кто пользуется ботом, и не пускает заблокированных,
+    а во время техработ или при закрытой регистрации — всех, кроме админов."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        admin: Admin = data["admin"]
+        if user is None or user.is_bot:
+            return await handler(event, data)
+        admin.touch(user)
+        reason = admin.check(user.id)
+        if reason is None:
+            return await handler(event, data)
+
+        text = admin.reason_text(reason)
+        inner = event.event if isinstance(event, Update) else event
+        if isinstance(inner, Message) and admin.should_notify_denied(user.id):
+            await inner.answer(text)
+        elif isinstance(inner, CallbackQuery):
+            await inner.answer(text[:190], show_alert=True)
+        elif isinstance(inner, InlineQuery):
+            button = InlineQueryResultsButton(text=text[:60], start_parameter="start")
+            await inner.answer([], cache_time=60, is_personal=True, button=button)
+        return None

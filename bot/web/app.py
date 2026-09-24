@@ -24,6 +24,7 @@ from yandex_music import Album, Artist, Playlist, Track
 from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
 from bot.accounts import Accounts, LoginError, LoginSession
+from bot.admin import ADMIN_MAX_AGE, Admin, LimitReached
 from bot.audio import (
     MAX_COVER_BYTES,
     ConversionError,
@@ -123,6 +124,7 @@ class WebContext:
     signer: MediaSigner
     static: StaticFiles
     placer: TopPlacer = field(default_factory=TopPlacer)
+    admin: Admin | None = None  # задаётся в create_app
     http: aiohttp.ClientSession | None = None
     sources: TTLCache = field(default_factory=lambda: TTLCache(SOURCE_TTL, 300))
     links: TTLCache = field(default_factory=lambda: TTLCache(LINK_TTL, 2000))
@@ -236,6 +238,8 @@ async def security_headers(request: web.Request, resp: web.StreamResponse) -> No
     """Заголовки безопасности на всех ответах, включая ошибки и потоковые (вызывается перед отправкой)."""
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Content-Security-Policy", CSP)
+    if request.path.startswith("/api/admin/"):
+        resp.headers["Cache-Control"] = "no-store"
 
 
 @web.middleware
@@ -281,6 +285,8 @@ async def errors_middleware(request: web.Request, handler):
         return _error(str(e), 404)
     except (UploadError, ConversionError, TrackTooLargeError) as e:
         return _error(str(e), 422)
+    except LimitReached as e:
+        return _error(str(e), 429, "limit")
     except ValueError as e:
         log.info("Некорректный запрос %s: %s", request.path, e)
         return _error("Некорректный запрос", 400)
@@ -307,6 +313,19 @@ async def auth_middleware(request: web.Request, handler):
         data = verify_init_data(ctx.config.bot_token, request.headers.get("X-Telegram-Init-Data", ""))
         request[INIT_DATA] = data
         request[USER] = user = data.user
+        admin = ctx.admin
+        if request.path.startswith("/api/admin/"):
+            # Для всех, кроме ADMIN_IDS, админки не существует (404), а попытка попадает в журнал.
+            if not admin.is_admin(user.id):
+                await admin.probe(user, f"{request.method} {request.path}")
+                raise web.HTTPNotFound()
+            if init_data_age(data) > ADMIN_MAX_AGE:
+                raise AuthError(401, "Для безопасности закройте и снова откройте приложение", code="stale_session")
+            admin.touch(user)
+            return await handler(request)
+        admin.touch(user)
+        if (reason := admin.check(user.id)) is not None:
+            raise AuthError(403, admin.reason_text(reason), code=reason)
         if request.path not in PUBLIC_API:
             ym = await ctx.accounts.get(user.id)
             if ym is None:
@@ -373,6 +392,8 @@ async def api_me(request: web.Request) -> web.Response:
         "can_convert": ffmpeg_available(),
         "max_upload_mb": ctx.config.web_max_upload_mb,
     }
+    if ctx.admin.is_admin(user_id):
+        info["is_admin"] = True
     ym = await ctx.accounts.get(user_id)  # не подключиться — 503 с объяснением
     if ym is not None:
         info.update(connected=True, login=ym.login, has_plus=ym.has_plus,
@@ -643,6 +664,7 @@ async def api_upload(request: web.Request) -> web.Response:
     ctx = _ctx(request)
     if (request.content_length or 0) > request.client_max_size:
         raise web.HTTPRequestEntityTooLarge(request.client_max_size, request.content_length)
+    ctx.admin.check_limit(_user_id(request), "upload")
     # Файл целиком лежит в памяти, пока идёт в Яндекс, поэтому принимаем по одному на человека и немного сразу:
     # тело запроса читаем, только когда подошла очередь.
     async with ctx.upload_locks[_user_id(request)], ctx.upload_slots:
@@ -680,6 +702,7 @@ async def _upload(request: web.Request, ctx: WebContext) -> web.Response:
     )
     known = await ctx.placer.before_upload(ym, kind)
     result = await ym.upload_track(kind, name, prepared)
+    ctx.admin.count(_user_id(request), "upload")
     ctx.placer.after_upload(ym, kind, known, result.ugc_track_id)  # встанет в начало, когда Яндекс обработает
     ctx.invalidate(_user_id(request))
     if result.note:
@@ -697,6 +720,8 @@ async def _media_account(request: web.Request, kind: str) -> tuple[int, YandexMu
     if not user.isdigit() or not ctx.signer.verify(kind, int(user), track_id,
                                                    request.query.get("exp"), request.query.get("sig")):
         raise web.HTTPForbidden(text="Ссылка недействительна или устарела")
+    if ctx.admin.check(int(user)) is not None:  # заблокирован или техработы — ссылки тоже не работают
+        raise web.HTTPForbidden(text="Доступ закрыт")
     ym = await ctx.accounts.get(int(user))
     if ym is None:
         raise web.HTTPForbidden(text="Аккаунт Яндекса отключён")
@@ -745,8 +770,10 @@ async def media_download(request: web.Request) -> web.Response:
     ctx = _ctx(request)
     user_id, ym, track_id = await _media_account(request, "download")
     track = await get_track(ym, track_id)
+    ctx.admin.check_limit(user_id, "download")
     async with ctx.download_slots:  # файл собирается в памяти целиком — не больше нескольких сразу
         data, _ = await ym.download_tagged(track, get_quality(ctx.store, ctx.config, user_id, "download"))
+    ctx.admin.count(user_id, "download")
     name = tagged_filename(track)
     return web.Response(body=data, content_type="audio/mpeg", headers={
         "Content-Disposition": f"attachment; filename=\"track.mp3\"; filename*=UTF-8''{quote(name)}",
@@ -818,14 +845,16 @@ async def _cleanup(app: web.Application) -> None:
 
 
 def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sender: TrackSender,
-               placer: TopPlacer | None = None) -> web.Application:
+               placer: TopPlacer | None = None, admin: Admin | None = None) -> web.Application:
+    from bot.web import admin_api  # модуль берёт CTX и USER отсюда
     app = web.Application(
         client_max_size=config.web_max_upload_mb * 1024 * 1024,
         middlewares=[compress_middleware, errors_middleware, auth_middleware],
     )
     app[CTX] = WebContext(config, bot, accounts, store, sender, MediaSigner(config.bot_token), StaticFiles(STATIC_DIR),
-                          placer or TopPlacer())
+                          placer or TopPlacer(), admin or Admin(config, store, accounts, bot))
     app.add_routes(routes)
+    app.add_routes(admin_api.routes)
     app.on_response_prepare.append(security_headers)
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)

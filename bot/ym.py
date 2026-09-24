@@ -222,8 +222,8 @@ class YandexMusic:
 
     # ---------- каталог ----------
 
-    async def search(self, query: str, type_: str = "all") -> Search | None:
-        return await self.client.search(query, type_=type_)
+    async def search(self, query: str, type_: str = "all", page: int = 0) -> Search | None:
+        return await self.client.search(query, type_=type_, page=page)
 
     async def get_tracks(self, track_ids: Sequence[str]) -> list[Track]:
         result: list[Track] = []

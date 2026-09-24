@@ -10,6 +10,7 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
 
+from bot.admin import LimitReached
 from bot.callbacks import BulkCb, CancelBulkCb, TrackCb
 from bot.errors import describe_error
 from bot.keyboards import cancel_bulk
@@ -96,8 +97,8 @@ async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexM
             try:
                 await sender.send(chat_id, track, ym)
                 sent += 1
-            except asyncio.CancelledError:
-                raise
+            except (asyncio.CancelledError, LimitReached):
+                raise  # лимит на сегодня исчерпан — дальше качать бессмысленно
             except Exception as e:
                 log.warning("Трек %s не скачался: %s", track.id, e)
                 failed.append(f"{track_title(track)} — {describe_error(e)}")
@@ -107,6 +108,8 @@ async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexM
         raise
     except SourceNotFoundError as e:
         text = f"😕 {html.escape(str(e))}"
+    except LimitReached as e:
+        text = f"⛔ {html.escape(str(e))}\nОтправлено {sent} из {total}."
     except Exception as e:
         log.exception("Ошибка массового скачивания")
         text = f"⚠️ Скачивание прервалось: {html.escape(describe_error(e))}\nОтправлено {sent} из {total}."

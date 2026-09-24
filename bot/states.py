@@ -10,3 +10,7 @@ class EditTrack(StatesGroup):
     # В данных состояния: pid — какой файл из очереди правим, field — какое поле (для text).
     text = State()
     cover = State()
+
+
+class AdminStates(StatesGroup):
+    broadcast = State()  # ждём текст рассылки; в данных — text после предпросмотра

@@ -97,3 +97,18 @@ def test_only_bot_token_is_required(monkeypatch):
     monkeypatch.setenv("BOT_TOKEN", "")
     with pytest.raises(ConfigError, match="BOT_TOKEN"):
         load_config()
+
+
+def test_admin_ids(monkeypatch):
+    import pytest as _pytest
+
+    from bot.config import ConfigError, load_config
+
+    monkeypatch.setenv("BOT_TOKEN", "1:x")
+    monkeypatch.setenv("ADMIN_IDS", "123456789, 42")
+    assert load_config().admin_ids == frozenset({123456789, 42})
+    monkeypatch.setenv("ADMIN_IDS", "")
+    assert load_config().admin_ids == frozenset()
+    monkeypatch.setenv("ADMIN_IDS", "@myname")
+    with _pytest.raises(ConfigError, match="ADMIN_IDS"):
+        load_config()

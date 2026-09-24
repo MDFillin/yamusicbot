@@ -1,13 +1,14 @@
 from aiogram import Router
 
-from bot.handlers import account, browse, common, download, upload
+from bot.handlers import account, admin, browse, common, download, inline, upload
 
 
 def build_router() -> Router:
     root = Router(name="root")
-    # Порядок важен: команды и меню -> вход в Яндекс -> загрузка (в т.ч. ввод названия плейлиста)
-    # -> скачивание -> поиск -> остальное.
+    # Порядок важен: команды и меню -> админка (только для ADMIN_IDS) -> вход в Яндекс -> загрузка
+    # (в т.ч. ввод названия плейлиста) -> скачивание -> инлайн -> поиск -> остальное.
     root.include_routers(
-        common.router, account.router, upload.router, download.router, browse.router, common.fallback_router,
+        common.router, admin.router, account.router, upload.router, download.router, inline.router, browse.router,
+        common.fallback_router,
     )
     return root

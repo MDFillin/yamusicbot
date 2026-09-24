@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import html
 
-from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram import Bot, F, Router
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, User
 
+from bot.accounts import Accounts
 from bot.callbacks import MenuCb, NoopCb
 from bot.config import Config
 from bot.handlers.browse import playlists_text, show_source, target_prompt
 from bot.keyboards import app_button, main_menu, welcome_menu
 from bot.middlewares import YANDEX_PROBLEM, login_button
+from bot.sender import TrackSender
 from bot.storage import Storage
-from bot.ym import YandexMusic
+from bot.ym import YandexMusic, track_title
 
 router = Router(name="common")
 PUBLIC = {"public": True}  # обработчик работает и без подключённой Яндекс Музыки
@@ -38,6 +40,9 @@ HELP = f"""<b>🎧 Что умеет бот</b>
 • Загруженные треки встают в <b>начало</b> плейлиста — листать вниз не нужно.
 • /target — плейлист по умолчанию: загрузка в него одной кнопкой.
 • FLAC, M4A, WAV и другие форматы бот сам переведёт в MP3, обложка из файла сохранится.
+
+<b>💬 В любом чате</b>
+• Наберите <code>@{{bot}}</code> и название песни — трек уйдёт собеседнику. Без запроса покажу «Мне нравится».
 
 <b>⚙️ Управление</b>
 • Под каждым треком: ❤️ в любимые, ➕ добавить в плейлист.
@@ -79,6 +84,31 @@ def welcome(user: User | None, config: Config) -> tuple[str, InlineKeyboardMarku
     return WELCOME.format(name=name), welcome_menu(config.webapp_url)
 
 
+@router.message(CommandStart(deep_link=True, magic=F.args.regexp(r"^(login|t[\w-]+)$")), flags=PUBLIC)
+async def start_link(message: Message, command: CommandObject, state: FSMContext, config: Config,
+                     accounts: Accounts, sender: TrackSender, ym: YandexMusic | None, ym_error: str | None) -> None:
+    """Ссылки t.me/бот?start=…: login — сразу ко входу, t<id> — прислать трек (кнопка под треком из инлайна)."""
+    await state.clear()
+    arg = command.args
+    if arg == "login":
+        from bot.handlers.account import begin_login  # account импортирует этот модуль
+
+        await begin_login(message, message.from_user.id, accounts, config, ym)
+        return
+    if ym is None:
+        await start(message, state, config, ym, ym_error)
+        return
+    track = await ym.get_track(arg[1:])
+    if track is None:
+        await message.answer("😕 Трек не найден")
+        return
+    status = await message.answer(f"⏳ Скачиваю «{html.escape(track_title(track))}»…")
+    try:
+        await sender.send(message.chat.id, track, ym)
+    finally:
+        await status.delete()
+
+
 @router.message(CommandStart(), flags=PUBLIC)
 async def start(message: Message, state: FSMContext, config: Config, ym: YandexMusic | None,
                 ym_error: str | None) -> None:
@@ -111,15 +141,19 @@ async def open_app(message: Message, config: Config) -> None:
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button]]))
 
 
+async def help_text(bot: Bot) -> str:
+    return HELP.format(bot=html.escape((await bot.me()).username or "имя_бота"))
+
+
 @router.message(Command("help"), flags=PUBLIC)
-async def help_(message: Message) -> None:
-    await message.answer(HELP)
+async def help_(message: Message, bot: Bot) -> None:
+    await message.answer(await help_text(bot))
 
 
 @router.callback_query(MenuCb.filter(F.action == "help"), flags=PUBLIC)
-async def help_button(call: CallbackQuery) -> None:
+async def help_button(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
-    await call.message.answer(HELP)
+    await call.message.answer(await help_text(bot))
 
 
 @router.message(Command("cancel"), flags=PUBLIC)

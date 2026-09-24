@@ -15,14 +15,30 @@ from aiogram.client.session.base import BaseSession
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import (
     AnswerCallbackQuery,
+    AnswerInlineQuery,
     DeleteMessage,
+    EditMessageMedia,
     EditMessageText,
     GetFile,
+    GetMe,
     SendAudio,
+    SendDocument,
     SendMessage,
     SendPhoto,
 )
-from aiogram.types import Audio, CallbackQuery, Chat, Document, File, Message, PhotoSize, Update, User
+from aiogram.types import (
+    Audio,
+    CallbackQuery,
+    Chat,
+    ChosenInlineResult,
+    Document,
+    File,
+    InlineQuery,
+    Message,
+    PhotoSize,
+    Update,
+    User,
+)
 
 from bot import accounts as accounts_module
 from bot.accounts import Accounts
@@ -74,8 +90,13 @@ class FakeTelegram(BaseSession):
                 message_id=next(self._ids), date=datetime.now(), chat=Chat(id=method.chat_id, type="private"),
                 audio=Audio(file_id="AUDIO-1", file_unique_id="a1", duration=method.duration or 0),
             ).as_(bot)
-        if isinstance(method, (AnswerCallbackQuery, DeleteMessage)):
+        if isinstance(method, (AnswerCallbackQuery, DeleteMessage, AnswerInlineQuery, EditMessageMedia)):
             return True
+        if isinstance(method, GetMe):
+            return User(id=42, is_bot=True, first_name="Bot", username="testbot", supports_inline_queries=True)
+        if isinstance(method, SendDocument):
+            return Message(message_id=next(self._ids), date=datetime.now(),
+                           chat=Chat(id=method.chat_id, type="private"), caption=method.caption).as_(bot)
         raise AssertionError(f"Неожиданный запрос к Telegram: {type(method).__name__}")
 
     def texts(self) -> list[str]:
@@ -94,7 +115,7 @@ class FakeTelegram(BaseSession):
 def make_track():
     album = NS(id=1, title="Звезда по имени Солнце", year=1989)
     return NS(id=123, title="Кукушка", version=None, artists=[NS(name="Кино")], duration_ms=400_000,
-              albums=[album], available=True)
+              albums=[album], available=True, cover_uri="avatars.yandex.net/get-music-content/x/%%")
 
 
 class FakeYM:
@@ -144,9 +165,15 @@ class FakeYM:
     async def download_cover(self, track, size="400x400"):
         return b"\xff\xd8cover"
 
-    async def search(self, query, type_):
+    async def get_liked_track_ids(self):
+        return ["123:1"]
+
+    async def get_tracks(self, ids):
+        return [make_track() for _ in ids]
+
+    async def search(self, query, type_, page=0):
         self.searches.append(query)
-        return NS(misspell_corrected=False, misspell_result=None, tracks=NS(results=[make_track()]),
+        return NS(misspell_corrected=False, misspell_result=None, tracks=NS(results=[make_track()], total=1),
                   albums=None, playlists=None, artists=None)
 
 
@@ -189,7 +216,7 @@ def env(tmp_path, monkeypatch):
     store.set_account(OWNER.id, "tok-owner", "me")
     store.set_account(FRIEND.id, "tok-friend", "friend")
     accounts = Accounts(store, factory=fakes.__getitem__, oauth=FakeOAuth())
-    config = Config(bot_token="42:TEST", data_dir=tmp_path)
+    config = Config(bot_token="42:TEST", data_dir=tmp_path, admin_ids=frozenset({OWNER.id}))
     # Роутеры aiogram подключаются к диспетчеру только один раз, поэтому между тестами меняем лишь зависимости.
     placer = FakePlacer()
     if _dispatcher is None:
@@ -583,3 +610,152 @@ async def test_upload_queue_is_limited(env, monkeypatch):
         await env.dp.feed_update(env.bot, audio_update(file_id))
     assert "В очереди уже 2 файлов" in env.tg.texts()[-1]
     assert [f.file_id for f in env.dp.workflow_data["uploads"].pending[OWNER.id]] == ["F1", "F2"]
+
+
+# ---------- инлайн-режим ----------
+
+def inline_update(query: str, user: User = OWNER, offset: str = "") -> Update:
+    iq = InlineQuery(id=str(next(_update_ids)), from_user=user, query=query, offset=offset)
+    return Update(update_id=next(_update_ids), inline_query=iq)
+
+
+def chosen_update(result_id: str, user: User = OWNER) -> Update:
+    chosen = ChosenInlineResult(result_id=result_id, from_user=user, query="кино", inline_message_id="IM1")
+    return Update(update_id=next(_update_ids), chosen_inline_result=chosen)
+
+
+def inline_answers(env) -> list[AnswerInlineQuery]:
+    return [c for c in env.tg.calls if isinstance(c, AnswerInlineQuery)]
+
+
+async def test_inline_search_then_send_track(env):
+    await env.dp.feed_update(env.bot, inline_update("кино"))
+    [answer] = inline_answers(env)
+    assert env.ym.searches == ["кино"] and answer.is_personal
+    [result] = answer.results
+    assert result.type == "article" and result.id == "t:123" and result.title == "Кукушка"
+    assert "Загружаю" in result.input_message_content.message_text
+    assert result.reply_markup.inline_keyboard[0][0].url == "https://t.me/testbot?start=t123"
+
+    # Выбрали трек: бот качает его, кладёт в Telegram (через свой чат, без звука) и подменяет сообщение аудио.
+    await env.dp.feed_update(env.bot, chosen_update("t:123"))
+    [upload] = [c for c in env.tg.calls if isinstance(c, SendAudio)]
+    assert upload.chat_id == OWNER.id and upload.disable_notification
+    assert any(isinstance(c, DeleteMessage) for c in env.tg.calls), "служебное сообщение удалено"
+    [edit] = [c for c in env.tg.calls if isinstance(c, EditMessageMedia)]
+    assert edit.inline_message_id == "IM1" and edit.media.media == "AUDIO-1"
+
+    # Второй раз — из кэша, мгновенно.
+    env.tg.calls.clear()
+    await env.dp.feed_update(env.bot, inline_update("кино"))
+    [result] = inline_answers(env)[0].results
+    assert result.type == "audio" and result.audio_file_id == "AUDIO-1"
+
+
+async def test_inline_empty_query_shows_likes(env):
+    await env.dp.feed_update(env.bot, inline_update(""))
+    [answer] = inline_answers(env)
+    assert [r.id for r in answer.results] == ["t:123"] and env.ym.searches == []
+    assert "Мне нравится" in answer.button.text
+
+
+async def test_inline_without_yandex_offers_login(env):
+    await env.dp.feed_update(env.bot, inline_update("кино", NEWBIE))
+    [answer] = inline_answers(env)
+    assert answer.results == [] and answer.button.start_parameter == "login"
+
+
+async def test_start_links_from_inline(env):
+    await env.dp.feed_update(env.bot, message_update(text="/start t123"))
+    assert any(isinstance(c, SendAudio) for c in env.tg.calls), "трек из кнопки «Слушать в боте»"
+    await env.dp.feed_update(env.bot, message_update(NEWBIE, text="/start login"))
+    assert "<code>ABCD1234</code>" in env.tg.texts()[-1]
+
+
+# ---------- админка в чате ----------
+
+async def test_admin_commands_only_for_admin(env):
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="/admin"))
+    assert "Не понял" in env.tg.texts()[-1], "для остальных команды нет"
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="/ban 1"))
+    assert "Не понял" in env.tg.texts()[-1]
+    assert not env.store.is_banned(OWNER.id)
+
+    await env.dp.feed_update(env.bot, message_update(text="/admin"))
+    assert "🛡 <b>Админ-панель</b>" in env.tg.texts()[-1] and "Пользователей: <b>2</b>" in env.tg.texts()[-1]
+
+
+async def test_admin_bans_user(env):
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="кино"))
+    await env.dp.feed_update(env.bot, message_update(text=f"/ban {FRIEND.id} спам"))
+    assert "заблокирован" in env.tg.texts()[-1]
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="кино"))
+    assert "Доступ к боту для вас закрыт" in env.tg.texts()[-1]
+    assert env.friend.searches == ["кино"], "после блокировки бот его запросы не выполняет"
+    await env.dp.feed_update(env.bot, message_update(text=f"/ban {OWNER.id}"))
+    assert "Админа заблокировать нельзя" in env.tg.texts()[-1]
+
+    await env.dp.feed_update(env.bot, message_update(text=f"/user {FRIEND.id}"))
+    assert "⛔ <b>Заблокирован</b>: спам" in env.tg.texts()[-1]
+    from bot.callbacks import AdminCb
+    await env.dp.feed_update(env.bot, callback_update(AdminCb(action="unban", user=FRIEND.id).pack()))
+    assert not env.store.is_banned(FRIEND.id)
+    assert [e["action"] for e in env.store.audit()] == ["unban", "ban"]
+
+
+async def test_admin_maintenance_mode(env):
+    from bot.callbacks import AdminCb
+    await env.dp.feed_update(env.bot, callback_update(AdminCb(action="maintenance").pack()))
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="кино"))
+    assert "техническом обслуживании" in env.tg.texts()[-1] and env.friend.searches == []
+    await env.dp.feed_update(env.bot, message_update(text="кино"))
+    assert env.ym.searches == ["кино"], "админ пользуется ботом и во время техработ"
+    await env.dp.feed_update(env.bot, callback_update(AdminCb(action="maintenance").pack(), FRIEND))
+    assert env.dp["admin"].settings.maintenance, "кнопки админки у других не работают"
+
+
+async def test_download_limit(env):
+    env.dp["admin"].update_settings(OWNER.id, {"download_limit": 1})
+    await env.dp.feed_update(env.bot, callback_update(TrackCb(action="dl", track="123").pack(), FRIEND))
+    await env.dp.feed_update(env.bot, callback_update(TrackCb(action="dl", track="123").pack(), FRIEND))
+    assert "Дневной лимит скачиваний (1) исчерпан" in env.tg.texts()[-1]
+    assert len([c for c in env.tg.calls if isinstance(c, SendAudio)]) == 1
+
+
+async def test_admin_broadcast_from_chat(env):
+    from bot.callbacks import AdminCb
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="/start"))
+    await env.dp.feed_update(env.bot, message_update(text="/broadcast"))
+    await env.dp.feed_update(env.bot, message_update(text="Новая версия бота!"))
+    assert env.tg.texts()[-2] == "Новая версия бота!" and "Кому отправить" in env.tg.texts()[-1]
+    await env.dp.feed_update(env.bot, callback_update(AdminCb(action="bc_all").pack()))
+    admin = env.dp["admin"]
+    for _ in range(100):
+        if not admin.broadcaster.running:
+            break
+        await asyncio.sleep(0.02)
+    got = [c.chat_id for c in env.tg.calls if isinstance(c, SendMessage) and c.text == "Новая версия бота!"]
+    assert sorted(got) == [OWNER.id, OWNER.id, FRIEND.id], "предпросмотр админу + рассылка обоим"
+    assert admin.broadcaster.status["state"] == "done" and "Рассылка завершена" in env.tg.texts()[-1]
+
+
+async def test_admin_backup_goes_to_admin_chat(env, tmp_path):
+    from bot.callbacks import AdminCb
+    await env.dp.feed_update(env.bot, callback_update(AdminCb(action="backup").pack()))
+    [doc] = [c for c in env.tg.calls if isinstance(c, SendDocument)]
+    assert doc.chat_id == OWNER.id and "никому не пересылайте" in doc.caption
+    assert not list(tmp_path.glob("backup-*")), "временная копия удалена"
+
+
+async def test_user_blocking_the_bot_is_noted(env):
+    from aiogram.types import ChatMemberBanned, ChatMemberMember, ChatMemberUpdated
+
+    chat = Chat(id=FRIEND.id, type="private")
+    me = User(id=42, is_bot=True, first_name="Bot")
+    update = ChatMemberUpdated(chat=chat, from_user=FRIEND, date=datetime.now(),
+                               old_chat_member=ChatMemberMember(user=me),
+                               new_chat_member=ChatMemberBanned(user=me, until_date=0))
+    await env.dp.feed_update(env.bot, Update(update_id=next(_update_ids), my_chat_member=update))
+    assert env.store.get_user(FRIEND.id)["blocked_bot"]
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="/start"))
+    assert not env.store.get_user(FRIEND.id)["blocked_bot"], "вернулся — снова получает рассылки"

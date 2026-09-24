@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 
 import pytest
 from aiogram import Bot
-from aiohttp import FormData, web
+from aiohttp import FormData
 from aiohttp.test_utils import TestClient, TestServer
 
 from bot import accounts as accounts_module
@@ -168,23 +168,6 @@ class FakeOAuth:
 
     async def poll_device_token(self, device_code):
         return NS(access_token="tok-newbie") if self.confirmed else None
-
-
-@pytest.fixture
-async def upstream(tmp_path):
-    """Поддельное хранилище Яндекса: отдаёт MP3 и понимает Range."""
-    path = tmp_path / "track.mp3"
-    path.write_bytes(FAKE_MP3)
-    app = web.Application()
-
-    async def serve(request: web.Request) -> web.FileResponse:
-        return web.FileResponse(path)
-
-    app.router.add_get("/file.mp3", serve)
-    server = TestServer(app)
-    await server.start_server()
-    yield str(server.make_url("/file.mp3"))
-    await server.close()
 
 
 @pytest.fixture

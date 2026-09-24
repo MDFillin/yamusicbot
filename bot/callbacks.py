@@ -67,3 +67,10 @@ class MenuCb(CallbackData, prefix="m"):
     """
 
     action: str
+
+
+class AdminCb(CallbackData, prefix="adm"):
+    """Кнопки админ-панели в чате (работают только у админов — см. IsAdmin)."""
+
+    action: str
+    user: int = 0

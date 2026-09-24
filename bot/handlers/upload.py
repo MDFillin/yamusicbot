@@ -18,6 +18,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+from bot.admin import Admin, LimitReached
 from bot.audio import (
     ConversionError,
     TrackMeta,
@@ -107,7 +108,8 @@ class QueuedFile:
 class UploadQueue:
     """Файлы, ждущие загрузки, по пользователям: карточка очереди и открытый редактор."""
 
-    def __init__(self) -> None:
+    def __init__(self, admin: Admin | None = None) -> None:
+        self.admin = admin  # дневные лимиты и статистика загрузок
         self.pending: dict[int, list[QueuedFile]] = defaultdict(list)
         self.prompts: dict[int, Message] = {}
         self.editors: dict[int, Message] = {}
@@ -499,6 +501,8 @@ async def upload_files(
         for i, qf in enumerate(files, 1):
             prefix = f"⏫ Загружаю в «{title}» {i}/{len(files)}: {html.escape(qf.label())}"
             try:
+                if uploads.admin is not None:
+                    uploads.admin.check_limit(user_id, "upload")
                 if qf.data is None:
                     await update(prefix + "\n(скачиваю из Telegram…)")
                 data = qf.data or await download_from_telegram(bot, qf.file_id)
@@ -507,10 +511,12 @@ async def upload_files(
                 known = await placer.before_upload(ym, kind)
                 result = await ym.upload_track(kind, name, data)
                 placed.append(placer.after_upload(ym, kind, known, result.ugc_track_id))
+                if uploads.admin is not None:
+                    uploads.admin.count(user_id, "upload")
                 if result.note:
                     notes.append(result.note)
                 ok.append(html.escape(name) + (f" <i>({html.escape('; '.join(notes))})</i>" if notes else ""))
-            except (UploadError, ConversionError) as e:
+            except (UploadError, ConversionError, LimitReached) as e:
                 failed.append(f"{html.escape(qf.file_name)} — {html.escape(str(e))}")
             except Exception as e:
                 ref = secrets.token_hex(3)

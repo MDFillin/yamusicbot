@@ -13,17 +13,26 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, ErrorEvent, MenuButtonDefault, MenuButtonWebApp, User, WebAppInfo
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    ErrorEvent,
+    MenuButtonDefault,
+    MenuButtonWebApp,
+    User,
+    WebAppInfo,
+)
 from aiogram.utils.token import TokenValidationError
 from aiohttp import web
 from yandex_music.exceptions import UnauthorizedError
 
 from bot.accounts import Accounts
+from bot.admin import Admin, LimitReached
 from bot.audio import ffmpeg_available
 from bot.config import Config, ConfigError, load_config
 from bot.handlers import build_router
 from bot.handlers.upload import UploadQueue
-from bot.middlewares import AccountMiddleware
+from bot.middlewares import AccessMiddleware, AccountMiddleware
 from bot.placer import TopPlacer
 from bot.sender import TrackSender
 from bot.storage import Storage
@@ -43,6 +52,13 @@ COMMANDS = [
     BotCommand(command="logout", description="🚪 Отключить аккаунт"),
     BotCommand(command="help", description="❓ Справка"),
     BotCommand(command="cancel", description="Отменить действие"),
+]
+# Видны только админам (в их личном чате с ботом).
+ADMIN_COMMANDS = [
+    BotCommand(command="admin", description="🛡 Админ-панель"),
+    BotCommand(command="user", description="👤 Пользователь: /user ID"),
+    BotCommand(command="broadcast", description="📣 Рассылка всем"),
+    *COMMANDS,
 ]
 
 # Что видит человек, впервые открыв бота (ставим, только если владелец не задал своё в @BotFather).
@@ -68,25 +84,29 @@ def build_bot(config: Config) -> Bot:
 
 
 def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Storage,
-                       placer: TopPlacer | None = None) -> dict[str, Any]:
+                       placer: TopPlacer | None = None, admin: Admin | None = None) -> dict[str, Any]:
     """Объекты, которые aiogram подставляет в обработчики по имени аргумента (ym — AccountMiddleware)."""
+    admin = admin or Admin(config, store, accounts, bot)
     return {
         "config": config,
         "accounts": accounts,
         "store": store,
-        "sender": TrackSender(bot, store, config),
-        "uploads": UploadQueue(),
+        "admin": admin,
+        "sender": TrackSender(bot, store, config, admin),
+        "uploads": UploadQueue(admin),
         "placer": placer or TopPlacer(),
     }
 
 
 def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storage,
-                     placer: TopPlacer | None = None) -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage(), **build_dependencies(config, bot, accounts, store, placer))
+                     placer: TopPlacer | None = None, admin: Admin | None = None) -> Dispatcher:
+    dp = Dispatcher(storage=MemoryStorage(), **build_dependencies(config, bot, accounts, store, placer, admin))
 
+    # Кто пользуется ботом; заблокированных, а в техработы — всех, кроме админов, дальше не пускаем.
+    dp.update.outer_middleware(AccessMiddleware())
     # У каждого свой аккаунт Яндекса: middleware подставляет его клиент или предлагает войти.
     account = AccountMiddleware()
-    for observer in (dp.message, dp.callback_query):
+    for observer in (dp.message, dp.callback_query, dp.inline_query, dp.chosen_inline_result):
         observer.middleware(account)
     dp.include_router(build_router())
 
@@ -95,7 +115,9 @@ def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storag
         update = event.update
         source = update.message or update.callback_query
         user = source.from_user if source else None
-        if isinstance(event.exception, UnauthorizedError):
+        if isinstance(event.exception, LimitReached):
+            text = f"⛔ {event.exception}"
+        elif isinstance(event.exception, UnauthorizedError):
             # Вход отозвали уже после подключения: забываем клиент, при следующем запросе бот всё объяснит.
             if user is not None:
                 await dp["accounts"].reset(user.id)
@@ -119,8 +141,8 @@ def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storag
 
 
 async def start_web(config: Config, bot: Bot, accounts: Accounts, store: Storage,
-                    sender: TrackSender, placer: TopPlacer) -> web.AppRunner:
-    runner = web.AppRunner(create_app(config, bot, accounts, store, sender, placer), access_log=None)
+                    sender: TrackSender, placer: TopPlacer, admin: Admin) -> web.AppRunner:
+    runner = web.AppRunner(create_app(config, bot, accounts, store, sender, placer, admin), access_log=None)
     await runner.setup()
     await web.TCPSite(runner, config.web_host, config.web_port).start()
     log.info("Мини-приложение слушает http://%s:%s (публичный адрес: %s)",
@@ -134,6 +156,14 @@ async def setup_menu_button(bot: Bot, config: Config) -> None:
         await bot.set_chat_menu_button(menu_button=button)
     else:
         await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+
+
+async def setup_admin_commands(bot: Bot, config: Config) -> None:
+    for admin_id in config.admin_ids:
+        try:
+            await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+        except TelegramAPIError as e:  # админ ещё не писал боту
+            log.info("Не удалось показать админ-команды %s: %s. Напишите боту /start", admin_id, e)
 
 
 async def setup_description(bot: Bot) -> None:
@@ -193,10 +223,18 @@ async def main() -> None:
     log.info("Подключённых аккаунтов Яндекса: %s", store.account_count())
 
     placer = TopPlacer()  # общий для бота и приложения: загрузки встают в начало плейлиста
-    dp = build_dispatcher(config, bot, accounts, store, placer)
-    runner = await start_web(config, bot, accounts, store, dp["sender"], placer)
+    admin = Admin(config, store, accounts, bot)  # один на бота и приложение: настройки, рассылка, журнал
+    logging.getLogger().addHandler(admin.errors)
+    admin.bot_username, admin.inline_enabled = me.username, bool(me.supports_inline_queries)
+    if not config.admin_ids:
+        log.info("ADMIN_IDS не задан — админ-панель выключена. Свой Telegram ID можно узнать у @userinfobot")
+    if not me.supports_inline_queries:
+        log.info("Инлайн-режим выключен: включите его в @BotFather (/setinline и /setinlinefeedback)")
+    dp = build_dispatcher(config, bot, accounts, store, placer, admin)
+    runner = await start_web(config, bot, accounts, store, dp["sender"], placer, admin)
     try:
         await bot.set_my_commands(COMMANDS)
+        await setup_admin_commands(bot, config)
         await setup_menu_button(bot, config)
         await setup_description(bot)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

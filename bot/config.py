@@ -32,6 +32,8 @@ class Config:
     # Прежняя однопользовательская настройка: токен YANDEX_MUSIC_TOKEN один раз привязывается к ALLOWED_USERS.
     legacy_ym_token: str | None = None
     legacy_users: frozenset[int] = frozenset()
+    # Telegram ID владельцев: только им доступны /admin и админ-панель в мини-приложении.
+    admin_ids: frozenset[int] = frozenset()
 
     @property
     def max_tg_download(self) -> int:
@@ -45,7 +47,7 @@ class Config:
 
 
 def _parse_users(raw: str) -> frozenset[int]:
-    """Telegram ID из прежней настройки ALLOWED_USERS (нужны только для переноса старого токена)."""
+    """Список Telegram ID через запятую (ADMIN_IDS, прежняя ALLOWED_USERS)."""
     parts = (p.strip() for p in raw.replace(";", ",").split(","))
     return frozenset(int(p) for p in parts if p.lstrip("-").isdigit())
 
@@ -91,4 +93,13 @@ def load_config() -> Config:
         web_max_upload_mb=int(os.getenv("WEB_MAX_UPLOAD_MB", "300")),
         legacy_ym_token=os.getenv("YANDEX_MUSIC_TOKEN", "").strip() or None,
         legacy_users=_parse_users(os.getenv("ALLOWED_USERS", "")),
+        admin_ids=_admin_ids(os.getenv("ADMIN_IDS", "")),
     )
+
+
+def _admin_ids(raw: str) -> frozenset[int]:
+    ids = _parse_users(raw)
+    junk = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip() and not p.strip().isdigit()]
+    if junk:  # опечатка здесь тихо оставила бы бота без админа — лучше сказать сразу
+        raise ConfigError(f"ADMIN_IDS: ожидались числовые Telegram ID через запятую, а не {', '.join(junk)}")
+    return frozenset(i for i in ids if i > 0)

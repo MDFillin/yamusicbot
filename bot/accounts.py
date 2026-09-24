@@ -98,6 +98,11 @@ class Accounts:
 
     # ---------- подключённые аккаунты ----------
 
+    @property
+    def loaded(self) -> int:
+        """Сколько клиентов Яндекса сейчас в памяти (для админ-панели)."""
+        return len(self._clients)
+
     def is_connected(self, user_id: int) -> bool:
         return user_id in self._clients or self._store.get_account(user_id) is not None
 

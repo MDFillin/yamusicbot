@@ -54,6 +54,13 @@
     sparkle: '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 17v4M17 19h4"/>',
     headphones: '<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>',
     droplet: '<path d="M12 2.7 6.3 8.4a8 8 0 1 0 11.4 0z"/>',
+    shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+    megaphone: '<path d="m3 11 18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/>',
+    chart: '<path d="M3 3v18h18"/><path d="M7 16v-4M11 16V8M15 16v-6M19 16V5"/>',
+    alert: '<path d="m10.3 3.9-8.2 14a2 2 0 0 0 1.7 3h16.4a2 2 0 0 0 1.7-3l-8.2-14a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
+    ban: '<circle cx="12" cy="12" r="9"/><path d="m5.7 5.7 12.6 12.6"/>',
+    server: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+    save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
   };
 
   function icon(name, cls = '') {
@@ -114,6 +121,7 @@
   }
 
   function fmtSize(bytes) {
+    if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(1)} ГБ`;
     return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} МБ` : `${Math.max(1, Math.round(bytes / 1024))} КБ`;
   }
 
@@ -450,17 +458,20 @@
       icon(ic), h('div', { class: 'meta' }, h('div', { class: 'title' }, text)));
   }
 
-  function promptSheet(title, placeholder, value, button, onSubmit) {
-    const input = h('input', { class: 'text', placeholder, value, maxLength: 100, enterKeyHint: 'done' });
+  function promptSheet(title, placeholder, value, button, onSubmit, { allowEmpty = false, maxLength = 100, multiline = false } = {}) {
+    const input = multiline
+      ? h('textarea', { class: 'text area', placeholder, maxLength, rows: 5 })
+      : h('input', { class: 'text', placeholder, value, maxLength, enterKeyHint: 'done' });
+    if (multiline) input.value = value;
     const btn = h('button', { class: 'btn block' }, button);
     const submit = async () => {
       const text = input.value.trim();
-      if (!text) { input.focus(); return; }
+      if (!text && !allowEmpty) { input.focus(); return; }
       btn.disabled = true;
       try { await onSubmit(text); closeSheet(); } catch (e) { fail(e); } finally { btn.disabled = false; }
     };
     btn.addEventListener('click', submit);
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    if (!multiline) input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
     openSheet([h('div', { class: 'sheet-title' }, title), input, btn]);
     setTimeout(() => input.focus(), 250);
   }
@@ -592,9 +603,14 @@
         h('button', { class: 'row set-row', onclick: () => { local.set('recent', []); haptic.ok(); toast('История поиска очищена'); } },
           h('span', { class: 'set-icon' }, icon('clock', 'sm')), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Очистить историю поиска')))));
 
+    const adminBox = isAdmin() ? group('Владелец', h('div', { class: 'card list' },
+      h('button', { class: 'row set-row', onclick: openAdmin }, h('span', { class: 'set-icon' }, icon('shield', 'sm')),
+        h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Админ-панель'), h('div', { class: 'sub' }, 'Пользователи, статистика, рассылка, режимы')),
+        icon('chevron', 'sm')))) : null;
+
     root.append(
       h('div', { class: 'lib-head' }, h('div', {}, h('div', { class: 'hello' }, 'Медиатека'), h('h1', { class: 'page-title' }, 'Настройки'))),
-      account, tokenBox, look, quality, misc);
+      adminBox, account, tokenBox, look, quality, misc);
   }
 
   async function logout() {
@@ -605,6 +621,353 @@
       showLogin();
       toast('Аккаунт отключён');
     } catch (e) { fail(e); }
+  }
+
+  // ---------- админ-панель (только для ADMIN_IDS; сервер проверяет это сам, здесь — лишь интерфейс) ----------
+  const isAdmin = () => !!(state.me && state.me.is_admin);
+
+  function openAdmin() {
+    if (!isAdmin()) return;
+    if (state.tab !== 'library') setTab('library');
+    if (top() && top().kind === 'admin') return;
+    push(adminView);
+  }
+
+  const fmtNum = (n) => (n == null ? '—' : Number(n).toLocaleString('ru-RU'));
+  function fmtAgo(ts) {
+    if (!ts) return '—';
+    const d = Math.floor(Date.now() / 1000 - ts);
+    if (d < 120) return 'только что';
+    if (d < 3600) return `${Math.floor(d / 60)} мин назад`;
+    if (d < 86400) return `${Math.floor(d / 3600)} ч назад`;
+    if (d < 7 * 86400) return `${Math.floor(d / 86400)} дн назад`;
+    return new Date(ts * 1000).toLocaleDateString('ru-RU');
+  }
+  const fmtStamp = (ts) => new Date(ts * 1000).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  function fmtUptime(sec) {
+    const d = Math.floor(sec / 86400); const hh = Math.floor((sec % 86400) / 3600); const mm = Math.floor((sec % 3600) / 60);
+    return d ? `${d} д ${hh} ч` : hh ? `${hh} ч ${mm} мин` : `${mm} мин`;
+  }
+  const userName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ') || `ID ${u.id}`;
+
+  function statTile(ic, label, value, sub, cls = '') {
+    return h('div', { class: `stat ${cls}` }, h('div', { class: 'stat-label' }, icon(ic, 'sm'), label),
+      h('div', { class: 'stat-value' }, value), sub ? h('div', { class: 'stat-sub' }, sub) : null);
+  }
+
+  // Столбики по дням: одна метрика за раз, подпись значения — по нажатию на столбик.
+  function barChart(series, key, title) {
+    const W = 336; const H = 132; const padB = 18; const padT = 14;
+    const max = Math.max(1, ...series.map((d) => d[key]));
+    const step = W / series.length; const bw = Math.max(4, step - 4);
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.setAttribute('class', 'bars');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', `${title}: ${series.map((d) => `${d.day.slice(5)} — ${d[key]}`).join(', ')}`);
+    const el = (tag, attrs) => { const n = document.createElementNS(NS, tag); Object.entries(attrs).forEach(([k, v]) => n.setAttribute(k, v)); return n; };
+    svg.append(el('line', { x1: 0, x2: W, y1: H - padB + 0.5, y2: H - padB + 0.5, class: 'axis' }));
+    const tip = h('div', { class: 'bar-tip' });
+    const pick = (i, bar) => {
+      svg.querySelectorAll('.bar').forEach((b) => b.classList.remove('on'));
+      bar.classList.add('on');
+      const d = series[i];
+      tip.textContent = `${new Date(`${d.day}T12:00:00`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' })}: ${fmtNum(d[key])}`;
+    };
+    series.forEach((d, i) => {
+      const hgt = d[key] ? Math.max(3, ((H - padB - padT) * d[key]) / max) : 0;
+      const x = i * step + (step - bw) / 2; const y = H - padB - hgt;
+      // Скругление только сверху: нижний край стоит на оси.
+      const r = Math.min(4, bw / 2, hgt);
+      const path = hgt ? `M${x},${H - padB} V${y + r} Q${x},${y} ${x + r},${y} H${x + bw - r} Q${x + bw},${y} ${x + bw},${y + r} V${H - padB} Z` : '';
+      const bar = el('path', { d: path, class: 'bar' });
+      const hit = el('rect', { x: i * step, y: 0, width: step, height: H, fill: 'transparent' });
+      hit.addEventListener('click', () => { haptic.tap(); pick(i, bar); });
+      hit.addEventListener('mouseenter', () => pick(i, bar));
+      svg.append(bar, hit);
+      if (i === 0 || i === series.length - 1 || i === Math.floor(series.length / 2)) {
+        const t = el('text', { x: x + bw / 2, y: H - 4, class: 'tick' });
+        t.textContent = d.day.slice(8) + '.' + d.day.slice(5, 7);
+        svg.append(t);
+      }
+    });
+    const last = series.length - 1;
+    pick(last, svg.querySelectorAll('.bar')[last]);
+    return h('div', { class: 'chart' }, svg, tip);
+  }
+
+  function adminView(root, alive, entry) {
+    entry.kind = 'admin';
+    const tabs = [['overview', 'Обзор'], ['users', 'Люди'], ['broadcast', 'Рассылка'], ['settings', 'Режимы'], ['journal', 'Журнал']];
+    let tab = 'overview';
+    const bar = h('div', { class: 'segments adm-tabs' });
+    const body = h('div', { class: 'adm-body' });
+    let timer = null;
+    const drawTabs = () => put(bar, tabs.map(([k, label]) => h('button', {
+      class: k === tab ? 'on' : '', onclick: () => { if (k !== tab) { haptic.tap(); tab = k; drawTabs(); render(); } },
+    }, label)));
+    const render = () => {
+      clearInterval(timer);
+      put(body, h('div', { class: 'empty' }, spinner()));
+      ({ overview, users, broadcast, settings, journal })[tab]().catch((e) => { if (alive()) put(body, emptyEl('alert', e.message)); });
+    };
+    entry.onShow = () => { if (tab === 'broadcast' || tab === 'overview') render(); };
+    root.append(h('div', { class: 'lib-head' }, h('div', {},
+      h('div', { class: 'hello' }, 'Только для владельца'), h('h1', { class: 'page-title' }, 'Админ-панель')),
+    h('span', { class: 'gear-btn adm-shield' }, icon('shield'))), bar, body);
+    drawTabs();
+    render();
+
+    // ----- обзор -----
+    let metric = 'active';
+    async function overview() {
+      const data = await api('/api/admin/overview');
+      if (!alive() || tab !== 'overview') return;
+      const { stats: st, server: sv, settings: cfg, broadcast: bc } = data;
+      const u = st.users;
+      const banners = [];
+      if (cfg.maintenance) banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'), 'Включены техработы — бот отвечает только вам'));
+      if (cfg.closed) banners.push(h('div', { class: 'adm-banner' }, icon('lock', 'sm'), 'Регистрация закрыта — новые пользователи не допускаются'));
+      if (bc.state === 'running') banners.push(h('div', { class: 'adm-banner' }, icon('megaphone', 'sm'), `Идёт рассылка: ${bc.sent} из ${bc.total}`));
+      if (sv.inline === false) banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'), 'Инлайн-режим выключен: @BotFather → /setinline и /setinlinefeedback'));
+      const metrics = [['active', 'Активные', 'Активные пользователи по дням'], ['new', 'Новые', 'Новые пользователи по дням'],
+        ['downloads', 'Скачивания', 'Скачанные треки по дням'], ['uploads', 'Загрузки', 'Загруженные треки по дням']];
+      const chartBox = h('div');
+      const drawChart = () => { const m = metrics.find((x) => x[0] === metric); put(chartBox, h('div', { class: 'chart-title' }, m[2]), barChart(st.series, metric, m[2])); };
+      drawChart();
+      const topList = st.top.length ? h('div', { class: 'card list' }, st.top.map((t, i) => h('button', { class: 'row', onclick: () => userSheet(t.id) },
+        h('span', { class: 'rank' }, String(i + 1)), h('div', { class: 'meta' }, h('div', { class: 'title' }, t.name)),
+        h('span', { class: 'num' }, fmtNum(t.downloads))))) : h('div', { class: 'set-note' }, 'За неделю никто ничего не скачивал.');
+      const kv = (k, v) => h('div', { class: 'kv' }, h('span', {}, k), h('b', {}, v));
+      const backupBtn = h('button', { class: 'btn secondary block', onclick: async () => {
+        if (!(await confirmAsk('Отправить копию базы вам в чат с ботом? В ней входы всех пользователей — храните её надёжно.'))) return;
+        backupBtn.disabled = true;
+        try { const r = await api('/api/admin/backup', { method: 'POST' }); haptic.ok(); toast(`Копия (${fmtSize(r.size)}) отправлена в чат`); } catch (e) { fail(e); } finally { backupBtn.disabled = false; }
+      } }, icon('save', 'sm'), 'Бэкап базы в чат');
+      put(body, ...banners,
+        h('div', { class: 'stat-grid' },
+          statTile('user', 'Пользователи', fmtNum(u.total), `+${u.new_today} сегодня · +${u.new_week} за неделю`),
+          statTile('key', 'С Яндексом', fmtNum(u.connected), u.total ? `${Math.round((100 * u.connected) / u.total)}% от всех` : ''),
+          statTile('sparkle', 'Активны сегодня', fmtNum(u.active_today), `${u.active_week} за неделю · ${u.active_month} за месяц`),
+          statTile('download', 'Скачано сегодня', fmtNum(st.downloads.today), `всего ${fmtNum(st.downloads.total)}`),
+          statTile('upload', 'Загружено сегодня', fmtNum(st.uploads.today), `всего ${fmtNum(st.uploads.total)}`),
+          statTile('alert', 'Ошибок за сутки', fmtNum(st.errors_24h), `⛔ ${u.banned} забанено · 🚫 ${u.blocked} ушли`, st.errors_24h ? 'warn' : '')),
+        group('Динамика за 14 дней', h('div', { class: 'card set-card' },
+          segmented(metrics.map(([k, label]) => [k, label]), metric, (v) => { metric = v; drawChart(); }), chartBox)),
+        group('Больше всех скачали за неделю', topList),
+        group('Сервер', h('div', { class: 'card set-card kvs' },
+          kv('Работает', fmtUptime(sv.uptime)), kv('Память', sv.memory_mb ? `${sv.memory_mb} МБ` : '—'),
+          kv('База', fmtSize(sv.db_bytes)), kv('Свободно на диске', `${fmtSize(sv.disk_free)} из ${fmtSize(sv.disk_total)}`),
+          kv('Клиентов Яндекса в памяти', fmtNum(sv.clients)), kv('ffmpeg', sv.ffmpeg || 'не установлен'),
+          kv('Python / aiogram', `${sv.python} / ${sv.aiogram}`), kv('Бот', sv.bot_username ? `@${sv.bot_username}` : '—'),
+          kv('Инлайн-режим', sv.inline ? 'включён' : sv.inline === false ? 'выключен в @BotFather' : '—'),
+          kv('Админы', sv.admins.join(', '))), backupBtn));
+    }
+
+    // ----- пользователи -----
+    let query = ''; let filter = 'all';
+    async function users() {
+      const input = h('input', { type: 'search', placeholder: 'Имя, @username, ID или логин Яндекса', value: query, enterKeyHint: 'search' });
+      const list = h('div', { class: 'card list' });
+      const more = h('div');
+      const count = h('div', { class: 'set-note' });
+      const chips = h('div', { class: 'segments' });
+      const filters = [['all', 'Все'], ['connected', 'С Яндексом'], ['banned', 'Заблокированы'], ['blocked', 'Ушли']];
+      const drawChips = () => put(chips, filters.map(([k, label]) => h('button', { class: k === filter ? 'on' : '',
+        onclick: () => { filter = k; drawChips(); load(0); } }, label)));
+      let seq = 0;
+      async function load(offset) {
+        const my = ++seq;
+        if (!offset) put(list, skRows(4));
+        const data = await api(`/api/admin/users?q=${encodeURIComponent(query)}&status=${filter}&offset=${offset}`);
+        if (!alive() || my !== seq) return;
+        const rows = data.users.map(userRow);
+        if (offset) list.append(...rows); else put(list, rows.length ? rows : h('div', { class: 'empty' }, 'Никого не нашлось'));
+        count.textContent = `Найдено: ${fmtNum(data.total)}`;
+        const shown = offset + data.users.length;
+        put(more, shown < data.total ? h('button', { class: 'link-btn center', onclick: () => load(shown).catch(fail) }, 'Показать ещё') : null);
+      }
+      let debounce;
+      input.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(() => { query = input.value.trim(); load(0).catch(fail); }, 300); });
+      drawChips();
+      put(body, h('div', { class: 'search-field' }, icon('search', 'sm'), input), chips, count, list, more);
+      await load(0);
+    }
+
+    function userRow(u) {
+      const badges = [];
+      if (u.is_admin) badges.push(h('span', { class: 'badge plus' }, 'админ'));
+      if (u.banned) badges.push(h('span', { class: 'badge bad' }, 'бан'));
+      if (u.blocked_bot) badges.push(h('span', { class: 'badge' }, 'ушёл'));
+      const hue = (u.id * 47) % 360;
+      return h('button', { class: 'row', onclick: () => userSheet(u.id) },
+        h('div', { class: 'avatar', style: `--a1:hsl(${hue} 70% 62%);--a2:hsl(${(hue + 40) % 360} 75% 52%)` }, userName(u).charAt(0).toUpperCase()),
+        h('div', { class: 'meta' }, h('div', { class: 'title' }, userName(u), u.username ? h('span', { class: 'muted' }, ` @${u.username}`) : null),
+          h('div', { class: 'sub' }, `${u.connected ? `Яндекс: ${u.yandex_login || 'подключён'}` : 'без Яндекса'} · ${fmtAgo(u.last_seen)}`)),
+        ...badges);
+    }
+
+    async function userSheet(id) {
+      let u;
+      try { u = await api(`/api/admin/users/${id}`); } catch (e) { fail(e); return; }
+      const act = (action, body, note) => async () => {
+        try { u = await api(`/api/admin/users/${id}/${action}`, { method: 'POST', body: body || {} }); haptic.ok(); toast(note); draw(); if (tab === 'users') users().catch(fail); } catch (e) { fail(e); }
+      };
+      const draw = () => {
+        const limits = [u.downloads_left != null ? `скачиваний осталось ${u.downloads_left}` : null,
+          u.uploads_left != null ? `загрузок осталось ${u.uploads_left}` : null].filter(Boolean).join(' · ');
+        openSheet([
+          h('div', { class: 'sheet-title' }, userName(u)),
+          h('div', { class: 'card set-card kvs' },
+            h('div', { class: 'kv' }, h('span', {}, 'Telegram ID'), h('b', {}, String(u.id))),
+            u.username ? h('div', { class: 'kv' }, h('span', {}, 'Username'), h('b', {}, `@${u.username}`)) : null,
+            h('div', { class: 'kv' }, h('span', {}, 'Яндекс'), h('b', {}, u.connected ? (u.yandex_login || 'подключён') : 'не подключён')),
+            h('div', { class: 'kv' }, h('span', {}, 'Впервые'), h('b', {}, fmtAgo(u.first_seen))),
+            h('div', { class: 'kv' }, h('span', {}, 'Был'), h('b', {}, fmtAgo(u.last_seen))),
+            h('div', { class: 'kv' }, h('span', {}, 'Скачал / загрузил'), h('b', {}, `${fmtNum(u.downloads)} / ${fmtNum(u.uploads)}`)),
+            limits ? h('div', { class: 'kv' }, h('span', {}, 'Сегодня'), h('b', {}, limits)) : null,
+            u.banned ? h('div', { class: 'kv bad' }, h('span', {}, 'Заблокирован'), h('b', {}, u.ban_reason || 'без причины')) : null,
+            u.blocked_bot ? h('div', { class: 'kv' }, h('span', {}, 'Статус'), h('b', {}, 'заблокировал бота')) : null),
+          h('button', { class: 'row', onclick: () => copyText(String(u.id)) }, icon('copy'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Скопировать ID'))),
+          h('button', { class: 'row', onclick: () => promptSheet('Сообщение пользователю', 'Текст (можно HTML: <b>, <i>, <a>)', '', 'Отправить',
+            async (text) => { u = await api(`/api/admin/users/${id}/message`, { method: 'POST', body: { text } }); haptic.ok(); toast('Сообщение отправлено'); },
+            { maxLength: 4000, multiline: true }) },
+          icon('send'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Написать от имени бота'))),
+          h('button', { class: 'row', onclick: act('reset', null, 'Лимиты на сегодня сброшены') }, icon('refresh'),
+            h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Сбросить лимиты на сегодня'))),
+          u.connected ? h('button', { class: 'row danger', onclick: async () => {
+            if (await confirmAsk('Отключить аккаунт Яндекса у этого пользователя? Он сможет подключить его снова.')) await act('disconnect', null, 'Яндекс отключён')();
+          } }, icon('logout'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Отключить его Яндекс'))) : null,
+          u.is_admin ? null : u.banned
+            ? h('button', { class: 'row', onclick: act('unban', null, 'Разблокирован') }, icon('check'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Разблокировать')))
+            : h('button', { class: 'row danger', onclick: () => promptSheet('Заблокировать?', 'Причина — например, спам (необязательно)', '', 'Заблокировать',
+              async (reason) => { await act('ban', { reason }, 'Заблокирован')(); }, { allowEmpty: true, maxLength: 200 }) },
+            icon('ban'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Заблокировать'))),
+        ]);
+      };
+      draw();
+    }
+
+    // ----- рассылка -----
+    let draft = ''; let audience = 'all';
+    async function broadcast() {
+      const st = await api('/api/admin/broadcast');
+      if (!alive() || tab !== 'broadcast') return;
+      const statusBox = h('div');
+      const drawStatus = (s) => {
+        if (s.state === 'idle') { put(statusBox); return; }
+        const titles = { running: 'Рассылка идёт', done: 'Рассылка завершена', cancelled: 'Рассылка остановлена', failed: 'Рассылка прервалась' };
+        const pct = s.total ? Math.round((100 * (s.sent + s.failed + s.blocked)) / s.total) : 100;
+        put(statusBox, group(titles[s.state] || 'Рассылка', h('div', { class: 'card set-card' },
+          h('div', { class: 'progress' }, h('div', { style: `width:${pct}%` })),
+          h('div', { class: 'kvs' },
+            h('div', { class: 'kv' }, h('span', {}, 'Доставлено'), h('b', {}, `${fmtNum(s.sent)} из ${fmtNum(s.total)}`)),
+            h('div', { class: 'kv' }, h('span', {}, 'Заблокировали бота'), h('b', {}, fmtNum(s.blocked))),
+            h('div', { class: 'kv' }, h('span', {}, 'Ошибок'), h('b', {}, fmtNum(s.failed))),
+            s.error ? h('div', { class: 'kv bad' }, h('span', {}, 'Причина'), h('b', {}, s.error)) : null),
+          h('div', { class: 'set-note' }, `Текст: ${s.preview || ''}`),
+          s.state === 'running' ? h('button', { class: 'btn secondary block', onclick: async () => {
+            try { drawStatus(await api('/api/admin/broadcast', { method: 'DELETE' })); toast('Останавливаю…'); } catch (e) { fail(e); }
+          } }, icon('x', 'sm'), 'Остановить') : null)));
+      };
+      drawStatus(st);
+      const poll = () => { timer = setInterval(async () => {
+        if (!alive() || tab !== 'broadcast') { clearInterval(timer); return; }
+        try { const s = await api('/api/admin/broadcast'); drawStatus(s); if (s.state !== 'running') clearInterval(timer); } catch (_) { clearInterval(timer); }
+      }, 2000); };
+      if (st.state === 'running') poll();
+
+      const text = h('textarea', { class: 'text area', rows: 6, maxLength: 4000, placeholder: 'Текст сообщения. Можно <b>жирный</b>, <i>курсив</i>, <a href="https://…">ссылку</a>' });
+      text.value = draft;
+      text.addEventListener('input', () => { draft = text.value; });
+      const a = st.audiences;
+      const aud = segmented(Object.entries(a).map(([k, v]) => [k, (k === 'all' ? 'Всем' : 'С Яндексом'), `${v.count} чел.`]), audience, (v) => { audience = v; });
+      const testBtn = h('button', { class: 'btn secondary', onclick: async () => {
+        if (!text.value.trim()) { text.focus(); return; }
+        try { await api('/api/admin/broadcast', { method: 'POST', body: { text: text.value, test: true } }); haptic.ok(); toast('Отправил вам — проверьте, как выглядит'); } catch (e) { fail(e); }
+      } }, icon('user', 'sm'), 'Себе');
+      const sendBtn = h('button', { class: 'btn', onclick: async () => {
+        if (!text.value.trim()) { text.focus(); return; }
+        const n = a[audience].count;
+        if (!(await confirmAsk(`Разослать сообщение ${n} ${plural(n, 'пользователю', 'пользователям', 'пользователям')}? Отменить уже отправленное нельзя.`))) return;
+        sendBtn.disabled = true;
+        try {
+          drawStatus(await api('/api/admin/broadcast', { method: 'POST', body: { text: text.value, audience } }));
+          draft = ''; text.value = ''; haptic.ok(); toast('Рассылка запущена'); poll();
+        } catch (e) { fail(e); } finally { sendBtn.disabled = false; }
+      } }, icon('megaphone', 'sm'), 'Разослать');
+      put(body, statusBox,
+        group('Новая рассылка', h('div', { class: 'card set-card' }, text,
+          h('div', { class: 'set-label' }, icon('user', 'sm'), 'Кому'), aud,
+          h('div', { class: 'btn-row' }, testBtn, sendBtn)),
+        h('div', { class: 'set-note' }, 'Сначала отправьте себе и проверьте, как выглядит. Рассылка идёт в фоне '
+          + '(около 20 сообщений в секунду); заблокированным и ушедшим она не отправляется.')));
+    }
+
+    // ----- режимы -----
+    async function settings() {
+      const { settings: cfg } = await api('/api/admin/overview');
+      if (!alive() || tab !== 'settings') return;
+      const save = async (patch, note) => {
+        try { Object.assign(cfg, await api('/api/admin/settings', { method: 'PUT', body: patch })); haptic.ok(); if (note) toast(note); return true; } catch (e) { fail(e); return false; }
+      };
+      const mText = h('textarea', { class: 'text area', rows: 2, maxLength: 500, placeholder: 'Бот на техническом обслуживании. Загляните чуть позже.' });
+      mText.value = cfg.maintenance_text || '';
+      mText.addEventListener('change', () => save({ maintenance_text: mText.value }, 'Текст сохранён'));
+      const num = (value) => h('input', { class: 'text num-input', type: 'number', min: 0, max: 100000, inputMode: 'numeric', value: String(value || 0) });
+      const dl = num(cfg.download_limit); const ul = num(cfg.upload_limit);
+      const saveLimits = h('button', { class: 'btn block', onclick: () => save({ download_limit: Number(dl.value || 0), upload_limit: Number(ul.value || 0) }, 'Лимиты сохранены') },
+        icon('check', 'sm'), 'Сохранить лимиты');
+      put(body,
+        group('Доступ', h('div', { class: 'card list' },
+          toggleRow('alert', 'Техработы', 'Бот и приложение отвечают только админам', cfg.maintenance, (v) => save({ maintenance: v }, v ? 'Техработы включены' : 'Техработы выключены')),
+          toggleRow('lock', 'Закрыть регистрацию', cfg.closed ? `Закрыта с ${fmtStamp(cfg.closed_since)} — новые не допускаются` : 'Новые пользователи не смогут пользоваться ботом',
+            cfg.closed, (v) => save({ closed: v }, v ? 'Регистрация закрыта' : 'Регистрация открыта'))),
+        h('div', { class: 'card set-card', style: 'margin-top:10px' }, h('div', { class: 'set-label' }, icon('edit', 'sm'), 'Текст на время техработ'), mText)),
+        group('Лимиты на человека в сутки', h('div', { class: 'card set-card' },
+          h('label', { class: 'field-row' }, h('span', {}, 'Скачиваний треков'), dl),
+          h('label', { class: 'field-row' }, h('span', {}, 'Загрузок файлов'), ul), saveLimits),
+        h('div', { class: 'set-note' }, '0 — без ограничений. Сутки считаются по Москве. На админов лимиты не действуют; '
+          + 'сбросить лимит конкретному человеку можно в его карточке.')));
+    }
+
+    // ----- журнал -----
+    let journalKind = 'audit'; let errQuery = '';
+    async function journal() {
+      const box = h('div');
+      const seg = segmented([['audit', 'Действия'], ['errors', 'Ошибки']], journalKind, (v) => { journalKind = v; load(); });
+      async function load() {
+        put(box, h('div', { class: 'empty' }, spinner()));
+        if (journalKind === 'audit') {
+          const { entries } = await api('/api/admin/audit');
+          if (!alive()) return;
+          put(box, entries.length ? h('div', { class: 'card list' }, entries.map((e) => h('div', { class: `row log-row${e.action === 'denied' ? ' bad' : ''}` },
+            h('div', { class: 'meta' }, h('div', { class: 'title' }, `${e.actor_name || e.actor}: ${e.label}${e.target && e.target !== e.actor ? ` ${e.target_name}` : ''}`),
+              h('div', { class: 'sub' }, fmtStamp(e.at) + (e.details ? ` · ${e.details}` : '')))))) : emptyEl('list', 'Журнал пуст'));
+        } else {
+          const input = h('input', { type: 'search', placeholder: 'Код ошибки из сообщения, например a1b2c3', value: errQuery });
+          const list = h('div');
+          const draw = async () => {
+            const { entries } = await api(`/api/admin/errors?q=${encodeURIComponent(errQuery)}`);
+            if (!alive()) return;
+            put(list, entries.length ? entries.map((e) => {
+              const [first, ...rest] = e.message.split('\n');
+              return h('details', { class: `card log ${e.level.toLowerCase()}` },
+                h('summary', {}, h('b', {}, `${fmtStamp(e.at)} · ${e.level}`), h('span', {}, first)),
+                rest.length ? h('pre', {}, rest.join('\n')) : null);
+            }) : emptyEl('check', errQuery ? 'Ничего не нашлось' : 'Ошибок нет'));
+          };
+          let t;
+          input.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { errQuery = input.value.trim(); draw().catch(fail); }, 300); });
+          put(box, h('div', { class: 'search-field' }, icon('search', 'sm'), input),
+            h('div', { class: 'set-note' }, 'Последние 300 предупреждений и ошибок с момента запуска бота.'), list);
+          await draw();
+        }
+      }
+      put(body, seg, box);
+      await load();
+    }
   }
 
   // ---------- действия с треками ----------
@@ -763,6 +1126,7 @@
   function libraryView(root, alive, entry) {
     const name = tgUser && tgUser.first_name;
     const gear = h('button', { class: 'gear-btn', 'aria-label': 'Настройки', onclick: () => { haptic.tap(); openSettings(); } }, icon('gear'));
+    const shield = isAdmin() ? h('button', { class: 'gear-btn', 'aria-label': 'Админ-панель', onclick: () => { haptic.tap(); openAdmin(); } }, icon('shield')) : null;
     const chip = h('button', { class: 'chip', onclick: openSettings }, icon('user', 'sm'), state.me.login || 'Аккаунт Яндекса',
       state.me.has_plus ? h('span', { class: 'badge plus' }, 'Плюс') : h('span', { class: 'badge' }, 'без Плюса'));
     const likesSub = h('div', { class: 's' }, '…');
@@ -776,7 +1140,7 @@
     root.append(
       h('div', { class: 'lib-head' },
         h('div', {}, h('div', { class: 'hello' }, name ? `Привет, ${name} 👋` : 'Привет 👋'), h('h1', { class: 'page-title' }, 'Медиатека')),
-        gear),
+        h('div', { class: 'head-btns' }, shield, gear)),
       chip, likes,
       h('div', { class: 'section-head' }, h('h2', {}, 'Мои плейлисты'),
         h('button', { class: 'link-btn', onclick: () => createPlaylistSheet() }, icon('plus', 'sm'), 'Создать')),
@@ -1762,15 +2126,32 @@
       state.me = await api('/api/me');
     } catch (e) {
       if (e.code === 'yandex_unavailable') gate('Яндекс Музыка недоступна', e.message, 'Подключить заново', () => showLogin());
+      else if (e.code === 'banned') gate('Доступ закрыт', e.message);
+      else if (e.code === 'maintenance') gate('Техническое обслуживание', e.message, 'Проверить снова', enterApp);
+      else if (e.code === 'closed') gate('Бот закрыт для новых пользователей', e.message);
       else gate('Не удалось открыть', e.message, 'Повторить', enterApp);
       return;
     }
-    if (!state.me.connected) { showLogin(); return; }
+    const wantsAdmin = new URLSearchParams(location.search).get('admin') === '1' && isAdmin();
+    if (!state.me.connected) {
+      if (wantsAdmin) { // админке Яндекс не нужен
+        resetNav();
+        state.tab = 'library';
+        stacks.library.push(mountPage(adminView));
+        show(top(), 0);
+        $('#tabs').hidden = true;
+        document.body.classList.add('no-tabs');
+        return;
+      }
+      showLogin();
+      return;
+    }
     resetNav();
     state.libraryLoaded = false;
     $('#tabs').hidden = false;
     document.body.classList.remove('no-tabs');
     setTab('library');
+    if (wantsAdmin) openAdmin();
   }
 
   // fxTunnel показывает страницу-предупреждение при заходе на поддомен и после «Продолжить» помнит
