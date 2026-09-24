@@ -254,14 +254,29 @@ body.paused .eq i { animation-play-state: paused; }
 .switch input:checked + span { background: var(--ok); }
 .switch input:checked + span::after { transform: translateX(20px); }
 
-.file { padding: 12px; }
-.file-head { display: flex; align-items: center; gap: 10px; }
-.file-head .ficon { width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; background: var(--soft); color: var(--accent); flex: none; }
-.file-head .name { flex: 1; min-width: 0; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.file-head .size { color: var(--hint); font-size: 13px; }
-.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
-.fields input { width: 100%; height: 40px; border-radius: 10px; border: 0; padding: 0 10px; background: var(--bg); outline: none; font-size: 15px; }
-.fields input:focus { box-shadow: 0 0 0 2px var(--accent); }
+.file { padding: 10px 6px 10px 12px; cursor: pointer; }
+.file:active:not(.locked) { background: var(--soft); }
+.file-head { display: flex; align-items: center; gap: 12px; }
+.file-head .meta { flex: 1; min-width: 0; }
+.file-head .title { font-weight: 600; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.file-head .title .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.file-head .sub { color: var(--hint); font-size: 13px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-cover .cover { width: 52px; height: 52px; border-radius: 12px; }
+.edited { flex: none; padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 700; background: var(--soft); color: var(--accent); }
+.file .progress, .file .status { margin-left: 64px; margin-right: 6px; }
+
+/* редактор данных трека */
+.ed-file { display: flex; align-items: center; gap: 6px; color: var(--hint); font-size: 13px; margin: -6px 4px 14px; word-break: break-all; }
+.ed-top { display: flex; align-items: center; gap: 16px; margin: 0 4px 16px; }
+.ed-cover .cover { width: 112px; height: 112px; border-radius: 18px; box-shadow: 0 10px 26px rgba(0, 0, 0, .18); }
+.ed-cover .cover .i { width: 42px; height: 42px; }
+.ed-cover-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; }
+.ed-cover-actions .btn { height: 40px; padding: 0 14px; font-size: 14px; }
+.ed-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+.ed-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ed-field.title, .ed-field.artist { grid-column: 1 / -1; }
+.ed-field span { color: var(--hint); font-size: 13px; font-weight: 500; margin-left: 4px; }
+#sheet .ed-field input.text { margin: 0; }
 .progress { height: 5px; border-radius: 5px; background: var(--fill); overflow: hidden; margin-top: 10px; }
 .progress div { height: 100%; width: 0; background: var(--accent); border-radius: 5px; transition: width .2s; }
 .file.done .progress div { background: var(--ok); }

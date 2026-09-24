@@ -131,7 +131,7 @@ async def render_page(ym: YandexMusic, source: TrackSource, src: str, page: int)
         kind = source.own_playlist.kind
         target = PlaylistCb(action="target", kind=kind).pack()
         delete = PlaylistCb(action="delete", kind=kind).pack()
-        rows.append([InlineKeyboardButton(text="📌 Загружать сюда мои файлы", callback_data=target)])
+        rows.append([InlineKeyboardButton(text="📌 Загружать сюда по умолчанию", callback_data=target)])
         rows.append([InlineKeyboardButton(text="🗑 Удалить плейлист", callback_data=delete)])
     if source.own_playlist is not None or src == "likes":
         rows.append([InlineKeyboardButton(text="⬅️ Мои плейлисты", callback_data=ViewCb(src="pls").pack())])

@@ -20,19 +20,21 @@ from aiogram.methods import (
     GetFile,
     SendAudio,
     SendMessage,
+    SendPhoto,
 )
-from aiogram.types import Audio, CallbackQuery, Chat, Document, File, Message, Update, User
+from aiogram.types import Audio, CallbackQuery, Chat, Document, File, Message, PhotoSize, Update, User
 
 from bot import accounts as accounts_module
 from bot.accounts import Accounts
-from bot.audio import read_mp3_tags, tag_mp3
-from bot.callbacks import MenuCb, TrackCb, UploadCb
+from bot.audio import read_mp3_tags, read_tags, tag_mp3
+from bot.callbacks import EditCb, MenuCb, TrackCb, UploadCb
 from bot.config import Config
 from bot.main import build_dependencies, build_dispatcher
 from bot.storage import Storage
 from bot.ym import UploadResult, YandexNotReady
 
 FAKE_MP3 = b"\xff\xfb\x90\x64" + b"\x00" * 2000
+FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"cover" * 40
 OWNER = User(id=1, is_bot=False, first_name="Owner")
 FRIEND = User(id=2, is_bot=False, first_name="Friend")
 NEWBIE = User(id=666, is_bot=False, first_name="Новичок")
@@ -49,7 +51,7 @@ class FakeTelegram(BaseSession):
 
     async def stream_content(self, url, headers=None, timeout=30, chunk_size=65536,
                              raise_for_status=True) -> AsyncGenerator[bytes, None]:
-        yield FAKE_MP3
+        yield FAKE_JPEG if "/photos/" in url else FAKE_MP3
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
@@ -61,8 +63,12 @@ class FakeTelegram(BaseSession):
                 text=method.text, reply_markup=method.reply_markup,
             ).as_(bot)
         if isinstance(method, GetFile):
-            return File(file_id=method.file_id, file_unique_id="u", file_size=len(FAKE_MP3),
-                        file_path=f"music/{method.file_id}.mp3")
+            path = f"photos/{method.file_id}.jpg" if method.file_id.startswith("PH") else f"music/{method.file_id}.mp3"
+            return File(file_id=method.file_id, file_unique_id="u", file_size=len(FAKE_MP3), file_path=path)
+        if isinstance(method, SendPhoto):
+            chat = Chat(id=method.chat_id, type="private")
+            return Message(message_id=next(self._ids), date=datetime.now(), chat=chat,
+                           caption=method.caption, reply_markup=method.reply_markup).as_(bot)
         if isinstance(method, SendAudio):
             return Message(
                 message_id=next(self._ids), date=datetime.now(), chat=Chat(id=method.chat_id, type="private"),
@@ -73,11 +79,16 @@ class FakeTelegram(BaseSession):
         raise AssertionError(f"Неожиданный запрос к Telegram: {type(method).__name__}")
 
     def texts(self) -> list[str]:
-        return [c.text for c in self.calls if isinstance(c, (SendMessage, EditMessageText))]
+        return [c.text if not isinstance(c, SendPhoto) else c.caption for c in self.calls
+                if isinstance(c, (SendMessage, EditMessageText, SendPhoto))]
 
     def buttons(self) -> list:
-        markup = [c.reply_markup for c in self.calls if isinstance(c, (SendMessage, EditMessageText))][-1]
+        markup = [c.reply_markup for c in self.calls if isinstance(c, (SendMessage, EditMessageText, SendPhoto))][-1]
         return [b for row in markup.inline_keyboard for b in row] if markup else []
+
+    def button(self, prefix: str):
+        """Кнопка из последнего сообщения, чей текст начинается с prefix."""
+        return next(b for b in self.buttons() if b.text.startswith(prefix))
 
 
 def make_track():
@@ -137,6 +148,22 @@ class FakeYM:
                   albums=None, playlists=None, artists=None)
 
 
+class FakePlacer:
+    """Вместо ожидания обработки у Яндекса: сразу «ставит трек наверх»."""
+
+    def __init__(self) -> None:
+        self.placed: list[tuple[int, int, str | None]] = []
+
+    async def before_upload(self, ym, kind):
+        return set()
+
+    def after_upload(self, ym, kind, known, ugc_id):
+        self.placed.append((ym.uid, kind, ugc_id))
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(True)
+        return future
+
+
 class FakeOAuth:
     async def request_device_code(self, device_name=None):
         return NS(device_code="dev", user_code="ABCD1234", verification_url="https://ya.ru/device",
@@ -162,12 +189,13 @@ def env(tmp_path, monkeypatch):
     accounts = Accounts(store, factory=fakes.__getitem__, oauth=FakeOAuth())
     config = Config(bot_token="42:TEST", data_dir=tmp_path)
     # Роутеры aiogram подключаются к диспетчеру только один раз, поэтому между тестами меняем лишь зависимости.
+    placer = FakePlacer()
     if _dispatcher is None:
         _dispatcher = build_dispatcher(config, bot, accounts, store)
-    _dispatcher.workflow_data.update(build_dependencies(config, bot, accounts, store))
+    _dispatcher.workflow_data.update(build_dependencies(config, bot, accounts, store, placer))
     _dispatcher.fsm.storage = MemoryStorage()
     yield NS(dp=_dispatcher, bot=bot, tg=telegram, ym=fakes["tok-owner"], friend=fakes["tok-friend"],
-             newbie=fakes["tok-newbie"], store=store, accounts=accounts)
+             newbie=fakes["tok-newbie"], store=store, accounts=accounts, placer=placer)
     store.close()
 
 
@@ -279,27 +307,106 @@ async def test_search_shows_download_buttons(env):
     assert any(b.callback_data == "t:dl:123" and "Кино — Кукушка" in b.text for b in buttons)
 
 
+async def settle() -> None:
+    """Дать доработать фоновым задачам (отчёт о переносе в начало плейлиста)."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
 async def test_upload_asks_playlist_then_uploads_all_files(env):
     await env.dp.feed_update(env.bot, audio_update("F1", caption="Кино - Кукушка"))
     await env.dp.feed_update(env.bot, audio_update("F2"))
 
     prompts = [c for c in env.tg.calls if isinstance(c, SendMessage)]
-    assert len(prompts) == 1, "на несколько файлов — один вопрос"
-    assert "Файлов к загрузке: 2" in env.tg.texts()[-1]
+    assert len(prompts) == 1, "на несколько файлов — одна карточка"
+    card = env.tg.texts()[-1]
+    assert "Готово к загрузке: 2" in card and "1. Кино — Кукушка ✏️" in card and "2. rec" in card
+    labels = [b.text for b in env.tg.buttons()]
+    assert "✏️ 1. Кино — Кукушка" in labels and any(t.startswith("📤 Мои записи") for t in labels)
     assert env.ym.uploads == []
 
     await env.dp.feed_update(env.bot, callback_update(UploadCb(action="to", kind=1003).pack()))
+    await settle()
 
     assert [(k, n) for k, n, _ in env.ym.uploads] == [(1003, "Кино - Кукушка.mp3"), (1003, "rec.mp3")]
     assert read_mp3_tags(env.ym.uploads[0][2]) == ("Кино", "Кукушка")
-    assert "✅ Загружено в «Мои записи»: 2 из 2" in env.tg.texts()[-1]
+    assert [(uid, kind) for uid, kind, _ in env.placer.placed] == [(42, 1003), (42, 1003)]
+    status = env.tg.texts()[-1]
+    assert "✅ Загружено в «Мои записи»: 2 из 2" in status and "треки уже в начале плейлиста" in status
 
 
-async def test_upload_goes_straight_to_default_playlist(env):
+async def test_default_playlist_is_one_tap_away(env):
     env.store.set_upload_target(OWNER.id, 1003)
     doc = Document(file_id="D1", file_unique_id="D1", file_name="demo.mp3", mime_type="audio/mpeg", file_size=10)
     await env.dp.feed_update(env.bot, message_update(document=doc))
+    assert env.ym.uploads == [], "сначала карточка — можно поправить данные"
+    upload = env.tg.button("⬆️ Загрузить в «Мои записи»")
+    assert env.tg.button("✏️ Изменить данные трека")
+
+    await env.dp.feed_update(env.bot, callback_update(upload.callback_data))
     assert [(k, n) for k, n, _ in env.ym.uploads] == [(1003, "demo.mp3")]
+
+
+async def test_track_editor_changes_tags_and_cover(env):
+    await env.dp.feed_update(env.bot, audio_update("F7"))
+    await env.dp.feed_update(env.bot, callback_update(env.tg.button("✏️ Изменить").callback_data))
+    editor = env.tg.texts()[-1]
+    assert "✏️ <b>Данные трека</b>" in editor and "🎵 Название: <b>rec</b>" in editor and "Обложка: нет" in editor
+    pid = EditCb.unpack(env.tg.button("🎵").callback_data).pid
+
+    async def set_field(action: str, value: str) -> None:
+        await env.dp.feed_update(env.bot, callback_update(EditCb(action=action, pid=pid).pack()))
+        await env.dp.feed_update(env.bot, message_update(text=value))
+
+    await set_field("title", "Новая песня")
+    await set_field("artist", "Мы")
+    await set_field("year", "в прошлом году")
+    assert "Год — четыре цифры" in env.tg.texts()[-1], "неправильный год — просим ещё раз"
+    await env.dp.feed_update(env.bot, message_update(text="2023"))
+    await set_field("album", "Демо")
+    editor = env.tg.texts()[-1]
+    assert "🎵 Название: <b>Новая песня</b> ✏️" in editor and "📅 Год: <b>2023</b> ✏️" in editor
+    assert any(isinstance(c, DeleteMessage) for c in env.tg.calls), "вопрос и ответ убираются из чата"
+
+    await env.dp.feed_update(env.bot, callback_update(EditCb(action="cover", pid=pid).pack()))
+    photo = [PhotoSize(file_id="PH-small", file_unique_id="s", width=90, height=90),
+             PhotoSize(file_id="PH-big", file_unique_id="b", width=800, height=800)]
+    await env.dp.feed_update(env.bot, message_update(photo=photo))
+    shown = [c for c in env.tg.calls if isinstance(c, SendPhoto)][-1]
+    assert shown.photo.data == FAKE_JPEG and "Обложка: новая ✏️" in shown.caption, "редактор показывает новую обложку"
+
+    await env.dp.feed_update(env.bot, callback_update(EditCb(action="done", pid=pid).pack()))
+    assert "1. Мы — Новая песня ✏️" in env.tg.texts()[-1]
+    await env.dp.feed_update(env.bot, callback_update(env.tg.button("📤 Мои записи").callback_data))
+    [(kind, name, data)] = env.ym.uploads
+    meta = read_tags(data)
+    assert name == "Мы - Новая песня.mp3"
+    assert (meta.title, meta.artist, meta.album, meta.year) == ("Новая песня", "Мы", "Демо", "2023")
+    assert meta.cover == FAKE_JPEG
+
+
+async def test_editor_can_remove_cover_and_reset_title(env):
+    tagged = tag_mp3(FAKE_MP3, artist="Автор", title="Из файла", cover=FAKE_JPEG)
+
+    async def stream(url, **kwargs):
+        yield tagged
+
+    env.tg.stream_content = stream
+    await env.dp.feed_update(env.bot, audio_update("F8", caption="Подпись - Из подписи"))
+    await env.dp.feed_update(env.bot, callback_update(env.tg.button("✏️ Изменить").callback_data))
+    shown = [c for c in env.tg.calls if isinstance(c, SendPhoto)][-1]
+    assert "Обложка: из файла" in shown.caption and "<b>Из подписи</b> ✏️" in shown.caption
+    pid = EditCb.unpack(env.tg.button("🗑").callback_data).pid
+
+    await env.dp.feed_update(env.bot, callback_update(EditCb(action="nocover", pid=pid).pack()))
+    await env.dp.feed_update(env.bot, callback_update(EditCb(action="title", pid=pid).pack()))
+    await env.dp.feed_update(env.bot, message_update(text="-"))
+    assert "🎵 Название: <b>Из файла</b>\n" in env.tg.texts()[-1] and "без обложки" in env.tg.texts()[-1]
+
+    await env.dp.feed_update(env.bot, callback_update(env.tg.button("✅").callback_data))
+    await env.dp.feed_update(env.bot, callback_update(env.tg.button("📤 Мои записи").callback_data))
+    meta = read_tags(env.ym.uploads[0][2])
+    assert (meta.title, meta.artist, meta.cover) == ("Из файла", "Подпись", None)
 
 
 async def test_non_audio_document_is_not_uploaded(env):

@@ -8,7 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from yandex_music import Playlist, Track
 
-from bot.callbacks import CancelBulkCb, MenuCb, NoopCb, PlaylistCb, SearchCb, TrackCb, UploadCb, ViewCb
+from bot.callbacks import CancelBulkCb, EditCb, MenuCb, NoopCb, PlaylistCb, SearchCb, TrackCb, UploadCb, ViewCb
 from bot.ym import track_artists, track_title
 
 
@@ -110,14 +110,48 @@ def pick_playlist(playlists: Sequence[Playlist], action: str, track: str = "") -
     return kb.as_markup()
 
 
-def upload_targets(playlists: Sequence[Playlist]) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for p in playlists:
-        kb.button(text=short(f"📤 {playlist_label(p)}"), callback_data=UploadCb(action="to", kind=p.kind))
-    kb.button(text="➕ Новый плейлист", callback_data=UploadCb(action="new"))
-    kb.button(text="❌ Отмена", callback_data=UploadCb(action="cancel"))
-    kb.adjust(1)
-    return kb.as_markup()
+MAX_EDIT_BUTTONS = 8
+
+
+def upload_card(
+    labels: Sequence[tuple[int, str]], playlists: Sequence[Playlist], target: Playlist | None,
+) -> InlineKeyboardMarkup:
+    """Очередь загрузки: правка каждого файла и выбор плейлиста (или загрузка в плейлист по умолчанию)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if target is not None:
+        rows.append([InlineKeyboardButton(text=short(f"⬆️ Загрузить в «{target.title}»"),
+                                          callback_data=UploadCb(action="to", kind=target.kind).pack())])
+    single = len(labels) == 1
+    for n, (pid, label) in enumerate(labels[:MAX_EDIT_BUTTONS], 1):
+        text = "✏️ Изменить данные трека" if single else short(f"✏️ {n}. {label}", 48)
+        rows.append([InlineKeyboardButton(text=text, callback_data=EditCb(action="open", pid=pid).pack())])
+    if target is None:
+        for p in playlists:
+            rows.append([InlineKeyboardButton(text=short(f"📤 {playlist_label(p)}"),
+                                              callback_data=UploadCb(action="to", kind=p.kind).pack())])
+        rows.append([InlineKeyboardButton(text="➕ Новый плейлист", callback_data=UploadCb(action="new").pack())])
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=UploadCb(action="cancel").pack())])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="📃 Другой плейлист", callback_data=UploadCb(action="pick").pack()),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=UploadCb(action="cancel").pack()),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def track_editor(pid: int, has_cover: bool) -> InlineKeyboardMarkup:
+    def b(text: str, action: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=text, callback_data=EditCb(action=action, pid=pid).pack())
+
+    cover_row = [b("🖼 Сменить обложку" if has_cover else "🖼 Добавить обложку", "cover")]
+    if has_cover:
+        cover_row.append(b("🗑 Убрать обложку", "nocover"))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b("🎵 Название", "title"), b("👤 Исполнитель", "artist")],
+        [b("💿 Альбом", "album"), b("📅 Год", "year")],
+        cover_row,
+        [b("✅ Готово", "done")],
+    ])
 
 
 def target_menu(playlists: Sequence[Playlist], has_target: bool) -> InlineKeyboardMarkup:
@@ -125,7 +159,7 @@ def target_menu(playlists: Sequence[Playlist], has_target: bool) -> InlineKeyboa
     for p in playlists:
         kb.button(text=short(f"📌 {playlist_label(p)}"), callback_data=PlaylistCb(action="target", kind=p.kind))
     if has_target:
-        kb.button(text="🚫 Спрашивать каждый раз", callback_data=PlaylistCb(action="untarget"))
+        kb.button(text="🚫 Без плейлиста по умолчанию", callback_data=PlaylistCb(action="untarget"))
     kb.adjust(1)
     return kb.as_markup()
 

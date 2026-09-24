@@ -209,8 +209,9 @@ async def target_prompt(ym: YandexMusic, store: Storage, user_id: int) -> tuple[
     playlists = await ym.get_my_playlists()
     current = store.get_upload_target(user_id)
     name = next((p.title for p in playlists if p.kind == current), None)
-    text = (f"📌 Сейчас присланные файлы сразу загружаются в «{html.escape(name)}»." if name
-            else "📌 Сейчас бот спрашивает, куда загружать каждый файл.")
+    text = (f"📌 Плейлист по умолчанию для загрузки: «{html.escape(name)}». Присланные файлы бот предложит "
+            "загрузить туда одной кнопкой (перед этим можно поправить данные трека)." if name
+            else "📌 Плейлист по умолчанию не выбран: для каждой пачки файлов бот спрашивает, куда их загрузить.")
     if not playlists:
         return text + "\n\nПлейлистов пока нет: /newplaylist название", None
     return text + "\n\nВыберите плейлист по умолчанию:", target_menu(playlists, current is not None)
@@ -229,14 +230,14 @@ async def on_target(call: CallbackQuery, callback_data: PlaylistCb, ym: YandexMu
         await call.answer("Плейлист не найден", show_alert=True)
         return
     store.set_upload_target(call.from_user.id, playlist.kind)
-    await call.answer(f"📌 Теперь файлы сразу загружаются в «{playlist.title}». Отключить: /target", show_alert=True)
+    await call.answer(f"📌 Плейлист по умолчанию для загрузки: «{playlist.title}». Изменить: /target", show_alert=True)
 
 
 @router.callback_query(PlaylistCb.filter(F.action == "untarget"))
 async def on_untarget(call: CallbackQuery, store: Storage) -> None:
     store.set_upload_target(call.from_user.id, None)
     await call.answer()
-    await _edit(call.message, "Ок, теперь буду спрашивать, куда загружать каждый файл.", None)
+    await _edit(call.message, "Ок, плейлист по умолчанию убран: буду спрашивать, куда загружать файлы.", None)
 
 
 @router.callback_query(PlaylistCb.filter(F.action == "delete"))

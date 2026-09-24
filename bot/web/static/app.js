@@ -43,6 +43,7 @@
     refresh: '<path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M8 16H3v5"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
     lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+    check: '<path d="M20 6 9 17l-5-5"/>',
   };
 
   function icon(name, cls = '') {
@@ -803,9 +804,253 @@
     if (!search.q) setTimeout(() => alive() && input.isConnected && input.focus(), 300);
   }
 
+  // ---------- теги аудиофайла (MP3 ID3v2 и FLAC) — читаем прямо на телефоне ----------
+  const MAX_TAG_BYTES = 16 << 20;
+
+  async function readBytes(file, from, length) {
+    return new Uint8Array(await file.slice(from, from + length).arrayBuffer());
+  }
+
+  const syncsafe = (b, i) => ((b[i] & 0x7f) << 21) | ((b[i + 1] & 0x7f) << 14) | ((b[i + 2] & 0x7f) << 7) | (b[i + 3] & 0x7f);
+  const be32 = (b, i) => ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+  const le32 = (b, i) => (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0;
+
+  function decodeLatin(bytes) {
+    // В русских MP3 «латиница» часто на самом деле cp1251: если все высокие байты — кириллица, читаем так.
+    const high = bytes.filter((c) => c >= 0x80);
+    if (high.length && high.every((c) => c >= 0xc0 || c === 0xa8 || c === 0xb8)) {
+      const fixed = new TextDecoder('windows-1251').decode(bytes);
+      if (!/[A-Za-z][А-яЁё]|[А-яЁё][A-Za-z]/.test(fixed)) return fixed; // «Beyoncé» — настоящий latin-1
+    }
+    return new TextDecoder('latin1').decode(bytes);
+  }
+
+  function decodeText(enc, bytes) {
+    let text;
+    if (enc === 1 || enc === 2) {
+      let le = enc === 1;
+      if (bytes[0] === 0xff && bytes[1] === 0xfe) { le = true; bytes = bytes.subarray(2); }
+      else if (bytes[0] === 0xfe && bytes[1] === 0xff) { le = false; bytes = bytes.subarray(2); }
+      text = new TextDecoder(le ? 'utf-16le' : 'utf-16be').decode(bytes);
+    } else {
+      text = enc === 3 ? new TextDecoder('utf-8').decode(bytes) : decodeLatin(bytes);
+    }
+    return text.split('\0')[0].trim();
+  }
+
+  function textEnd(bytes, from, enc) {
+    // Конец строки с нулём: для UTF-16 — два нулевых байта на чётной позиции.
+    if (enc === 1 || enc === 2) {
+      for (let i = from; i + 1 < bytes.length; i += 2) if (!bytes[i] && !bytes[i + 1]) return i;
+      return bytes.length;
+    }
+    const i = bytes.indexOf(0, from);
+    return i < 0 ? bytes.length : i;
+  }
+
+  function parseApic(body, v2) {
+    const enc = body[0];
+    let pos = 1;
+    let mime = 'image/jpeg';
+    if (v2) { mime = String.fromCharCode(...body.subarray(1, 4)).toLowerCase() === 'png' ? 'image/png' : 'image/jpeg'; pos = 4; }
+    else {
+      const end = body.indexOf(0, 1);
+      mime = new TextDecoder('latin1').decode(body.subarray(1, end)) || mime;
+      pos = end + 1;
+    }
+    pos += 1; // тип картинки
+    const end = textEnd(body, pos, enc);
+    pos = end + (enc === 1 || enc === 2 ? 2 : 1);
+    return pos < body.length ? new Blob([body.slice(pos)], { type: mime.includes('/') ? mime : `image/${mime}` }) : null;
+  }
+
+  async function parseId3(file, head) {
+    const ver = head[3];
+    const total = Math.min(syncsafe(head, 6) + 10, MAX_TAG_BYTES);
+    const buf = await readBytes(file, 0, total);
+    const v2 = ver === 2;
+    const hdr = v2 ? 6 : 10;
+    let pos = 10;
+    if (head[5] & 0x40) pos += ver === 4 ? syncsafe(buf, 10) : be32(buf, 10) + 4; // расширенный заголовок
+    const keys = { TIT2: 'title', TT2: 'title', TPE1: 'artist', TP1: 'artist', TALB: 'album', TAL: 'album',
+      TDRC: 'year', TYER: 'year', TYE: 'year' };
+    const out = {};
+    while (pos + hdr <= buf.length) {
+      const id = String.fromCharCode(...buf.subarray(pos, pos + (v2 ? 3 : 4)));
+      if (!/^[A-Z0-9]{3,4}$/.test(id)) break;
+      const size = v2 ? (buf[pos + 3] << 16) | (buf[pos + 4] << 8) | buf[pos + 5]
+        : ver === 4 ? syncsafe(buf, pos + 4) : be32(buf, pos + 4);
+      if (size <= 0) break;
+      const body = buf.subarray(pos + hdr, pos + hdr + size);
+      pos += hdr + size;
+      if (keys[id] && !out[keys[id]]) out[keys[id]] = decodeText(body[0], body.subarray(1));
+      else if ((id === 'APIC' || id === 'PIC') && !out.cover) out.cover = parseApic(body, v2);
+    }
+    return out;
+  }
+
+  async function parseFlac(file) {
+    const out = {};
+    let pos = 4;
+    for (let n = 0; n < 64 && pos < MAX_TAG_BYTES; n += 1) {
+      const h4 = await readBytes(file, pos, 4);
+      if (h4.length < 4) break;
+      const type = h4[0] & 0x7f;
+      const len = (h4[1] << 16) | (h4[2] << 8) | h4[3];
+      if (type === 4 || (type === 6 && !out.cover)) {
+        const b = await readBytes(file, pos + 4, len);
+        if (type === 4) {
+          let p = 4 + le32(b, 0);
+          const count = le32(b, p); p += 4;
+          for (let i = 0; i < count && p + 4 <= b.length; i += 1) {
+            const l = le32(b, p); p += 4;
+            const entry = new TextDecoder('utf-8').decode(b.subarray(p, p + l)); p += l;
+            const eq = entry.indexOf('=');
+            const key = { TITLE: 'title', ARTIST: 'artist', ALBUM: 'album', DATE: 'year', YEAR: 'year' }[entry.slice(0, eq).toUpperCase()];
+            if (key && !out[key]) out[key] = entry.slice(eq + 1).trim();
+          }
+        } else {
+          let p = 4;
+          const mimeLen = be32(b, p); p += 4;
+          const mime = new TextDecoder('latin1').decode(b.subarray(p, p + mimeLen)); p += mimeLen;
+          p += 4 + be32(b, p) + 16; // описание, размеры и глубина цвета
+          const dataLen = be32(b, p); p += 4;
+          out.cover = new Blob([b.slice(p, p + dataLen)], { type: mime || 'image/jpeg' });
+        }
+      }
+      pos += 4 + len;
+      if (h4[0] & 0x80) break; // последний блок
+    }
+    return out;
+  }
+
+  async function readTags(file) {
+    try {
+      const head = await readBytes(file, 0, 10);
+      let tags = null;
+      if (head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33) tags = await parseId3(file, head);
+      else if (head[0] === 0x66 && head[1] === 0x4c && head[2] === 0x61 && head[3] === 0x43) tags = await parseFlac(file);
+      if (tags && tags.year) tags.year = (tags.year.match(/\d{4}/) || [''])[0];
+      return tags;
+    } catch (_) {
+      return null; // не смогли — сервер всё равно возьмёт теги из файла
+    }
+  }
+
+  // Картинка для обложки: уменьшаем до 1000 px и пережимаем в JPEG прямо на телефоне.
+  async function resizeImage(file, max = 1000) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const i = new Image();
+        i.onload = () => resolve(i);
+        i.onerror = () => reject(new Error('Не удалось открыть картинку'));
+        i.src = url;
+      });
+      const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const canvas = h('canvas', { width: Math.round(img.naturalWidth * scale), height: Math.round(img.naturalHeight * scale) });
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+      if (!blob) throw new Error('Не удалось подготовить обложку');
+      return blob;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  const blobUrls = new WeakMap();
+  function blobUrl(blob) {
+    if (!blobUrls.has(blob)) blobUrls.set(blob, URL.createObjectURL(blob));
+    return blobUrls.get(blob);
+  }
+
   // ---------- экран: загрузка ----------
   const up = { files: [], kind: null, running: false };
   const ACCEPT = 'audio/*,.mp3,.flac,.m4a,.aac,.ogg,.oga,.opus,.wav,.wma,.aiff,.alac,.ape';
+  const FIELDS = [['title', 'Название'], ['artist', 'Исполнитель'], ['album', 'Альбом'], ['year', 'Год']];
+
+  // Что окажется в треке: правка пользователя → тег файла → догадка по имени файла.
+  function effective(f) {
+    const tags = f.tags || {};
+    const pick = (k) => (k in f.edit ? f.edit[k] : tags[k]) || '';
+    return {
+      title: pick('title') || f.guess.title,
+      artist: pick('artist') || f.guess.artist,
+      album: pick('album'),
+      year: pick('year'),
+      cover: f.removeCover ? null : (f.cover || tags.cover || null),
+    };
+  }
+
+  const isEdited = (f) => Object.keys(f.edit).length > 0 || !!f.cover || f.removeCover;
+
+  function trackEditor(f, onSave) {
+    const e = effective(f);
+    const inputs = {};
+    let cover = f.cover;
+    let removeCover = f.removeCover;
+    const fileCover = f.tags && f.tags.cover;
+    const coverBox = h('div', { class: 'ed-cover' });
+    const picker = h('input', { type: 'file', accept: 'image/*', hidden: true });
+    const coverBtns = h('div', { class: 'ed-cover-actions' });
+
+    function drawCover() {
+      const blob = removeCover ? null : (cover || fileCover);
+      put(coverBox, blob ? h('img', { class: 'cover', src: blobUrl(blob), alt: '' }) : h('div', { class: 'cover' }, icon('music')));
+      put(coverBtns,
+        h('label', { class: 'btn secondary' }, icon('edit', 'sm'), blob ? 'Сменить обложку' : 'Добавить обложку', picker),
+        blob ? h('button', { class: 'btn secondary danger', onclick: () => { cover = null; removeCover = true; drawCover(); } },
+          icon('trash', 'sm'), 'Убрать') : null,
+        !blob && (removeCover || cover) && fileCover
+          ? h('button', { class: 'link-btn', onclick: () => { cover = null; removeCover = false; drawCover(); } }, 'Вернуть из файла') : null);
+    }
+
+    picker.addEventListener('change', async () => {
+      const file = picker.files[0];
+      picker.value = '';
+      if (!file) return;
+      try {
+        cover = await resizeImage(file);
+        removeCover = false;
+        drawCover();
+        haptic.tap();
+      } catch (err) { fail(err); }
+    });
+
+    const fields = FIELDS.map(([key, label]) => {
+      inputs[key] = h('input', {
+        class: 'text', value: e[key] || '', maxLength: key === 'year' ? 4 : 200, enterKeyHint: 'next',
+        inputMode: key === 'year' ? 'numeric' : 'text', placeholder: key === 'year' ? '2024' : label,
+      });
+      return h('label', { class: `ed-field ${key}` }, h('span', {}, label), inputs[key]);
+    });
+
+    function save() {
+      const year = inputs.year.value.trim();
+      if (year && !/^\d{4}$/.test(year)) { toast('Год — четыре цифры, например 2024'); inputs.year.focus(); return; }
+      const base = f.tags || {};
+      const fallback = { title: f.guess.title, artist: f.guess.artist };
+      const edit = {};
+      for (const [key] of FIELDS) {
+        const value = inputs[key].value.trim();
+        if (value !== (base[key] || fallback[key] || '')) edit[key] = value;
+      }
+      Object.assign(f, { edit, cover, removeCover });
+      haptic.ok();
+      closeSheet();
+      onSave();
+    }
+
+    drawCover();
+    openSheet([
+      h('div', { class: 'sheet-title' }, 'Данные трека'),
+      h('div', { class: 'ed-file' }, icon('music', 'sm'), f.file.name),
+      h('div', { class: 'ed-top' }, coverBox, coverBtns),
+      h('div', { class: 'ed-fields' }, fields),
+      h('button', { class: 'btn block big', onclick: save }, icon('check', 'sm'), 'Готово'),
+      h('div', { class: 'sheet-note' }, 'Пустые поля возьмём из тегов файла. Трек встанет в начало плейлиста, как только Яндекс его обработает.'),
+    ]);
+  }
 
   function uploadView(root, alive, entry) {
     const targetBox = h('div', { class: 'card list' }, skRows(1));
@@ -825,9 +1070,9 @@
       h('div', { class: 'lib-head' }, h('div', {}, h('div', { class: 'hello' }, 'В вашу Яндекс Музыку'), h('h1', { class: 'page-title' }, 'Загрузка'))),
       targetBox,
       h('div', { style: 'margin-top:14px' }, dz),
-      h('div', { class: 'hint' }, state.me.can_convert
-        ? 'Не-MP3 файлы сервер сам переведёт в MP3 320 kbps. Исполнителя и название можно не заполнять — возьмём теги из файла.'
-        : 'Исполнителя и название можно не заполнять — возьмём теги из файла.'),
+      h('div', { class: 'hint' }, 'Нажмите на файл, чтобы поменять название, исполнителя, альбом, год или обложку. '
+        + 'Загруженные треки встают в начало плейлиста.'
+        + (state.me.can_convert ? ' Не-MP3 сервер сам переведёт в MP3 320 kbps.' : '')),
       listHead, list, uploadBar);
 
     input.addEventListener('change', () => { addFiles(input.files); input.value = ''; });
@@ -838,7 +1083,10 @@
     function addFiles(fileList) {
       for (const file of fileList) {
         if (file.size > maxMb * 1048576) { toast(`${file.name}: больше ${maxMb} МБ`); continue; }
-        up.files.push({ file, guess: guessFromName(file.name), artist: '', title: '', status: 'pending', progress: 0, message: '' });
+        const f = { file, guess: guessFromName(file.name), tags: null, edit: {}, cover: null, removeCover: false,
+          status: 'pending', progress: 0, message: '' };
+        f.tagsReady = readTags(file).then((tags) => { f.tags = tags; if (f.redraw) f.redraw(); });
+        up.files.push(f);
       }
       haptic.tap();
       drawFiles();
@@ -865,8 +1113,8 @@
           h('div', { class: 'meta' }, h('div', { class: 'label' }, 'Загружать в плейлист'), h('div', { class: 'value' }, p.title)),
           icon('chevron', 'sm')),
         h('div', { class: 'toggle-row' },
-          h('div', { class: 'meta' }, h('div', {}, 'Файлы из чата — сюда же'),
-            h('div', { class: 'sub' }, 'Аудио, присланные боту, будут сразу загружаться в этот плейлист')),
+          h('div', { class: 'meta' }, h('div', {}, 'По умолчанию и для чата'),
+            h('div', { class: 'sub' }, 'Файлы, присланные боту, можно будет загрузить сюда одной кнопкой')),
           h('label', { class: 'switch' }, sw, h('span'))));
     }
 
@@ -879,30 +1127,40 @@
     }
 
     function fileCard(f) {
-      const artist = h('input', { placeholder: f.guess.artist || 'Исполнитель', value: f.artist, 'aria-label': 'Исполнитель' });
-      const title = h('input', { placeholder: f.guess.title || 'Название', value: f.title, 'aria-label': 'Название' });
-      artist.addEventListener('input', () => { f.artist = artist.value; });
-      title.addEventListener('input', () => { f.title = title.value; });
+      const coverBox = h('div', { class: 'file-cover' });
+      const title = h('div', { class: 'title' });
+      const sub = h('div', { class: 'sub' });
       const bar = h('div');
       const progress = h('div', { class: 'progress' }, bar);
       const status = h('div', { class: 'status' });
+      const edit = h('button', { class: 'icon-btn', 'aria-label': 'Изменить данные трека' }, icon('edit', 'sm'));
       const remove = h('button', { class: 'icon-btn', 'aria-label': 'Убрать' });
-      remove.addEventListener('click', () => { up.files = up.files.filter((x) => x !== f); drawFiles(); });
-      f.el = h('div', { class: 'file' },
-        h('div', { class: 'file-head' }, h('div', { class: 'ficon' }, icon('music', 'sm')), h('div', { class: 'name' }, f.file.name),
-          h('div', { class: 'size' }, fmtSize(f.file.size)), remove),
-        h('div', { class: 'fields' }, artist, title), progress, status);
-      // Меняем только нужные элементы карточки, чтобы не сбить ввод в полях.
+      const openEditor = () => {
+        if (f.status === 'uploading' || f.status === 'done') return;
+        f.tagsReady.then(() => trackEditor(f, () => f.redraw()));
+      };
+      edit.addEventListener('click', (e) => { e.stopPropagation(); openEditor(); });
+      remove.addEventListener('click', (e) => { e.stopPropagation(); up.files = up.files.filter((x) => x !== f); drawFiles(); });
+      f.el = h('div', { class: 'file', role: 'button', onclick: openEditor },
+        h('div', { class: 'file-head' }, coverBox, h('div', { class: 'meta' }, title, sub), edit, remove),
+        progress, status);
       f.redraw = () => {
+        const e = effective(f);
         const busy = f.status === 'uploading';
+        const locked = busy || f.status === 'done';
+        put(coverBox, e.cover ? h('img', { class: 'cover', src: blobUrl(e.cover), alt: '' }) : h('div', { class: 'cover' }, icon('music')));
+        put(title, h('span', { class: 'name' }, e.title || f.file.name), isEdited(f) ? h('span', { class: 'edited' }, 'изменено') : null);
+        sub.textContent = [e.artist, e.album, fmtSize(f.file.size)].filter(Boolean).join(' · ');
         bar.style.width = `${Math.round(f.progress * 100)}%`;
         progress.hidden = f.status === 'pending';
         status.textContent = f.message;
+        status.hidden = !f.message;
         status.className = `status${f.status === 'done' ? ' ok' : f.status === 'error' ? ' err' : ''}`;
         f.el.classList.toggle('done', f.status === 'done');
+        f.el.classList.toggle('locked', locked);
+        edit.hidden = locked;
         remove.hidden = busy;
         put(remove, icon(f.status === 'done' ? 'x' : 'trash', 'sm'));
-        artist.disabled = title.disabled = busy || f.status === 'done';
         drawButton();
       };
       f.redraw();
@@ -937,7 +1195,7 @@
       drawButton();
       if (ok) {
         haptic.ok();
-        toast(`Загружено: ${filesWord(ok)}. Яндекс обработает треки за пару минут`, 4000);
+        toast(`Загружено: ${filesWord(ok)}. Через минуту-другую Яндекс обработает треки, и они встанут в начало плейлиста`, 5000);
         loadLibrary().catch(() => {});
       }
     }
@@ -945,11 +1203,13 @@
     function uploadOne(f) {
       return new Promise((resolve) => {
         const form = new FormData();
+        const meta = { ...f.edit };
+        if (f.removeCover && !f.cover) meta.remove_cover = true;
         form.append('kind', String(up.kind));
-        form.append('artist', f.artist.trim());
-        form.append('title', f.title.trim());
+        form.append('meta', JSON.stringify(meta));
         form.append('fallback_artist', f.guess.artist);
         form.append('fallback_title', f.guess.title);
+        if (f.cover) form.append('cover', f.cover, 'cover.jpg');
         form.append('file', f.file, f.file.name);
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/upload');

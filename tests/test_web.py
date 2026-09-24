@@ -17,7 +17,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from bot import accounts as accounts_module
 from bot.accounts import Accounts
-from bot.audio import read_mp3_tags, tag_mp3
+from bot.audio import read_mp3_tags, read_tags, tag_mp3
 from bot.config import Config
 from bot.storage import Storage
 from bot.web.app import create_app
@@ -28,6 +28,7 @@ OWNER_ID = 1
 FRIEND_ID = 2
 NEWBIE_ID = 666
 FAKE_MP3 = b"\xff\xfb\x90\x64" + bytes(range(256)) * 40
+FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"cover" * 40
 
 
 def init_data(user_id: int = OWNER_ID, token: str = TOKEN, auth_date: int | None = None) -> str:
@@ -144,6 +145,18 @@ class FakeSender:
         self.sent.append((chat_id, str(track.id), ym.login))
 
 
+class FakePlacer:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    async def before_upload(self, ym, kind):
+        self.calls.append(("before", ym.login, kind))
+        return {"known"}
+
+    def after_upload(self, ym, kind, known, ugc_id):
+        self.calls.append(("after", ym.login, kind, known, ugc_id))
+
+
 class FakeOAuth:
     def __init__(self) -> None:
         self.confirmed = False
@@ -189,11 +202,12 @@ async def env(tmp_path, upstream, monkeypatch):
     sender = FakeSender()
     config = Config(bot_token=TOKEN, data_dir=tmp_path)
     bot = Bot(TOKEN)
-    client = TestClient(TestServer(create_app(config, bot, accounts, store, sender)))
+    placer = FakePlacer()
+    client = TestClient(TestServer(create_app(config, bot, accounts, store, sender, placer)))
     await client.start_server()
     client.session.headers["X-Telegram-Init-Data"] = init_data()
     yield NS(client=client, ym=fakes["tok-owner"], friend=fakes["tok-friend"], store=store, sender=sender,
-             accounts=accounts, oauth=oauth)
+             accounts=accounts, oauth=oauth, placer=placer)
     await client.close()
     await bot.session.close()
     await accounts.close()
@@ -426,6 +440,58 @@ async def test_upload_uses_filename_guess_only_without_tags(env):
     assert (await env.client.post("/api/upload", data=form)).status == 200
     [(_, _, _, data)] = [c for c in env.ym.calls if c[0] == "upload"]
     assert read_mp3_tags(data) == ("Из тегов", "Файла"), "свои теги файла важнее догадки по имени"
+
+
+async def test_upload_with_editor_meta_and_cover(env):
+    tagged = tag_mp3(FAKE_MP3, artist="Из файла", title="Трек", album="Старый альбом", year=2001)
+    form = FormData()
+    form.add_field("kind", "1003")
+    form.add_field("meta", json.dumps({"title": "Новое", "artist": None, "album": "", "year": "2024"}))
+    form.add_field("cover", FAKE_JPEG, filename="cover.jpg", content_type="image/jpeg")
+    form.add_field("file", tagged, filename="x.mp3", content_type="audio/mpeg")
+    r = await env.client.post("/api/upload", data=form)
+    body = await r.json()
+    assert r.status == 200, body
+    assert body["name"] == "Из файла - Новое.mp3" and "новая обложка" in body["notes"]
+    [(_, kind, _, data)] = [c for c in env.ym.calls if c[0] == "upload"]
+    meta = read_tags(data)
+    assert (meta.title, meta.artist, meta.album, meta.year) == ("Новое", "Из файла", None, "2024")
+    assert meta.cover == FAKE_JPEG
+    assert env.placer.calls == [("before", "me", 1003), ("after", "me", 1003, {"known"}, "ugc-9")], \
+        "трек встанет в начало плейлиста"
+
+
+async def test_upload_can_remove_cover(env):
+    form = FormData()
+    form.add_field("kind", "1003")
+    form.add_field("meta", json.dumps({"remove_cover": True}))
+    form.add_field("file", tag_mp3(FAKE_MP3, title="T", cover=FAKE_JPEG), filename="x.mp3")
+    assert (await env.client.post("/api/upload", data=form)).status == 200
+    [(_, _, _, data)] = [c for c in env.ym.calls if c[0] == "upload"]
+    assert read_tags(data).cover is None and read_tags(data).title == "T"
+
+
+@pytest.mark.parametrize(("field", "value", "error"), [
+    ("meta", json.dumps({"year": "давно"}), "Год"),
+    ("meta", "не json", "Некорректные данные"),
+])
+async def test_upload_rejects_bad_meta(env, field, value, error):
+    form = FormData()
+    form.add_field("kind", "1003")
+    form.add_field(field, value)
+    form.add_field("file", FAKE_MP3, filename="x.mp3")
+    r = await env.client.post("/api/upload", data=form)
+    assert r.status == 400 and error in (await r.json())["error"]
+    assert not [c for c in env.ym.calls if c[0] == "upload"]
+
+
+async def test_upload_rejects_non_image_cover(env):
+    form = FormData()
+    form.add_field("kind", "1003")
+    form.add_field("cover", b"%PDF-1.4 not an image", filename="c.jpg")
+    form.add_field("file", FAKE_MP3, filename="x.mp3")
+    r = await env.client.post("/api/upload", data=form)
+    assert r.status == 422 and "картинкой" in (await r.json())["error"]
 
 
 async def test_upload_validation(env):

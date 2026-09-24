@@ -24,6 +24,7 @@ from bot.config import Config, ConfigError, load_config
 from bot.handlers import build_router
 from bot.handlers.upload import UploadQueue
 from bot.middlewares import AccountMiddleware
+from bot.placer import TopPlacer
 from bot.sender import TrackSender
 from bot.storage import Storage
 from bot.web.app import create_app
@@ -34,7 +35,7 @@ COMMANDS = [
     BotCommand(command="app", description="🎧 Открыть медиатеку"),
     BotCommand(command="likes", description="❤️ Мне нравится"),
     BotCommand(command="playlists", description="📃 Мои плейлисты"),
-    BotCommand(command="target", description="📌 Куда загружать мои файлы"),
+    BotCommand(command="target", description="📌 Плейлист по умолчанию для загрузки"),
     BotCommand(command="newplaylist", description="➕ Создать плейлист"),
     BotCommand(command="menu", description="🏠 Главное меню"),
     BotCommand(command="login", description="🔑 Подключить Яндекс Музыку"),
@@ -65,7 +66,8 @@ def build_bot(config: Config) -> Bot:
     return Bot(config.bot_token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 
-def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Storage) -> dict[str, Any]:
+def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Storage,
+                       placer: TopPlacer | None = None) -> dict[str, Any]:
     """Объекты, которые aiogram подставляет в обработчики по имени аргумента (ym — AccountMiddleware)."""
     return {
         "config": config,
@@ -73,11 +75,13 @@ def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Stor
         "store": store,
         "sender": TrackSender(bot, store, config),
         "uploads": UploadQueue(),
+        "placer": placer or TopPlacer(),
     }
 
 
-def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storage) -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage(), **build_dependencies(config, bot, accounts, store))
+def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storage,
+                     placer: TopPlacer | None = None) -> Dispatcher:
+    dp = Dispatcher(storage=MemoryStorage(), **build_dependencies(config, bot, accounts, store, placer))
 
     # У каждого свой аккаунт Яндекса: middleware подставляет его клиент или предлагает войти.
     account = AccountMiddleware()
@@ -113,8 +117,8 @@ def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storag
 
 
 async def start_web(config: Config, bot: Bot, accounts: Accounts, store: Storage,
-                    sender: TrackSender) -> web.AppRunner:
-    runner = web.AppRunner(create_app(config, bot, accounts, store, sender), access_log=None)
+                    sender: TrackSender, placer: TopPlacer) -> web.AppRunner:
+    runner = web.AppRunner(create_app(config, bot, accounts, store, sender, placer), access_log=None)
     await runner.setup()
     await web.TCPSite(runner, config.web_host, config.web_port).start()
     log.info("Мини-приложение слушает http://%s:%s (публичный адрес: %s)",
@@ -186,8 +190,9 @@ async def main() -> None:
                  "ALLOWED_USERS больше не нужны — их можно убрать из .env.", ", ".join(map(str, imported)))
     log.info("Подключённых аккаунтов Яндекса: %s", store.account_count())
 
-    dp = build_dispatcher(config, bot, accounts, store)
-    runner = await start_web(config, bot, accounts, store, dp["sender"])
+    placer = TopPlacer()  # общий для бота и приложения: загрузки встают в начало плейлиста
+    dp = build_dispatcher(config, bot, accounts, store, placer)
+    runner = await start_web(config, bot, accounts, store, dp["sender"], placer)
     try:
         await bot.set_my_commands(COMMANDS)
         await setup_menu_button(bot, config)
@@ -195,6 +200,7 @@ async def main() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await runner.cleanup()
+        await placer.close()
         await accounts.close()
         store.close()
         await bot.session.close()

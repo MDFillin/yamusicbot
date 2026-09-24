@@ -266,6 +266,42 @@ class YandexMusic:
             kind, track.id, album.id, at=playlist.track_count or 0, revision=playlist.revision or 1,
         )
 
+    async def playlist_track_ids(self, kind: int) -> set[str]:
+        playlist = await self.get_playlist(kind)
+        return {str(s.id) for s in playlist.tracks or []} if playlist is not None else set()
+
+    async def move_to_top(self, kind: int, track_ids: Sequence[str], playlist: Playlist | None = None) -> bool:
+        """Ставит треки своего плейлиста в самое начало, в заданном порядке. False — таких треков в нём нет.
+
+        Одним запросом: сначала вставляем треки наверх, потом удаляем их прежние позиции. Если Яндекс вдруг
+        применит только часть операций, трек в худшем случае окажется в плейлисте дважды, но не пропадёт.
+        """
+        playlist = playlist or await self.get_playlist(kind)
+        if playlist is None:
+            raise YandexMusicError("Плейлист не найден")
+        shorts = list(playlist.tracks or [])
+        positions: dict[str, int] = {}
+        for i, short in enumerate(shorts):
+            positions.setdefault(str(short.id), i)
+        wanted = list(dict.fromkeys(t for t in track_ids if t in positions))
+        if not wanted:
+            return False
+        if [str(s.id) for s in shorts[:len(wanted)]] == wanted:
+            return True  # уже наверху
+
+        items = []
+        for track_id in wanted:
+            short = shorts[positions[track_id]]
+            item: dict[str, object] = {"id": short.id}
+            if short.album_id:  # у загруженных треков альбома нет
+                item["albumId"] = short.album_id
+            items.append(item)
+        ops: list[dict[str, object]] = [{"op": "insert", "at": 0, "tracks": items}]
+        for pos in sorted((positions[t] for t in wanted), reverse=True):
+            ops.append({"op": "delete", "from": pos + len(items), "to": pos + len(items) + 1})
+        await self.client.users_playlists_change(kind, json.dumps(ops), revision=playlist.revision or 1)
+        return True
+
     async def get_liked_track_ids(self) -> list[str]:
         likes = await self.client.users_likes_tracks()
         return [s.track_id for s in likes.tracks] if likes and likes.tracks else []

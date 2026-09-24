@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import re
 import shutil
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
+import mutagen
+from mutagen.flac import Picture
 from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, ID3NoHeaderError
 
 # Эти форматы бот понимает как аудио, если их прислали документом.
@@ -16,6 +20,40 @@ AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".
 
 _CAPTION_SPLIT = re.compile(r"\s+[-–—]\s+")
 _BAD_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_YEAR = re.compile(r"\d{4}")
+
+MAX_COVER_BYTES = 10 * 1024 * 1024
+COVER_MAX_SIDE = 1200  # px: больше обложке не нужно, а файл трека от неё раздувается
+
+
+@dataclass
+class TrackMeta:
+    """Данные трека: название, исполнитель, альбом, год, обложка.
+
+    В правке пользователя None значит «оставить как в файле», а пустая строка — «очистить».
+    """
+
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    year: str | None = None
+    cover: bytes | None = field(default=None, repr=False)
+    remove_cover: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return any(v is not None for v in (self.title, self.artist, self.album, self.year, self.cover)) \
+            or self.remove_cover
+
+
+def clean_year(value: str | None) -> str | None:
+    """Год из тега или ввода: «1989», «1989-05-01» -> «1989»; пустая строка остаётся пустой (очистить)."""
+    if value is None or not value.strip():
+        return value.strip() if value is not None else None
+    m = _YEAR.search(value)
+    if not m or not 1000 <= int(m.group()) <= 2100:
+        raise ValueError("Год — четыре цифры, например 2024")
+    return m.group()
 
 
 def safe_filename(name: str, default: str = "track") -> str:
@@ -78,6 +116,162 @@ def read_mp3_tags(data: bytes) -> tuple[str | None, str | None]:
     return artist, title
 
 
+def image_type(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8"):
+        return "jpeg"
+    if data.startswith(b"\x89PNG"):
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:4] in (b"GIF8",):
+        return "gif"
+    return None
+
+
+def _first(value) -> str | None:
+    if isinstance(value, list):
+        value = value[0] if value else None
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+_CP1251_HIGH = set(range(0xC0, 0x100)) | {0xA8, 0xB8}  # кириллица и Ёё в cp1251
+_MIXED_WORD = re.compile(r"[A-Za-z][А-яЁё]|[А-яЁё][A-Za-z]")
+
+
+def _id3_text(frame) -> str | None:
+    """Текст ID3-кадра. Старые русские MP3 пишут cp1251 под видом latin-1 — такие строки перекодируем."""
+    text = _first(frame.text)
+    if text and frame.encoding == 0:
+        try:
+            raw = text.encode("latin-1")
+        except UnicodeEncodeError:
+            return text
+        high = [b for b in raw if b >= 0x80]
+        if high and all(b in _CP1251_HIGH for b in high):
+            fixed = raw.decode("cp1251")
+            if not _MIXED_WORD.search(fixed):  # «Beyoncé» дал бы «Beyoncщ» — это настоящий latin-1
+                return fixed
+    return text
+
+
+def _year_or_none(value) -> str | None:
+    try:
+        return clean_year(_first(value)) or None
+    except ValueError:
+        return None
+
+
+def read_tags(data: bytes) -> TrackMeta:
+    """Теги и обложка из файла: MP3 (ID3), FLAC, OGG/Opus, M4A. Чего нет или не удалось прочитать — None."""
+    try:
+        if data[:3] == b"ID3":
+            tags, audio = ID3(io.BytesIO(data)), None
+        else:
+            audio = mutagen.File(io.BytesIO(data))
+            tags = audio.tags if audio is not None else None
+    except Exception:
+        return TrackMeta()
+    if tags is None:
+        return TrackMeta()
+
+    if isinstance(tags, ID3):
+        apic = tags.getall("APIC")
+        cover = next((a.data for a in apic if a.type == 3), apic[0].data if apic else None)
+        return TrackMeta(
+            title=_id3_text(tags["TIT2"]) if "TIT2" in tags else None,
+            artist=_id3_text(tags["TPE1"]) if "TPE1" in tags else None,
+            album=_id3_text(tags["TALB"]) if "TALB" in tags else None,
+            year=_year_or_none(tags["TDRC"].text) if "TDRC" in tags else None,
+            cover=cover,
+        )
+
+    def get(*keys: str):
+        for key in keys:
+            try:
+                if key in tags:
+                    return tags[key]
+            except (KeyError, ValueError, TypeError):
+                continue
+        return None
+
+    cover = None
+    pictures = getattr(audio, "pictures", None)  # FLAC
+    if pictures:
+        cover = next((p.data for p in pictures if p.type == 3), pictures[0].data)
+    elif (block := _first(get("metadata_block_picture"))) is not None:  # OGG/Opus
+        try:
+            cover = Picture(base64.b64decode(block)).data
+        except Exception:
+            cover = None
+    elif (covr := get("covr")) is not None:  # M4A
+        cover = bytes(covr[0]) if covr else None
+    return TrackMeta(
+        title=_first(get("title", "\xa9nam")),
+        artist=_first(get("artist", "\xa9ART")),
+        album=_first(get("album", "\xa9alb")),
+        year=_year_or_none(get("date", "year", "\xa9day")),
+        cover=cover,
+    )
+
+
+def write_mp3_tags(data: bytes, meta: TrackMeta) -> bytes:
+    """Записывает в MP3 ровно эти данные: пустые поля и обложка удаляются."""
+    buf = io.BytesIO(data)
+    try:
+        tags = ID3(buf)
+    except ID3NoHeaderError:
+        tags = ID3()
+    for frame, cls, value in (("TIT2", TIT2, meta.title), ("TPE1", TPE1, meta.artist),
+                              ("TALB", TALB, meta.album), ("TDRC", TDRC, meta.year)):
+        if value:
+            tags.setall(frame, [cls(encoding=3, text=value)])
+        else:
+            tags.delall(frame)
+    if meta.cover:
+        mime = "image/png" if image_type(meta.cover) == "png" else "image/jpeg"
+        tags.setall("APIC", [APIC(encoding=3, mime=mime, type=3, desc="Cover", data=meta.cover)])
+    else:
+        tags.delall("APIC")
+    buf.seek(0)
+    tags.save(buf, v2_version=3)
+    return buf.getvalue()
+
+
+async def _ffmpeg(args: list[str], src_name: str, src: bytes, dst_name: str) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = Path(tmp) / src_name
+        dst_path = Path(tmp) / dst_name
+        src_path.write_bytes(src)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src_path), *args, str(dst_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not dst_path.exists():
+            raise ConversionError(stderr.decode(errors="replace").strip()[-500:] or "ffmpeg завершился с ошибкой")
+        return dst_path.read_bytes()
+
+
+async def normalize_cover(data: bytes) -> bytes:
+    """Картинка для обложки: JPEG или PNG разумного размера (большие и WEBP/GIF пережимаются в JPEG)."""
+    kind = image_type(data)
+    if kind is None:
+        raise ConversionError("Обложка должна быть картинкой: JPEG, PNG или WEBP")
+    if len(data) > MAX_COVER_BYTES:
+        raise ConversionError("Обложка больше 10 МБ — выберите картинку поменьше")
+    if kind in ("jpeg", "png") and len(data) <= 1_500_000:
+        return data
+    if not ffmpeg_available():
+        if kind in ("jpeg", "png"):
+            return data
+        raise ConversionError("Пришлите обложку в JPEG или PNG")
+    side = COVER_MAX_SIDE
+    scale = f"scale='min({side},iw)':'min({side},ih)':force_original_aspect_ratio=decrease"
+    return await _ffmpeg(["-vf", scale, "-frames:v", "1", "-q:v", "3"], f"cover.{kind}", data, "cover.jpg")
+
+
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
@@ -87,62 +281,75 @@ class ConversionError(RuntimeError):
 
 
 async def convert_to_mp3(data: bytes, source_ext: str, bitrate: int = 320) -> bytes:
-    """Конвертирует аудио в MP3 через ffmpeg (теги переносятся)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / f"in{source_ext or '.bin'}"
-        dst = Path(tmp) / "out.mp3"
-        src.write_bytes(data)
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(src),
-            "-map", "0:a:0", "-map_metadata", "0",
-            "-codec:a", "libmp3lame", "-b:a", f"{bitrate}k", "-id3v2_version", "3",
-            str(dst),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0 or not dst.exists():
-            raise ConversionError(stderr.decode(errors="replace").strip()[-500:] or "ffmpeg завершился с ошибкой")
-        return dst.read_bytes()
+    """Конвертирует аудио в MP3 через ffmpeg (текстовые теги переносятся, обложку допишет prepare_for_upload)."""
+    args = ["-map", "0:a:0", "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", f"{bitrate}k",
+            "-id3v2_version", "3"]
+    return await _ffmpeg(args, f"in{source_ext or '.bin'}", data, "out.mp3")
+
+
+def _pick(edited: str | None, from_file: str | None) -> str | None:
+    """Правка пользователя важнее тега из файла; пустая строка — очистить поле."""
+    if edited is None:
+        return from_file
+    return edited.strip() or None
 
 
 async def prepare_for_upload(
     file_name: str,
     data: bytes,
     *,
-    artist: str | None = None,
-    title: str | None = None,
+    edit: TrackMeta | None = None,
     fallback_artist: str | None = None,
     fallback_title: str | None = None,
 ) -> tuple[str, bytes, list[str]]:
     """Готовит файл к загрузке в Яндекс Музыку. Возвращает (имя файла, байты, заметки для пользователя).
 
-    - не-MP3 конвертируется в MP3, если есть ffmpeg;
-    - artist/title (указаны пользователем) записываются в теги и в имя файла;
-    - fallback_* (например, из метаданных Telegram) пишутся, только если своих тегов в файле нет.
+    - не-MP3 конвертируется в MP3, если есть ffmpeg (обложка из исходного файла сохраняется);
+    - правки пользователя (edit) важнее тегов файла, поля без правки остаются как в файле;
+    - fallback_* (например, из метаданных Telegram или имени файла) пишутся, только если в файле нет своих.
     """
+    edit = edit or TrackMeta()
     notes: list[str] = []
     name = safe_filename(file_name)
     ext = Path(name).suffix.lower()
+    original = read_tags(data)
+    converted = False
 
     if ext != ".mp3":
         if ffmpeg_available():
             data = await convert_to_mp3(data, ext)
             name = f"{Path(name).stem}.mp3"
             notes.append(f"сконвертирован из {ext or 'неизвестного формата'} в MP3")
+            converted = True
         else:
             notes.append(f"{ext or 'файл'} загружен как есть (ffmpeg не установлен, Яндекс надёжнее принимает MP3)")
+            if edit.changed:
+                notes.append("правки данных трека не применены — для этого нужен ffmpeg")
+            return name, data, notes
 
-    if name.lower().endswith(".mp3"):
-        if artist and title:
-            data = tag_mp3(data, artist=artist, title=title)
-            name = safe_filename(f"{artist} - {title}") + ".mp3"
-            notes.append(f"теги: {artist} — {title}")
-        else:
-            tag_artist, tag_title = read_mp3_tags(data)
-            new_artist = tag_artist or artist or fallback_artist
-            new_title = tag_title or title or fallback_title
-            if (new_artist, new_title) != (tag_artist, tag_title):
-                data = tag_mp3(data, artist=new_artist, title=new_title)
+    final = TrackMeta(
+        title=_pick(edit.title, original.title) or fallback_title,
+        artist=_pick(edit.artist, original.artist) or fallback_artist,
+        album=_pick(edit.album, original.album),
+        year=_pick(edit.year, original.year),
+        cover=None if edit.remove_cover else (edit.cover or original.cover),
+    )
+    current = read_tags(data)  # после конвертации текстовые теги уже на месте, а обложки нет
+    if final != current:
+        data = write_mp3_tags(data, final)
+
+    if edit.artist is not None or edit.title is not None:
+        if final.artist and final.title:
+            name = safe_filename(f"{final.artist} - {final.title}") + ".mp3"
+            notes.append(f"теги: {final.artist} — {final.title}")
+    if edit.album is not None:
+        notes.append(f"альбом: {final.album}" if final.album else "альбом убран")
+    if edit.year is not None:
+        notes.append(f"год: {final.year}" if final.year else "год убран")
+    if edit.cover:
+        notes.append("новая обложка")
+    elif edit.remove_cover:
+        notes.append("обложка убрана")
+    elif converted and original.cover:
+        notes.append("обложка из файла сохранена")
     return name, data, notes

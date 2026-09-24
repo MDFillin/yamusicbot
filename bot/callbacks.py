@@ -34,8 +34,15 @@ class PlaylistCb(CallbackData, prefix="p"):
 
 
 class UploadCb(CallbackData, prefix="u"):
-    action: str  # to | new | cancel
+    action: str  # to | pick | new | cancel
     kind: int = 0
+
+
+class EditCb(CallbackData, prefix="e"):
+    """Редактор данных файла из очереди загрузки (pid — номер файла в очереди)."""
+
+    action: str  # open | title | artist | album | year | cover | nocover | done
+    pid: int
 
 
 class SearchCb(CallbackData, prefix="s"):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import hashlib
+import json
 import logging
 import time
 from collections.abc import Callable, Hashable
@@ -21,9 +22,18 @@ from yandex_music import Album, Artist, Playlist, Track
 from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
 from bot.accounts import Accounts, LoginError, LoginSession
-from bot.audio import ConversionError, ffmpeg_available, prepare_for_upload
+from bot.audio import (
+    MAX_COVER_BYTES,
+    ConversionError,
+    TrackMeta,
+    clean_year,
+    ffmpeg_available,
+    normalize_cover,
+    prepare_for_upload,
+)
 from bot.config import Config
 from bot.handlers.download import start_bulk_download
+from bot.placer import TopPlacer
 from bot.sender import TrackSender, TrackTooLargeError
 from bot.sources import SourceNotFoundError, TrackSource, load_source, playlist_cover, playlist_ref, resolve
 from bot.storage import Storage
@@ -94,6 +104,7 @@ class WebContext:
     sender: TrackSender
     signer: MediaSigner
     static: StaticFiles
+    placer: TopPlacer = field(default_factory=TopPlacer)
     http: aiohttp.ClientSession | None = None
     sources: TTLCache = field(default_factory=lambda: TTLCache(SOURCE_TTL, 300))
     links: TTLCache = field(default_factory=lambda: TTLCache(LINK_TTL, 2000))
@@ -495,29 +506,70 @@ async def api_send_source(request: web.Request) -> web.Response:
     return web.json_response({"started": started})
 
 
+def parse_meta(fields: dict[str, str], cover: bytes | None) -> TrackMeta:
+    """Правки данных трека из формы: JSON-поле meta (null — как в файле, "" — очистить) и файл cover.
+
+    Старые поля artist/title (без meta) тоже понимаем: непустые — правка, пустые — как в файле.
+    """
+    try:
+        raw = json.loads(fields.get("meta") or "{}")
+    except ValueError as e:
+        raise web.HTTPBadRequest(text="Некорректные данные трека") from e
+    if not isinstance(raw, dict):
+        raise web.HTTPBadRequest(text="Некорректные данные трека")
+    for legacy in ("artist", "title"):
+        if legacy not in raw and fields.get(legacy):
+            raw[legacy] = fields[legacy]
+
+    def text(name: str) -> str | None:
+        value = raw.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, str | int):
+            raise web.HTTPBadRequest(text="Некорректные данные трека")
+        value = str(value).strip()[:200]
+        return value if value or name in ("album", "year") else None  # пустые название и исполнитель — из файла
+
+    try:
+        year = clean_year(text("year"))
+    except ValueError as e:
+        raise web.HTTPBadRequest(text=str(e)) from e
+    return TrackMeta(title=text("title"), artist=text("artist"), album=text("album"), year=year,
+                     cover=cover, remove_cover=bool(raw.get("remove_cover")) and cover is None)
+
+
 @routes.post("/api/upload")
 async def api_upload(request: web.Request) -> web.Response:
     """Файл с телефона прямо на сервер: лимит Telegram в 20 МБ здесь не действует."""
+    ctx = _ctx(request)
+    ym = request[YM]
     reader = await request.multipart()
     fields: dict[str, str] = {}
-    file_name, data = None, b""
+    file_name, data, cover = None, b"", None
     while (part := await reader.next()) is not None:
         if part.name == "file":
             file_name = part.filename or "track.mp3"
             data = bytes(await part.read())
+        elif part.name == "cover":
+            cover = bytes(await part.read())
+            if len(cover) > MAX_COVER_BYTES:
+                raise web.HTTPBadRequest(text="Обложка больше 10 МБ")
         elif part.name:
             fields[part.name] = (await part.text()).strip()
     if not file_name or not data:
         raise web.HTTPBadRequest(text="Файл не передан")
     if not fields.get("kind", "").isdigit():
         raise web.HTTPBadRequest(text="Не выбран плейлист")
+    kind = int(fields["kind"])
+    edit = parse_meta(fields, await normalize_cover(cover) if cover else None)
     name, prepared, notes = await prepare_for_upload(
-        file_name, data,
-        artist=fields.get("artist") or None, title=fields.get("title") or None,
+        file_name, data, edit=edit,
         fallback_artist=fields.get("fallback_artist") or None, fallback_title=fields.get("fallback_title") or None,
     )
-    result = await request[YM].upload_track(int(fields["kind"]), name, prepared)
-    _ctx(request).invalidate(_user_id(request))
+    known = await ctx.placer.before_upload(ym, kind)
+    result = await ym.upload_track(kind, name, prepared)
+    ctx.placer.after_upload(ym, kind, known, result.ugc_track_id)  # встанет в начало, когда Яндекс обработает
+    ctx.invalidate(_user_id(request))
     return web.json_response({"name": name, "notes": notes, "ugc_track_id": result.ugc_track_id})
 
 
@@ -649,12 +701,14 @@ async def _cleanup(app: web.Application) -> None:
         await app[CTX].http.close()
 
 
-def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sender: TrackSender) -> web.Application:
+def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sender: TrackSender,
+               placer: TopPlacer | None = None) -> web.Application:
     app = web.Application(
         client_max_size=config.web_max_upload_mb * 1024 * 1024,
         middlewares=[compress_middleware, errors_middleware, auth_middleware],
     )
-    app[CTX] = WebContext(config, bot, accounts, store, sender, MediaSigner(config.bot_token), StaticFiles(STATIC_DIR))
+    app[CTX] = WebContext(config, bot, accounts, store, sender, MediaSigner(config.bot_token), StaticFiles(STATIC_DIR),
+                          placer or TopPlacer())
     app.add_routes(routes)
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
