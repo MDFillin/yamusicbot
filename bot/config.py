@@ -78,7 +78,7 @@ def load_config() -> Config:
     if fxtunnel_domain and not FXTUNNEL_DOMAIN_RE.fullmatch(fxtunnel_domain):
         raise ConfigError("FXTUNNEL_DOMAIN: 3–32 символа — латиница, цифры и дефис (не в начале и не в конце)")
     if not webapp_url and fxtunnel_domain:
-        webapp_url = f"https://{fxtunnel_domain}.fxtun.dev"  # адрес, который выдаёт туннель fxTunnel
+        webapp_url = f"https://{fxtunnel_domain}.fxtun.ru"  # адрес, который выдаёт туннель fxTunnel (домен fxtun.ru)
     if webapp_url and not webapp_url.startswith("https://"):
         raise ConfigError("WEBAPP_URL должен начинаться с https:// — мини-приложения Telegram работают только по HTTPS")
 

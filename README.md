@@ -98,15 +98,15 @@ docker compose up -d --build --force-recreate
 ```
 
 **Вариант Б: сервер без открытых портов (за NAT) — туннель [fxTunnel](https://github.com/mephistofox/fxtun.dev).**
-Российский сервис: бесплатно, свой поддомен `https://имя.fxtun.dev`, HTTPS, открывается из России
-(туннели Cloudflare там сейчас замедляют). Зарегистрируйтесь на https://fxtun.dev, создайте токен в разделе «Токены»
+Российский сервис: бесплатно, свой поддомен `https://имя.fxtun.ru`, HTTPS, открывается из России
+(туннели Cloudflare там сейчас замедляют). Зарегистрируйтесь на https://fxtun.ru, создайте токен в разделе «Токены»
 и впишите в `.env`:
 ```bash
 FXTUNNEL_TOKEN=sk_...
 FXTUNNEL_DOMAIN=my-music        # 3–32 символа: латиница, цифры, дефис
 COMPOSE_PROFILES=tunnel
 ```
-`WEBAPP_URL` бот возьмёт сам: `https://my-music.fxtun.dev`. Запуск: `docker compose up -d --build --force-recreate`,
+`WEBAPP_URL` бот возьмёт сам: `https://my-music.fxtun.ru`. Запуск: `docker compose up -d --build --force-recreate`,
 проверка: `docker compose logs --tail 20 tunnel` (строка `HTTP: https://…`).
 При первом открытии fxTunnel покажет страницу-предупреждение — нажмите «Продолжить» один раз, дальше приложение
 само продлевает согласие.

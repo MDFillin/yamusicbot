@@ -71,7 +71,7 @@ def test_fxtunnel_domain_sets_webapp_url(monkeypatch):
     monkeypatch.setenv("YANDEX_MUSIC_TOKEN", "y0")
     monkeypatch.delenv("WEBAPP_URL", raising=False)
     monkeypatch.setenv("FXTUNNEL_DOMAIN", "BobikMusic228")
-    assert load_config().webapp_url == "https://bobikmusic228.fxtun.dev"
+    assert load_config().webapp_url == "https://bobikmusic228.fxtun.ru"
 
     monkeypatch.setenv("WEBAPP_URL", "https://other.example.com")
     assert load_config().webapp_url == "https://other.example.com", "явный WEBAPP_URL важнее"

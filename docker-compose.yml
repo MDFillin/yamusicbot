@@ -29,7 +29,9 @@ services:
     profiles: ["tunnel"]
     # Общая сеть с ботом: localhost:8080 внутри туннеля — это веб-сервер бота.
     network_mode: "service:bot"
-    command: ["http", "${WEB_PORT:-8080}", "--domain", "${FXTUNNEL_DOMAIN:-}", "--no-inspect"]
+    # Сервер управления fxTunnel переехал на fxtun.ru; только TLS, без старого открытого порта 4443.
+    command: ["http", "${WEB_PORT:-8080}", "--domain", "${FXTUNNEL_DOMAIN:-}", "--server", "${FXTUNNEL_SERVER:-tunnel.fxtun.ru:443}",
+              "--no-inspect", "--log-level", "info"]
     environment:
       FXTUNNEL_SERVER_TOKEN: ${FXTUNNEL_TOKEN:-}
     restart: unless-stopped

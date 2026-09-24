@@ -292,9 +292,9 @@ docker compose up -d --build --force-recreate
 ### 8Б. Вариант без открытых портов: туннель fxTunnel
 
 Туннель: сервер сам подключается к [fxTunnel](https://github.com/mephistofox/fxtun.dev) и получает адрес
-`https://имя.fxtun.dev`. Это российский сервис, бесплатный, открывается из России.
+`https://имя.fxtun.ru`. Это российский сервис, бесплатный, открывается из России.
 
-1. Зарегистрируйся на **https://fxtun.dev**. В личном кабинете, в разделе **«Токены»**, создай токен. Он начинается с `sk_`.
+1. Зарегистрируйся на **https://fxtun.ru**. В личном кабинете, в разделе **«Токены»**, создай токен. Он начинается с `sk_`.
 2. Придумай имя поддомена: 3–32 символа, латиница, цифры и дефис, например `bobik-music`.
 3. Если раньше настраивал DuckDNS (шаги 8.1–8.3), убери те настройки и останови Caddy:
    ```bash
@@ -310,7 +310,7 @@ docker compose up -d --build --force-recreate
    docker compose up -d --build --force-recreate
    ```
 
-✅ **Проверка:** `docker compose logs --tail 20 tunnel` показывает `Tunnel established!` и строку `HTTP: https://bobik-music.fxtun.dev`.
+✅ **Проверка:** `docker compose logs --tail 20 tunnel` показывает `Tunnel established!` и строку `HTTP: https://bobik-music.fxtun.ru`.
 Если адрес в этой строке другой, допиши его в `.env` как `WEBAPP_URL=https://…` и снова выполни `docker compose up -d --force-recreate`.
 
 Дальше, как в проверке 2 выше: закрой и открой чат с ботом, появится кнопка **«Медиатека»**.
@@ -407,7 +407,7 @@ curl -m 15 -sS -o /dev/null -w '%{http_code}\n' https://api.telegram.org
 | в логах `Conflict: terminated by other getUpdates request` | Этот же бот запущен где-то ещё (например, на твоём компьютере). Останови вторую копию |
 | бот пишет «Этот бот приватный» | Твоего ID нет в `ALLOWED_USERS`, или ты забыл `docker compose up -d --force-recreate` |
 | нет кнопки «Медиатека», а `/app` пишет «не настроено» | `WEBAPP_URL` не заполнен или не применён: шаг 8.2 и 8.3. Потом перезапусти Telegram |
-| в логах туннеля `all endpoints failed` или `unauthorized` | Проверь `FXTUNNEL_TOKEN` в `.env` (без пробелов и кавычек). Если токен верный, с сервера недоступен fxtun.dev |
+| в логах туннеля `all endpoints failed` или `unauthorized` | Проверь `FXTUNNEL_TOKEN` в `.env` (без пробелов и кавычек). Если токен верный, с сервера недоступен fxtun.ru |
 | `https://...duckdns.org` не открывается | Проверь IP на duckdns.org и открытые порты 80/443. Логи Caddy: `docker compose logs --tail 50 caddy` |
 | в «Медиатеке» «Нет доступа» | Твоего ID нет в `ALLOWED_USERS` |
 | в «Медиатеке» «Сессия устарела» | Закрой приложение и открой заново |
