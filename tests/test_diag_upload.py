@@ -24,16 +24,16 @@ def test_chunk_urls_from_runtime_decodes_all_name_forms():
 
 
 def test_find_api_paths_and_snippets():
-    js = ('x.get("/loader/upload-url",{params:{kind:e,filename:t}});'
+    js = ('x.get("loader/upload-url",{params:{kind:e,filename:t}});'
           'const u=`/ugc/tracks/${id}/state`;fetch("/playlists/list");'
-          'someOther.upload(avatar);')
-    assert find_api_paths(js) == {"/loader/upload-url", "/ugc/tracks/${id}/state"}
+          'someOther.upload(avatar);a.href="/icons/sprite.svg#upload_xxs";b="static/chunks/ugc.js"')
+    assert find_api_paths(js) == {"loader/upload-url", "/ugc/tracks/${id}/state"}
     found = find_snippets({BASE + "8290-x.js": js})
-    [ugc] = found["ugc"]
-    assert "[8290-x.js]" in ugc and "/loader/upload-url" in ugc
-    assert found["upload-url"] == [], "тот же участок кода второй раз не показываем"
+    [snippet] = found["upload-url"]
+    assert "[8290-x.js]" in snippet and "/ugc/tracks/" in snippet
+    assert found["ugc"] == [], "тот же участок кода второй раз не показываем"
 
-    far = js + " " * 1000 + 'post("/loader/upload-url2")'
+    far = js + " " * 1000 + 'class LoaderResource{getUploadUrl(e){return this.get("x")}}'
     found = find_snippets({BASE + "8290-x.js": far})
-    assert len(found["ugc"]) == 1 and len(found["upload-url"]) == 1
-    assert "upload-url2" in found["upload-url"][0]
+    assert len(found["upload-url"]) == 1 and len(found["getUploadUrl"]) == 1
+    assert "class LoaderResource" in found["getUploadUrl"][0]

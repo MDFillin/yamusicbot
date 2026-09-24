@@ -10,6 +10,7 @@ import random
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import aiohttp
 from yandex_music import Album, ClientAsync, DownloadInfo, Playlist, Search, Track
@@ -23,6 +24,47 @@ WEB_BASE_URL = "https://music.yandex.ru"
 
 
 START_RETRY_INTERVAL = 20  # сек: не долбить Яндекс повторными попытками на каждое сообщение
+API_BASE_URLS = ("https://api.music.yandex.net", "https://api.music.yandex.ru")
+# Заголовки, с которыми к этим хостам ходят приложение (.net) и новый сайт (.ru).
+API_HEADERS = {
+    "api.music.yandex.net": {"X-Yandex-Music-Client": "YandexMusicAndroid/24023621"},
+    "api.music.yandex.ru": {
+        "X-Yandex-Music-Client": "YandexMusicWebNext/1.0.0",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Yandex-Music-Without-Invocation-Info": "1",
+        "Origin": "https://music.yandex.ru",
+        "Referer": "https://music.yandex.ru/",
+        "Accept": "application/json",
+    },
+}
+TOO_MANY_FILES = "TOO_MANY_FILES"
+
+
+def _host(url: str) -> str:
+    return urlsplit(url).netloc
+
+
+def _parse_upload_target(body: str) -> dict | str | None:
+    """Ответ на запрос адреса загрузки: dict с post-target, TOO_MANY_FILES или None (не то)."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    result = payload.get("result")
+    if isinstance(result, dict):  # ответы API обёрнуты в {"invocationInfo": …, "result": …}
+        payload, result = result, result.get("result")
+    if isinstance(result, str) and result.upper().replace("-", "_") == TOO_MANY_FILES:
+        return TOO_MANY_FILES
+    return payload if payload.get("post-target") else None
+
+
+def _describe_body(body: str) -> str:
+    body = body.strip()
+    if body.startswith("<"):
+        return "(HTML-страница вместо ответа API)"
+    return body[:150]
 
 
 class UploadError(RuntimeError):
@@ -81,10 +123,18 @@ def tagged_filename(track: Track) -> str:
 
 
 class YandexMusic:
-    def __init__(self, token: str, *, max_bitrate: int = 320, web_base_url: str = WEB_BASE_URL) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        max_bitrate: int = 320,
+        web_base_url: str = WEB_BASE_URL,
+        api_base_urls: Sequence[str] = API_BASE_URLS,
+    ) -> None:
         self._token = token
         self._max_bitrate = max_bitrate
         self._web_base_url = web_base_url.rstrip("/")
+        self._api_base_urls = [u.rstrip("/") for u in api_base_urls]
         self._client: ClientAsync | None = None
         self._session: aiohttp.ClientSession | None = None
         self.uid: int | None = None
@@ -281,43 +331,65 @@ class YandexMusic:
 
     # ---------- загрузка своих треков ----------
 
-    async def upload_track(self, playlist_kind: int, filename: str, data: bytes) -> UploadResult:
-        """Загружает свой аудиофайл в плейлист (как кнопка «Загрузить трек» на music.yandex.ru).
+    async def _get_upload_target(self, playlist_kind: int, filename: str) -> dict:
+        """Одноразовый адрес для загрузки файла: {"post-target": …, "ugc-track-id": …}.
 
-        1. GET /handlers/ugc-upload.jsx — Яндекс выдаёт одноразовый адрес для загрузки (post-target);
-        2. POST файла на этот адрес в multipart-поле «file».
-        После этого Яндекс ещё пару минут обрабатывает файл, и трек появляется в плейлисте.
+        Новый сайт (music.yandex.ru v4) делает это так:
+            loaderResource.getUploadUrl({playlistId: `${uid}:${kind}`, uid, path: fileName})
+        — это запрос loader/upload-url к API. Пробуем его на обоих хостах API, а старый адрес
+        сайта (handlers/ugc-upload.jsx, до 2026 года) оставляем последним запасным вариантом.
         """
-        http = self._http()
-        params = {
+        if self.uid is None:
+            raise UploadError("Бот ещё не подключился к Яндекс Музыке")
+        playlist_id = f"{self.uid}:{playlist_kind}"
+        loader_params = {
+            "uid": str(self.uid),
+            "playlist-id": playlist_id,
+            "playlistId": playlist_id,  # имя параметра в коде сайта; сервер лишний проигнорирует
+            "path": filename,
+        }
+        candidates = [
+            (f"{base}/loader/upload-url", loader_params, API_HEADERS.get(_host(base), {}))
+            for base in self._api_base_urls
+        ]
+        candidates.append((f"{self._web_base_url}/handlers/ugc-upload.jsx", {
             "filename": filename,
             "kind": str(playlist_kind),
             "visibility": "private",
             "external-domain": "music.yandex.ru",
             "overembed": "false",
             "ncrnd": repr(random.random()),
-        }
-        try:
-            async with http.get(f"{self._web_base_url}/handlers/ugc-upload.jsx", params=params) as resp:
-                body = await resp.text()
-                status = resp.status
-        except aiohttp.ClientError as e:
-            raise UploadError(f"Сетевая ошибка при запросе адреса загрузки: {e}") from e
-        if body.lstrip().startswith("<"):
-            # Вместо JSON пришла страница сайта: старый адрес загрузки Яндекс убрал вместе со старым сайтом.
-            raise UploadError(
-                f"Яндекс изменил способ загрузки треков: старый адрес больше не работает (HTTP {status}). "
-                "Нужна новая версия бота — перешлите это сообщение разработчику."
-            )
-        if status != 200:
-            raise UploadError(f"Яндекс не выдал адрес для загрузки (HTTP {status}): {body[:300]}")
-        try:
-            payload = json.loads(body)
-        except ValueError as e:
-            raise UploadError(f"Неожиданный ответ Яндекса вместо адреса загрузки: {body[:300]}") from e
-        target = payload.get("post-target") if isinstance(payload, dict) else None
-        if not target:
-            raise UploadError(f"Яндекс не выдал адрес для загрузки: {body[:300]}")
+        }, {}))
+
+        attempts = []
+        for url, params, headers in candidates:
+            try:
+                async with self._http().get(url, params=params, headers=headers) as resp:
+                    body = await resp.text()
+                    status = resp.status
+            except aiohttp.ClientError as e:
+                attempts.append(f"{_host(url)}: сетевая ошибка {e}")
+                continue
+            payload = _parse_upload_target(body)
+            if payload == TOO_MANY_FILES:
+                raise UploadError("Яндекс не принимает больше файлов: достигнут лимит загруженных треков в аккаунте")
+            if payload is not None:
+                log.info("Адрес загрузки получен через %s", url)
+                return payload
+            attempts.append(f"{_host(url)}{urlsplit(url).path}: HTTP {status} {_describe_body(body)}")
+        raise UploadError("Яндекс не выдал адрес для загрузки. Ответы: " + "; ".join(attempts))
+
+
+    async def upload_track(self, playlist_kind: int, filename: str, data: bytes) -> UploadResult:
+        """Загружает свой аудиофайл в плейлист (как кнопка «Загрузить трек» на music.yandex.ru).
+
+        1. Яндекс выдаёт одноразовый адрес для загрузки (post-target) — см. _get_upload_target;
+        2. POST файла на этот адрес в multipart-поле «file».
+        После этого Яндекс ещё пару минут обрабатывает файл, и трек появляется в плейлисте.
+        """
+        http = self._http()
+        payload = await self._get_upload_target(playlist_kind, filename)
+        target = payload["post-target"]
 
         # quote_fields=False: имя файла уходит как в браузере (UTF-8), а не %D0%9A...
         form = aiohttp.FormData(quote_fields=False)

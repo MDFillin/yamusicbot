@@ -23,10 +23,18 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PAGES = ("https://music.yandex.ru/", "https://music.yandex.ru/collection")
 
 # Что ищем: пути API и куски кода рядом с этими словами. Порядок = приоритет в отчёте.
-KEYWORDS = ("ugc", "post-target", "postTarget", "upload-url", "uploadUrl", "loader/", "upload")
-PATH_RE = re.compile(r"""["'`](/[\w\-/.{}$:]*(?:ugc|upload|loader)[\w\-/.{}$:]*)["'`]""", re.I)
+KEYWORDS = (
+    "getUploadUrl", "LoaderResource", "UgcUploadHttpClient", "upload-url", "loader/",
+    "post-target", "postTarget", "uploadUrl", "ugc", "upload",
+)
+# Строки-пути вида "loader/upload-url" или `/ugc/${id}`: хотя бы один «/» и нужное слово внутри.
+PATH_RE = re.compile(r"""["'`](/?[\w\-.{}$:]+(?:/[\w\-.{}$:]+)+/?)["'`]""")
+PATH_WORDS = re.compile(r"ugc|upload|loader", re.I)
+PATH_NOISE = ("static/", "sprite.svg", "icons/")
 CONTEXT = 220
-MAX_SNIPPETS = {"ugc": 30, "upload": 12}
+MAX_SNIPPETS = {"ugc": 20, "upload": 6}
+# Для самых важных мест берём кусок побольше, чтобы попало определение запроса целиком.
+WIDE_CONTEXT = {"getUploadUrl": 700, "LoaderResource": 500, "UgcUploadHttpClient": 500}
 DEFAULT_MAX = 10
 
 
@@ -55,7 +63,10 @@ def chunk_urls_from_runtime(runtime_js: str, base: str) -> set[str]:
 
 
 def find_api_paths(js: str) -> set[str]:
-    return {m.group(1) for m in PATH_RE.finditer(js) if len(m.group(1)) < 120}
+    return {
+        path for m in PATH_RE.finditer(js)
+        if len(path := m.group(1)) < 120 and PATH_WORDS.search(path) and not any(n in path for n in PATH_NOISE)
+    }
 
 
 def find_snippets(sources: dict[str, str]) -> dict[str, list[str]]:
@@ -72,7 +83,8 @@ def find_snippets(sources: dict[str, str]) -> dict[str, list[str]]:
                     break
                 if any(a <= m.start() < b for a, b in windows):
                     continue
-                a, b = max(0, m.start() - CONTEXT), m.end() + CONTEXT
+                width = WIDE_CONTEXT.get(keyword, CONTEXT)
+                a, b = max(0, m.start() - width), m.end() + width
                 windows.append((a, b))
                 found[keyword].append(f"[{short}] …{js[a:b].replace(chr(10), ' ')}…")
     return found
@@ -100,13 +112,18 @@ def main() -> None:
             print(f"Не удалось разобрать {runtime}: {e}", file=sys.stderr)
     print(f"Версия сайта: {version.group(1) if version else '?'}; JS-файлов: {len(urls)}. Скачиваю…", file=sys.stderr)
 
-    def get(url: str) -> tuple[str, str | None]:
-        try:
-            return url, fetch(url)
-        except Exception:
-            return url, None
+    errors: dict[str, str] = {}
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    def get(url: str) -> tuple[str, str | None]:
+        for attempt in (1, 2):
+            try:
+                return url, fetch(url)
+            except Exception as e:
+                if attempt == 2:
+                    errors[url] = str(e)[:80]
+        return url, None
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
         sources = {u: js for u, js in pool.map(get, sorted(urls)) if js}
 
     paths = sorted(set().union(*(find_api_paths(js) for js in sources.values())))
@@ -115,6 +132,8 @@ def main() -> None:
     lines = [
         f"Версия сайта: {version.group(1) if version else '?'}",
         f"JS-файлов: скачано {len(sources)} из {len(urls)}",
+        "",
+        *(f"не скачался: {u.rsplit('/', 1)[-1]} — {err}" for u, err in list(errors.items())[:8]),
         "",
         "== Пути API со словами ugc/upload/loader ==",
         *(paths or ["(не найдено)"]),
