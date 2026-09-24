@@ -303,6 +303,12 @@ class YandexMusic:
                 status = resp.status
         except aiohttp.ClientError as e:
             raise UploadError(f"Сетевая ошибка при запросе адреса загрузки: {e}") from e
+        if body.lstrip().startswith("<"):
+            # Вместо JSON пришла страница сайта: старый адрес загрузки Яндекс убрал вместе со старым сайтом.
+            raise UploadError(
+                f"Яндекс изменил способ загрузки треков: старый адрес больше не работает (HTTP {status}). "
+                "Нужна новая версия бота — перешлите это сообщение разработчику."
+            )
         if status != 200:
             raise UploadError(f"Яндекс не выдал адрес для загрузки (HTTP {status}): {body[:300]}")
         try:

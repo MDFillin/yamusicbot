@@ -18,6 +18,8 @@ async def fake_yandex():
         received["query"] = dict(request.query)
         if request.query.get("kind") == "404":
             return web.Response(status=404, text="playlist not found")
+        if request.query.get("kind") == "html":
+            return web.Response(text="<!DOCTYPE html><html>new site</html>", content_type="text/html")
         target = str(request.url.with_path("/upload/abc").with_query({}))
         return web.Response(text=json.dumps({"post-target": target, "ugc-track-id": "ugc-123"}),
                             content_type="application/json")
@@ -68,5 +70,16 @@ async def test_upload_track_error(fake_yandex):
     try:
         with pytest.raises(UploadError, match="HTTP 404"):
             await ym.upload_track(404, "a.mp3", b"x")
+    finally:
+        await ym.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_track_old_endpoint_gone(fake_yandex):
+    base, _ = fake_yandex
+    ym = YandexMusic("t", web_base_url=base)
+    try:
+        with pytest.raises(UploadError, match="изменил способ загрузки"):
+            await ym.upload_track("html", "a.mp3", b"x")
     finally:
         await ym.close()
