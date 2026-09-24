@@ -494,6 +494,8 @@ async def upload_files(
                 known = await placer.before_upload(ym, kind)
                 result = await ym.upload_track(kind, name, data)
                 placed.append(placer.after_upload(ym, kind, known, result.ugc_track_id))
+                if result.note:
+                    notes.append(result.note)
                 ok.append(html.escape(name) + (f" <i>({html.escape('; '.join(notes))})</i>" if notes else ""))
             except (UploadError, ConversionError) as e:
                 failed.append(f"{html.escape(qf.file_name)} — {html.escape(str(e))}")

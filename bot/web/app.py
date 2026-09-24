@@ -570,6 +570,8 @@ async def api_upload(request: web.Request) -> web.Response:
     result = await ym.upload_track(kind, name, prepared)
     ctx.placer.after_upload(ym, kind, known, result.ugc_track_id)  # встанет в начало, когда Яндекс обработает
     ctx.invalidate(_user_id(request))
+    if result.note:
+        notes.append(result.note)
     return web.json_response({"name": name, "notes": notes, "ugc_track_id": result.ugc_track_id})
 
 

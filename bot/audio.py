@@ -56,9 +56,16 @@ def clean_year(value: str | None) -> str | None:
     return m.group()
 
 
-def safe_filename(name: str, default: str = "track") -> str:
+def safe_filename(name: str, default: str = "track", limit: int = 150) -> str:
+    """Имя файла без опасных символов; длинное обрезается, но расширение сохраняется."""
     name = _BAD_CHARS.sub("_", name).strip(" .")
-    return name[:150] or default
+    if len(name) > limit:
+        stem, dot, ext = name.rpartition(".")
+        if dot and stem and 1 <= len(ext) <= 5:
+            name = stem[:limit - len(ext) - 1].rstrip(" .") + "." + ext
+        else:
+            name = name[:limit].rstrip(" .")
+    return name or default
 
 
 def parse_caption(caption: str | None) -> tuple[str, str] | None:
@@ -114,6 +121,62 @@ def read_mp3_tags(data: bytes) -> tuple[str | None, str | None]:
     artist = str(tags["TPE1"].text[0]) if "TPE1" in tags and tags["TPE1"].text else None
     title = str(tags["TIT2"].text[0]) if "TIT2" in tags and tags["TIT2"].text else None
     return artist, title
+
+
+# Что на самом деле внутри аудиофайла (расширение бывает обманчивым: скачанное с YouTube часто
+# называется .mp3, а внутри M4A или WebM — такое Яндекс отвергает с UNSUPPORTED_MEDIA_TYPE).
+FORMAT_NAMES = {"mp4": "M4A/AAC", "webm": "WebM", "ogg": "OGG", "flac": "FLAC", "wav": "WAV", "aiff": "AIFF",
+                "wma": "WMA", "ape": "APE", "aac": "AAC"}
+_FORMAT_EXT = {"mp3": ".mp3", "mp4": ".m4a", "webm": ".webm", "ogg": ".ogg", "flac": ".flac", "wav": ".wav",
+               "aiff": ".aiff", "wma": ".wma", "ape": ".ape", "aac": ".aac"}
+
+
+def _mpeg_frame(b0: int, b1: int, b2: int) -> str | None:
+    """Заголовок кадра MPEG-аудио: "mp3" (слои II/III), "aac" (ADTS) или None."""
+    if b0 != 0xFF or (b1 & 0xE0) != 0xE0:
+        return None
+    layer = (b1 >> 1) & 3
+    if layer == 0:
+        return "aac" if (b1 & 0xF0) == 0xF0 else None
+    if (b1 >> 3) & 3 == 1 or layer == 3:  # зарезервированная версия; слой I как MP3 не годится
+        return None
+    if (b2 >> 4) in (0, 0xF) or (b2 >> 2) & 3 == 3:  # неверный битрейт или частота
+        return None
+    return "mp3"
+
+
+def audio_format(data: bytes | memoryview, _depth: int = 0) -> str | None:
+    """Формат аудио по содержимому: mp3, mp4, webm, ogg, flac, wav, aiff, wma, ape, aac или None."""
+    head = bytes(data[:12])
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[4:8] == b"ftyp":
+        return "mp4"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"\x1aE\xdf\xa3":
+        return "webm"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[:4] == b"FORM" and head[8:12] in (b"AIFF", b"AIFC"):
+        return "aiff"
+    if head[:4] == b"0&\xb2u":
+        return "wma"
+    if head[:4] == b"MAC ":
+        return "ape"
+    start = 0
+    if head[:3] == b"ID3" and len(data) >= 10:
+        size = (data[6] & 0x7F) << 21 | (data[7] & 0x7F) << 14 | (data[8] & 0x7F) << 7 | (data[9] & 0x7F)
+        start = 10 + size + (10 if data[5] & 0x10 else 0)
+        if _depth == 0 and (inner := audio_format(memoryview(data)[start:], 1)) not in (None, "mp3"):
+            return inner  # ID3 перед чужим контейнером (так делают некоторые программы и прежняя версия бота)
+        tag_end = start
+        while start < len(data) and start < tag_end + 65536 and data[start] == 0:
+            start += 1  # нули-«набивка» после тега
+    for i in range(start, min(len(data), start + 4096) - 2):
+        if data[i] == 0xFF and (kind := _mpeg_frame(data[i], data[i + 1], data[i + 2])):
+            return kind
+    return None
 
 
 def image_type(data: bytes) -> str | None:
@@ -287,6 +350,13 @@ async def convert_to_mp3(data: bytes, source_ext: str, bitrate: int = 320) -> by
     return await _ffmpeg(args, f"in{source_ext or '.bin'}", data, "out.mp3")
 
 
+async def reencode_mp3(data: bytes) -> bytes:
+    """Перекодирует файл в обычный MP3 320 kbps, сохраняя теги и обложку (когда Яндекс не принял файл как есть)."""
+    meta = read_tags(data)
+    converted = await convert_to_mp3(data, _FORMAT_EXT.get(audio_format(data) or "", ".mp3"))
+    return write_mp3_tags(converted, meta)
+
+
 def _pick(edited: str | None, from_file: str | None) -> str | None:
     """Правка пользователя важнее тега из файла; пустая строка — очистить поле."""
     if edited is None:
@@ -314,19 +384,34 @@ async def prepare_for_upload(
     ext = Path(name).suffix.lower()
     original = read_tags(data)
     converted = False
+    fmt = audio_format(data)
+    # Конвертируем всё, что внутри не MP3, даже если файл называется .mp3. Неопознанный .mp3 оставляем как есть:
+    # если Яндекс его не примет, upload_track перекодирует и попробует ещё раз.
+    needs_mp3 = fmt != "mp3" and (fmt is not None or ext != ".mp3")
 
-    if ext != ".mp3":
+    if needs_mp3:
         if ffmpeg_available():
-            data = await convert_to_mp3(data, ext)
-            name = f"{Path(name).stem}.mp3"
-            notes.append(f"сконвертирован из {ext or 'неизвестного формата'} в MP3")
+            data = await convert_to_mp3(data, _FORMAT_EXT.get(fmt or "", ext))
+            if ext == ".mp3":
+                notes.append(f"внутри файла не MP3, а {FORMAT_NAMES.get(fmt, fmt)} — сконвертирован в MP3")
+            else:
+                notes.append(f"сконвертирован из {ext or 'неизвестного формата'} в MP3")
             converted = True
         else:
             notes.append(f"{ext or 'файл'} загружен как есть (ffmpeg не установлен, Яндекс надёжнее принимает MP3)")
             if edit.changed:
                 notes.append("правки данных трека не применены — для этого нужен ffmpeg")
             return name, data, notes
+    if Path(name).suffix != ".mp3":  # в том числе «.MP3»: Яндекс ждёт MP3 с обычным расширением
+        name = f"{Path(name).stem}.mp3"
 
+    current = read_tags(data)  # после конвертации текстовые теги уже на месте, а обложки нет
+    if converted:  # что mutagen не прочитал в исходнике (например, WebM), мог перенести ffmpeg
+        original = TrackMeta(
+            title=original.title or current.title, artist=original.artist or current.artist,
+            album=original.album or current.album, year=original.year or current.year,
+            cover=original.cover or current.cover,
+        )
     final = TrackMeta(
         title=_pick(edit.title, original.title) or fallback_title,
         artist=_pick(edit.artist, original.artist) or fallback_artist,
@@ -334,7 +419,6 @@ async def prepare_for_upload(
         year=_pick(edit.year, original.year),
         cover=None if edit.remove_cover else (edit.cover or original.cover),
     )
-    current = read_tags(data)  # после конвертации текстовые теги уже на месте, а обложки нет
     if final != current:
         data = write_mp3_tags(data, final)
 

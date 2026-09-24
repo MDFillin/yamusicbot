@@ -12,7 +12,7 @@ from bot.ym import UploadError, YandexMusic
 @pytest.fixture
 async def fake_yandex():
     """Поддельный Яндекс: loader/upload-url (как у нового сайта) и приём файла по post-target."""
-    received = {"calls": []}
+    received = {"calls": [], "reject": 0, "uploads": []}
 
     async def loader(request: web.Request) -> web.Response:
         if request.method != "POST":
@@ -39,6 +39,10 @@ async def fake_yandex():
         received["filename"] = field.filename
         received["content_type"] = field.content_type
         received["data"] = field.file.read()
+        received["uploads"].append(received["data"])
+        if received["reject"] > 0:  # так Яндекс отвечает на файл, который не считает MP3
+            received["reject"] -= 1
+            return web.json_response({"result": "UNSUPPORTED_MEDIA_TYPE"}, status=415)
         return web.Response(text="CREATED")
 
     app = web.Application()
@@ -132,3 +136,45 @@ def test_parse_upload_target_and_describe_body():
     assert _parse_upload_target(json.dumps({"error": {"name": "not-found"}})) is None
     assert _parse_upload_target("<html>") is None
     assert _describe_body('{\n"message":"x",\n"status":"405"\n}') == '{ "message":"x", "status":"405" }'
+
+
+async def test_unsupported_media_is_reencoded_once(fake_yandex, monkeypatch):
+    import bot.ym as ym_module
+
+    async def fake_reencode(data):
+        return b"clean-mp3:" + data
+
+    monkeypatch.setattr(ym_module, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(ym_module, "reencode_mp3", fake_reencode)
+    base, received = fake_yandex
+    received["reject"] = 1
+    ym = make_ym([f"{base}/api"])
+    try:
+        result = await ym.upload_track(1003, "a.mp3", b"odd")
+    finally:
+        await ym.close()
+    assert received["uploads"] == [b"odd", b"clean-mp3:odd"], "второй раз — перекодированный файл"
+    assert received["calls"] == ["loader", "loader"], "на повтор — новый адрес загрузки"
+    assert "перекодирован в MP3" in result.note
+
+
+async def test_unsupported_media_is_explained(fake_yandex, monkeypatch):
+    import bot.ym as ym_module
+
+    base, received = fake_yandex
+    monkeypatch.setattr(ym_module, "ffmpeg_available", lambda: False)
+    received["reject"] = 5
+    ym = make_ym([f"{base}/api"])
+    try:
+        with pytest.raises(UploadError, match="нужен обычный MP3.*ffmpeg"):
+            await ym.upload_track(1003, "a.mp3", b"odd")
+
+        async def fake_reencode(data):
+            return data
+
+        monkeypatch.setattr(ym_module, "ffmpeg_available", lambda: True)
+        monkeypatch.setattr(ym_module, "reencode_mp3", fake_reencode)
+        with pytest.raises(UploadError, match="не помогла и перекодировка"):
+            await ym.upload_track(1003, "a.mp3", b"odd")
+    finally:
+        await ym.close()

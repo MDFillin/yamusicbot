@@ -15,7 +15,7 @@ import aiohttp
 from yandex_music import Album, ClientAsync, DownloadInfo, Playlist, Search, Track
 from yandex_music.exceptions import NetworkError, UnauthorizedError, YandexMusicError
 
-from bot.audio import safe_filename, tag_mp3
+from bot.audio import ConversionError, ffmpeg_available, reencode_mp3, safe_filename, tag_mp3
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +67,16 @@ class UploadError(RuntimeError):
     pass
 
 
+class UnsupportedMediaError(UploadError):
+    """Яндекс не принял формат файла (HTTP 415 UNSUPPORTED_MEDIA_TYPE)."""
+
+
+UNSUPPORTED_MEDIA = (
+    "Яндекс не принял формат файла — ему нужен обычный MP3. Похоже, внутри файла другой формат "
+    "(так бывает у скачанного с YouTube)"
+)
+
+
 class YandexNotReady(RuntimeError):
     """Подключиться к Яндекс Музыке не удалось; текст — объяснение для человека."""
 
@@ -91,6 +101,7 @@ class TrackUnavailableError(RuntimeError):
 class UploadResult:
     ugc_track_id: str | None
     server_reply: str
+    note: str | None = None  # что пришлось сделать с файлом, чтобы Яндекс его принял
 
 
 def track_artists(track: Track) -> str:
@@ -408,7 +419,27 @@ class YandexMusic:
         1. Яндекс выдаёт одноразовый адрес для загрузки (post-target) — см. _get_upload_target;
         2. POST файла на этот адрес в multipart-поле «file».
         После этого Яндекс ещё пару минут обрабатывает файл, и трек появляется в плейлисте.
+
+        Если Яндекс не принял файл как MP3 (HTTP 415), перекодируем его в обычный MP3 и пробуем ещё раз.
         """
+        try:
+            return await self._upload_once(playlist_kind, filename, data)
+        except UnsupportedMediaError as e:
+            if not ffmpeg_available():
+                raise UploadError(f"{UNSUPPORTED_MEDIA}. Установите ffmpeg — бот сам переведёт файл в MP3.") from e
+            log.warning("Яндекс не принял %s как MP3 — перекодирую и пробую ещё раз", filename)
+            try:
+                fixed = await reencode_mp3(data)
+            except ConversionError as conv:
+                raise UploadError(f"{UNSUPPORTED_MEDIA}, а перекодировать его не вышло: {conv}") from conv
+        try:
+            result = await self._upload_once(playlist_kind, filename, fixed)
+        except UnsupportedMediaError as e:
+            raise UploadError(f"{UNSUPPORTED_MEDIA}; не помогла и перекодировка в MP3.") from e
+        return UploadResult(result.ugc_track_id, result.server_reply,
+                            note="Яндекс не принял файл как есть — перекодирован в MP3 320 kbps")
+
+    async def _upload_once(self, playlist_kind: int, filename: str, data: bytes) -> UploadResult:
         http = self._http()
         payload = await self._get_upload_target(playlist_kind, filename)
         target = payload["post-target"]
@@ -425,6 +456,8 @@ class YandexMusic:
                 status = resp.status
         except aiohttp.ClientError as e:
             raise UploadError(f"Сетевая ошибка при отправке файла: {e}") from e
+        if status == 415 or "UNSUPPORTED_MEDIA_TYPE" in reply:
+            raise UnsupportedMediaError(reply[:300])
         if status >= 300:
             raise UploadError(f"Яндекс отклонил файл (HTTP {status}): {reply[:300]}")
         log.info("Загружен %s в плейлист %s: %s", filename, playlist_kind, reply[:100])

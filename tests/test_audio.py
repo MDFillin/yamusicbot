@@ -6,6 +6,7 @@ import pytest
 from bot.audio import (
     ConversionError,
     TrackMeta,
+    audio_format,
     clean_year,
     normalize_cover,
     parse_caption,
@@ -39,6 +40,32 @@ def test_parse_caption():
 def test_safe_filename():
     assert safe_filename('AC/DC: "Hells Bells"?.mp3') == "AC_DC_ _Hells Bells__.mp3"
     assert safe_filename("...") == "track"
+    long = safe_filename("Rusted Citadel musical theme " * 10 + ".mp3")
+    assert len(long) <= 150 and long.endswith(".mp3"), "длинное имя обрезается, расширение остаётся"
+
+
+@pytest.mark.parametrize(("data", "fmt"), [
+    (FAKE_MP3, "mp3"),
+    (tag_mp3(FAKE_MP3, title="T", cover=JPEG), "mp3"),
+    (b"\x00\x00\x00\x1cftypisom" + b"\x00" * 20, "mp4"),
+    (b"\x1aE\xdf\xa3" + b"\x00" * 20, "webm"),
+    (b"OggS" + b"\x00" * 20, "ogg"),
+    (b"fLaC" + b"\x00" * 20, "flac"),
+    (b"RIFF\x00\x00\x00\x00WAVEfmt ", "wav"),
+    (b"\xff\xf1\x50\x80" + b"\x00" * 20, "aac"),
+    (b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00\x00\x00\x1cftypM4A " + b"\x00" * 20, "mp4"),
+    (b"<html>not audio</html>", None),
+])
+def test_audio_format_by_content(data, fmt):
+    assert audio_format(data) == fmt
+
+
+@pytest.mark.asyncio
+async def test_mislabeled_file_without_ffmpeg_goes_as_is(monkeypatch):
+    monkeypatch.setattr("bot.audio.ffmpeg_available", lambda: False)
+    m4a = b"\x00\x00\x00\x1cftypisom" + b"\x00" * 200
+    name, data, notes = await prepare_for_upload("song.mp3", m4a)
+    assert data == m4a and "ffmpeg не установлен" in notes[0]
 
 
 def test_tag_roundtrip():
@@ -160,3 +187,18 @@ async def test_prepare_file_non_mp3_without_ffmpeg(monkeypatch):
     name, data, notes = await prepare_file(pf, b"fLaC-data")
     assert name == "song.flac" and data == b"fLaC-data"
     assert "ffmpeg не установлен" in notes[0]
+
+
+@needs_ffmpeg
+@pytest.mark.asyncio
+async def test_m4a_named_mp3_is_converted(tmp_path):
+    """Скачанное с YouTube: называется .mp3, внутри M4A с тегами — Яндекс такое отвергает (415)."""
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=duration=1",
+                    "-c:a", "aac", "-metadata", "title=Rusted Citadel", "-f", "mp4", "fake.mp3"],
+                   check=True, cwd=tmp_path)
+    source = (tmp_path / "fake.mp3").read_bytes()
+    assert audio_format(source) == "mp4"
+    name, data, notes = await prepare_for_upload("fake.mp3", source)
+    assert name == "fake.mp3" and audio_format(data) == "mp3"
+    assert read_tags(data).title == "Rusted Citadel"
+    assert notes == ["внутри файла не MP3, а M4A/AAC — сконвертирован в MP3"]
