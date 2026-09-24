@@ -44,6 +44,16 @@
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
     lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
     check: '<path d="M20 6 9 17l-5-5"/>',
+    gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+    eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+    eyeOff: '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="m1 1 22 22"/>',
+    copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+    palette: '<circle cx="13.5" cy="6.5" r="1.5"/><circle cx="17.5" cy="10.5" r="1.5"/><circle cx="8.5" cy="7.5" r="1.5"/><circle cx="6.5" cy="12.5" r="1.5"/><path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.3 0-1.1.9-2 2-2h2.4A5.6 5.6 0 0 0 22 10c0-4.4-4.5-8-10-8z"/>',
+    moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
+    vibrate: '<rect x="7" y="4" width="10" height="16" rx="2"/><path d="M3 9v6M21 9v6"/>',
+    sparkle: '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 17v4M17 19h4"/>',
+    headphones: '<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>',
+    droplet: '<path d="M12 2.7 6.3 8.4a8 8 0 1 0 11.4 0z"/>',
   };
 
   function icon(name, cls = '') {
@@ -129,11 +139,104 @@
     set(k, v) { try { localStorage.setItem(this.key(k), JSON.stringify(v)); } catch (_) { /* приватный режим */ } },
   };
 
+  // ---------- оформление и настройки устройства ----------
+  // Хранятся в localStorage и в облаке Telegram (CloudStorage) — так они одинаковые на телефоне и компьютере.
+  const PREFS_DEFAULT = { mode: 'telegram', palette: 'telegram', tint: false, haptics: true, motion: true };
+  const prefs = { ...PREFS_DEFAULT, ...local.get('prefs', {}) };
+
+  const MODES = [['telegram', 'Telegram'], ['light', 'Светлая'], ['dark', 'Тёмная'], ['amoled', 'Чёрная']];
+  const PALETTES = [
+    { id: 'telegram', name: 'Telegram' },
+    { id: 'blue', name: 'Синий', accent: '#2f7cf6' },
+    { id: 'indigo', name: 'Индиго', accent: '#5856d6' },
+    { id: 'violet', name: 'Фиолет', accent: '#8e44ef' },
+    { id: 'pink', name: 'Розовый', accent: '#ff2d78' },
+    { id: 'red', name: 'Красный', accent: '#f2344b' },
+    { id: 'orange', name: 'Оранжевый', accent: '#ff8a00' },
+    { id: 'amber', name: 'Янтарь', accent: '#f5b400', text: '#1c1c1e', link: '#d99a00' },
+    { id: 'green', name: 'Зелёный', accent: '#28b463' },
+    { id: 'teal', name: 'Бирюза', accent: '#12a89a' },
+    { id: 'cyan', name: 'Голубой', accent: '#0fb5d6' },
+    { id: 'graphite', name: 'Графит', accent: '#5b6472', link: '#7b8594' },
+    { id: 'mono', name: 'Монохром', accent: 'var(--text)', text: 'var(--bg)', swatch: 'linear-gradient(135deg, #111 50%, #f2f2f2 50%)' },
+    { id: 'sunset', name: 'Закат', grad: ['#ff9a3d', '#ff2d78'], accent: '#ff5a5f' },
+    { id: 'ocean', name: 'Океан', grad: ['#00c6ff', '#0062ff'], accent: '#1a8cff' },
+    { id: 'neon', name: 'Неон', grad: ['#ff3cac', '#784ba0', '#2b86c5'], accent: '#a150b8' },
+    { id: 'cosmos', name: 'Космос', grad: ['#4776e6', '#8e54e9'], accent: '#6a65e8' },
+    { id: 'candy', name: 'Конфета', grad: ['#f093fb', '#f5576c'], accent: '#f0628f' },
+    { id: 'fire', name: 'Пламя', grad: ['#f12711', '#f5af19'], accent: '#f35a14' },
+    { id: 'mint', name: 'Мята', grad: ['#11998e', '#38ef7d'], accent: '#16a889' },
+    { id: 'lavender', name: 'Лаванда', grad: ['#9d7fe0', '#e68fc7'], accent: '#a57fd9' },
+    { id: 'peach', name: 'Персик', grad: ['#ff9966', '#ff5e62'], accent: '#ff7462' },
+    { id: 'sky', name: 'Небо', grad: ['#56ccf2', '#2f80ed'], accent: '#3a93ee' },
+    { id: 'amethyst', name: 'Аметист', grad: ['#7f00ff', '#e100ff'], accent: '#a100ff' },
+    { id: 'gold', name: 'Золото', grad: ['#f7971e', '#ffd200'], accent: '#f29c1f', text: '#1c1c1e', link: '#e08a00' },
+    { id: 'forest', name: 'Лес', grad: ['#3b8d27', '#8cc63f'], accent: '#4f9e2f' },
+    { id: 'night', name: 'Ночь', grad: ['#232526', '#5b6470'], accent: '#4a5059', link: 'var(--text)' },
+  ];
+  const paletteFill = (p) => (p.swatch || (p.grad ? `linear-gradient(135deg, ${p.grad.join(', ')})` : p.accent)
+    || 'var(--tg-theme-button-color, #3478f6)');
+
+  const cloud = {
+    ok: () => supports('6.9') && !!tg.CloudStorage,
+    get(key) {
+      return new Promise((resolve) => {
+        if (!this.ok()) { resolve(null); return; }
+        try { tg.CloudStorage.getItem(key, (err, value) => resolve(err ? null : value || null)); } catch (_) { resolve(null); }
+      });
+    },
+    set(key, value) { if (this.ok()) { try { tg.CloudStorage.setItem(key, value); } catch (_) { /* не критично */ } } },
+  };
+
+  function toHex(color) {
+    const m = color.match(/\d+(\.\d+)?/g);
+    return m && m.length >= 3 ? `#${m.slice(0, 3).map((x) => Math.round(+x).toString(16).padStart(2, '0')).join('')}` : null;
+  }
+
+  function applyPrefs() {
+    const root = document.documentElement;
+    root.dataset.mode = prefs.mode;
+    root.classList.toggle('tint', !!prefs.tint);
+    root.classList.toggle('no-motion', !prefs.motion);
+    for (const k of ['--accent', '--accent-text', '--link', '--accent-grad']) root.style.removeProperty(k);
+    const p = PALETTES.find((x) => x.id === prefs.palette);
+    if (p && p.accent) {
+      root.style.setProperty('--accent', p.accent);
+      root.style.setProperty('--accent-text', p.text || '#fff');
+      root.style.setProperty('--link', p.link || p.accent);
+      if (p.grad) root.style.setProperty('--accent-grad', `linear-gradient(135deg, ${p.grad.join(', ')})`);
+    }
+    if (!tg || !supports('6.1')) return;
+    try { // шапка и фон самого Telegram — в цвет выбранной темы
+      const bg = prefs.mode === 'telegram' ? 'secondary_bg_color' : toHex(getComputedStyle(document.body).backgroundColor);
+      if (bg && (bg === 'secondary_bg_color' || supports('6.9'))) { tg.setHeaderColor(bg); tg.setBackgroundColor(bg); }
+      if (bg && supports('7.10') && tg.setBottomBarColor) tg.setBottomBarColor(bg);
+    } catch (_) { /* старый клиент Telegram */ }
+  }
+
+  function savePrefs(patch) {
+    Object.assign(prefs, patch);
+    local.set('prefs', prefs);
+    cloud.set('prefs', JSON.stringify(prefs));
+    applyPrefs();
+  }
+
+  async function loadCloudPrefs() {
+    try {
+      const saved = JSON.parse((await cloud.get('prefs')) || 'null');
+      if (saved && JSON.stringify({ ...prefs, ...saved }) !== JSON.stringify(prefs)) {
+        Object.assign(prefs, saved);
+        local.set('prefs', prefs);
+        applyPrefs();
+      }
+    } catch (_) { /* нет облака — живём с локальными */ }
+  }
+
   // ---------- связь с Telegram ----------
   const haptic = {
-    tap: () => { try { tg.HapticFeedback.impactOccurred('light'); } catch (_) { /* нет в браузере */ } },
-    ok: () => { try { tg.HapticFeedback.notificationOccurred('success'); } catch (_) { /* нет в браузере */ } },
-    err: () => { try { tg.HapticFeedback.notificationOccurred('error'); } catch (_) { /* нет в браузере */ } },
+    tap: () => { if (prefs.haptics) try { tg.HapticFeedback.impactOccurred('light'); } catch (_) { /* нет в браузере */ } },
+    ok: () => { if (prefs.haptics) try { tg.HapticFeedback.notificationOccurred('success'); } catch (_) { /* нет в браузере */ } },
+    err: () => { if (prefs.haptics) try { tg.HapticFeedback.notificationOccurred('error'); } catch (_) { /* нет в браузере */ } },
   };
 
   function confirmAsk(text) {
@@ -368,20 +471,127 @@
       name.trim().charAt(0).toUpperCase());
   }
 
-  function openAccount() {
+  function openSettings() {
     if (!state.me || !state.me.connected) return;
+    if (state.tab !== 'library') setTab('library');
+    if (top() && top().kind === 'settings') return;
+    push(settingsView);
+  }
+
+  const group = (title, ...children) => h('section', { class: 'set-group' }, title ? h('h3', {}, title) : null, ...children);
+
+  function toggleRow(ic, title, sub, value, onChange) {
+    const input = h('input', { type: 'checkbox', checked: value });
+    input.addEventListener('change', () => { onChange(input.checked); haptic.tap(); });
+    return h('label', { class: 'row set-row' }, h('span', { class: 'set-icon' }, icon(ic, 'sm')),
+      h('div', { class: 'meta' }, h('div', { class: 'title' }, title), sub ? h('div', { class: 'sub' }, sub) : null),
+      h('span', { class: 'switch' }, input, h('span')));
+  }
+
+  function segmented(options, value, onPick) {
+    const box = h('div', { class: 'seg-full' });
+    const draw = (current) => put(box, options.map(([v, label, sub]) => h('button', {
+      class: v === current ? 'on' : '',
+      onclick: async () => { if (v === current) return; haptic.tap(); draw(v); if ((await onPick(v)) === false) draw(current); },
+    }, h('b', {}, label), sub ? h('span', {}, sub) : null)));
+    draw(value);
+    return box;
+  }
+
+  function settingsView(root, alive, entry) {
+    entry.kind = 'settings';
+    const me = state.me;
     const name = tgUser ? [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') : 'Вы';
-    openSheet([
-      h('div', { class: 'account-card' }, avatarEl('lg'),
-        h('div', { class: 'meta' }, h('div', { class: 'title' }, name),
-          h('div', { class: 'sub' }, `Яндекс: ${state.me.login || '—'}`)),
-        state.me.has_plus ? h('span', { class: 'badge plus' }, 'Плюс') : h('span', { class: 'badge' }, 'без Плюса')),
+
+    // Аккаунт
+    const account = group('Аккаунт',
+      h('div', { class: 'card' },
+        h('div', { class: 'account-card' }, avatarEl('lg'),
+          h('div', { class: 'meta' }, h('div', { class: 'title' }, name), h('div', { class: 'sub' }, `Яндекс: ${me.login || '—'}`)),
+          me.has_plus ? h('span', { class: 'badge plus' }, 'Плюс') : h('span', { class: 'badge' }, 'без Плюса')),
+        h('div', { class: 'list' },
+          h('button', { class: 'row set-row', onclick: () => showLogin(true) }, h('span', { class: 'set-icon' }, icon('refresh', 'sm')),
+            h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Сменить аккаунт Яндекса')), icon('chevron', 'sm')),
+          h('button', { class: 'row set-row danger', onclick: logout }, h('span', { class: 'set-icon' }, icon('logout', 'sm')),
+            h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Отключить аккаунт'))))));
+
+    // Токен
+    let token = null;
+    let shown = false;
+    const tokenText = h('code', { class: 'token masked' }, '•'.repeat(24));
+    const eyeBtn = h('button', { class: 'btn secondary sm' });
+    const drawEye = () => put(eyeBtn, icon(shown ? 'eyeOff' : 'eye', 'sm'), shown ? 'Скрыть' : 'Показать');
+    const getToken = async () => token || (token = (await api('/api/token')).token);
+    eyeBtn.addEventListener('click', async () => {
+      if (!shown && !(await confirmAsk('Токен даёт полный доступ к вашей Яндекс Музыке. Показать его на экране?'))) return;
+      try {
+        const t = await getToken();
+        shown = !shown;
+        tokenText.textContent = shown ? t : '•'.repeat(24);
+        tokenText.classList.toggle('masked', !shown);
+        drawEye();
+      } catch (e) { fail(e); }
+    });
+    drawEye();
+    const tokenBox = group('Токен Яндекс Музыки',
+      h('div', { class: 'card token-card' }, tokenText,
+        h('div', { class: 'token-actions' }, eyeBtn,
+          h('button', { class: 'btn secondary sm', onclick: async () => { try { await copyText(await getToken()); } catch (e) { fail(e); } } },
+            icon('copy', 'sm'), 'Скопировать'))),
+      h('div', { class: 'set-note' }, '⚠️ С этим токеном можно управлять вашей Яндекс Музыкой. Никому его не отправляйте — '
+        + 'даже тем, кто представляется поддержкой. Отозвать токен можно, выйдя на всех устройствах в Яндекс ID.'));
+
+    // Оформление
+    const swatches = h('div', { class: 'swatches' });
+    const grads = h('div', { class: 'swatches' });
+    const drawSwatches = () => {
+      const make = (p) => h('button', { class: `swatch${prefs.palette === p.id ? ' on' : ''}`, 'aria-label': p.name,
+        onclick: () => { savePrefs({ palette: p.id }); haptic.tap(); drawSwatches(); } },
+      h('span', { class: 'dot', style: `background:${paletteFill(p)}` }, prefs.palette === p.id ? icon('check', 'sm') : null),
+      h('span', { class: 'name' }, p.name));
+      put(swatches, PALETTES.filter((p) => !p.grad).map(make));
+      put(grads, PALETTES.filter((p) => p.grad).map(make));
+    };
+    drawSwatches();
+    const look = group('Оформление',
+      h('div', { class: 'card set-card' },
+        h('div', { class: 'set-label' }, icon('moon', 'sm'), 'Тема'),
+        segmented(MODES.map(([v, label]) => [v, label]), prefs.mode, (v) => { savePrefs({ mode: v }); }),
+        h('div', { class: 'set-label' }, icon('droplet', 'sm'), 'Однотонные'), swatches,
+        h('div', { class: 'set-label' }, icon('palette', 'sm'), 'Градиенты'), grads),
+      h('div', { class: 'card list', style: 'margin-top:10px' },
+        toggleRow('sparkle', 'Цветной фон', 'Мягкая подсветка в цвет палитры', prefs.tint, (v) => savePrefs({ tint: v }))));
+
+    // Качество
+    const qualities = (me.settings && me.settings.qualities) || [{ kbps: 320, label: 'лучшее' }];
+    const qualityOptions = qualities.map((q) => [q.kbps, `${q.kbps}`, q.label]);
+    const setQuality = (key) => async (v) => {
+      try {
+        me.settings = await api('/api/settings', { method: 'PUT', body: { [key]: v } });
+        toast(`Качество: ${v} kbps`);
+        return true;
+      } catch (e) { fail(e); return false; }
+    };
+    const quality = group('Качество',
+      h('div', { class: 'card set-card' },
+        h('div', { class: 'set-label' }, icon('download', 'sm'), 'Скачивание и отправка в чат'),
+        segmented(qualityOptions, me.settings ? me.settings.download_quality : 320, setQuality('download_quality')),
+        h('div', { class: 'set-label' }, icon('headphones', 'sm'), 'Прослушивание в плеере'),
+        segmented(qualityOptions, me.settings ? me.settings.stream_quality : 320, setQuality('stream_quality'))),
+      h('div', { class: 'set-note' }, 'kbps — чем больше, тем лучше звук и тяжелее файл. 320 доступно с Яндекс Плюсом; '
+        + 'меньшее качество экономит мобильный интернет.'));
+
+    // Прочее
+    const misc = group('Приложение',
       h('div', { class: 'card list' },
-        menuRow('refresh', 'Сменить аккаунт Яндекса', () => showLogin(true)),
-        menuRow('logout', 'Отключить аккаунт', logout, 'danger')),
-      h('div', { class: 'sheet-note' },
-        'Бот хранит только ваш вход в Яндекс Музыку. Отключите аккаунт — и бот его забудет; музыка и плейлисты в Яндексе останутся.'),
-    ]);
+        toggleRow('vibrate', 'Вибрация', 'Лёгкий отклик на нажатия', prefs.haptics, (v) => savePrefs({ haptics: v })),
+        toggleRow('sparkle', 'Анимации', 'Плавные переходы и эффекты', prefs.motion, (v) => savePrefs({ motion: v })),
+        h('button', { class: 'row set-row', onclick: () => { local.set('recent', []); haptic.ok(); toast('История поиска очищена'); } },
+          h('span', { class: 'set-icon' }, icon('clock', 'sm')), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Очистить историю поиска')))));
+
+    root.append(
+      h('div', { class: 'lib-head' }, h('div', {}, h('div', { class: 'hello' }, 'Медиатека'), h('h1', { class: 'page-title' }, 'Настройки'))),
+      account, tokenBox, look, quality, misc);
   }
 
   async function logout() {
@@ -549,8 +759,8 @@
   // ---------- экран: медиатека ----------
   function libraryView(root, alive, entry) {
     const name = tgUser && tgUser.first_name;
-    const avatar = h('button', { class: 'avatar-btn', 'aria-label': 'Аккаунт', onclick: openAccount }, avatarEl());
-    const chip = h('button', { class: 'chip', onclick: openAccount }, icon('user', 'sm'), state.me.login || 'Аккаунт Яндекса',
+    const gear = h('button', { class: 'gear-btn', 'aria-label': 'Настройки', onclick: () => { haptic.tap(); openSettings(); } }, icon('gear'));
+    const chip = h('button', { class: 'chip', onclick: openSettings }, icon('user', 'sm'), state.me.login || 'Аккаунт Яндекса',
       state.me.has_plus ? h('span', { class: 'badge plus' }, 'Плюс') : h('span', { class: 'badge' }, 'без Плюса'));
     const likesSub = h('div', { class: 's' }, '…');
     const likes = h('div', { class: 'likes-tile', role: 'button', onclick: () => push(sourceView('likes', '')) },
@@ -563,7 +773,7 @@
     root.append(
       h('div', { class: 'lib-head' },
         h('div', {}, h('div', { class: 'hello' }, name ? `Привет, ${name} 👋` : 'Привет 👋'), h('h1', { class: 'page-title' }, 'Медиатека')),
-        avatar),
+        gear),
       chip, likes,
       h('div', { class: 'section-head' }, h('h2', {}, 'Мои плейлисты'),
         h('button', { class: 'link-btn', onclick: () => createPlaylistSheet() }, icon('plus', 'sm'), 'Создать')),
@@ -1569,6 +1779,7 @@
 
   function boot() {
     extendTunnelConsent();
+    applyPrefs();
     const labels = { library: ['library', 'Медиатека'], search: ['search', 'Поиск'], upload: ['upload', 'Загрузка'] };
     document.querySelectorAll('#tabs button').forEach((b) => {
       const [ic, label] = labels[b.dataset.tab];
@@ -1581,11 +1792,13 @@
       tg.expand();
       if (initData) document.documentElement.classList.add('tg');
       try {
-        if (supports('6.1')) { tg.setHeaderColor('secondary_bg_color'); tg.setBackgroundColor('secondary_bg_color'); }
         if (supports('7.7')) tg.disableVerticalSwipes();
         if (supports('6.1')) tg.BackButton.onClick(onBack);
-        if (supports('7.0')) { tg.SettingsButton.onClick(openAccount); tg.SettingsButton.show(); }
+        if (supports('7.0')) { tg.SettingsButton.onClick(openSettings); tg.SettingsButton.show(); }
       } catch (_) { /* старый клиент Telegram */ }
+      applyPrefs();
+      loadCloudPrefs();
+      if (tg.onEvent) tg.onEvent('themeChanged', applyPrefs);
     }
 
     if (!initData) {

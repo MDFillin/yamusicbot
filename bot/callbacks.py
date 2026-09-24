@@ -53,6 +53,13 @@ class NoopCb(CallbackData, prefix="n"):
     pass
 
 
+class SettingsCb(CallbackData, prefix="cfg"):
+    """Настройки в чате: kind — download (качество скачивания), value — kbps."""
+
+    kind: str
+    value: int
+
+
 class MenuCb(CallbackData, prefix="m"):
     """Меню и аккаунт.
 

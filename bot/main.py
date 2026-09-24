@@ -38,6 +38,7 @@ COMMANDS = [
     BotCommand(command="target", description="📌 Плейлист по умолчанию для загрузки"),
     BotCommand(command="newplaylist", description="➕ Создать плейлист"),
     BotCommand(command="menu", description="🏠 Главное меню"),
+    BotCommand(command="settings", description="⚙️ Настройки: качество, аккаунт"),
     BotCommand(command="login", description="🔑 Подключить Яндекс Музыку"),
     BotCommand(command="logout", description="🚪 Отключить аккаунт"),
     BotCommand(command="help", description="❓ Справка"),

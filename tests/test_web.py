@@ -125,12 +125,13 @@ class FakeYM:
     async def remove_from_playlist(self, kind, index, track_id):
         self.calls.append(("remove", kind, index, track_id))
 
-    async def direct_link(self, track):
-        self.calls.append(("direct_link", str(track.id)))
+    async def direct_link(self, track, max_bitrate=None):
+        self.calls.append(("direct_link", str(track.id), max_bitrate))
         return self.upstream_url
 
-    async def download_tagged(self, track):
-        return tag_mp3(FAKE_MP3, artist="Кино", title=track.title), 320
+    async def download_tagged(self, track, max_bitrate=None):
+        self.calls.append(("download", str(track.id), max_bitrate))
+        return tag_mp3(FAKE_MP3, artist="Кино", title=track.title), max_bitrate or 320
 
     async def upload_track(self, kind, filename, data):
         self.calls.append(("upload", kind, filename, data))
@@ -386,7 +387,7 @@ async def test_stream_proxies_audio_with_range(env):
 
     r = await env.client.get(t["stream"], headers={"X-Telegram-Init-Data": ""})
     assert r.status == 200 and await r.read() == FAKE_MP3
-    assert ("direct_link", "1") in env.ym.calls and not any(c[0] == "direct_link" for c in env.friend.calls)
+    assert ("direct_link", "1", 320) in env.ym.calls and not any(c[0] == "direct_link" for c in env.friend.calls)
 
 
 async def test_media_links_are_signed_per_user(env):
@@ -519,3 +520,36 @@ async def test_revoked_login_resets_client(env):
     r = await env.client.get("/api/library")
     assert r.status == 503 and (await r.json())["code"] == "yandex_unavailable"
     assert OWNER_ID not in env.accounts._clients
+
+
+# ---------- настройки ----------
+
+async def test_settings_defaults_and_update(env):
+    c = env.client
+    me = await (await c.get("/api/me")).json()
+    assert me["settings"]["download_quality"] == 320 and me["settings"]["stream_quality"] == 320
+    assert [q["kbps"] for q in me["settings"]["qualities"]] == [320, 192, 128, 64]
+
+    r = await c.put("/api/settings", json={"download_quality": 128, "stream_quality": 64})
+    assert (await r.json())["download_quality"] == 128 and env.store.get_setting(OWNER_ID, "stream_quality") == "64"
+    assert (await c.put("/api/settings", json={"download_quality": 100})).status == 400
+    assert (await c.put("/api/settings", json={"stream_quality": "много"})).status == 400
+    friend = await (await c.get("/api/settings", headers=as_user(FRIEND_ID))).json()
+    assert friend["download_quality"] == 320, "у каждого свои настройки"
+
+
+async def test_quality_applies_to_player_and_downloads(env):
+    await env.client.put("/api/settings", json={"download_quality": 192, "stream_quality": 128})
+    t = await _track_links(env)
+    assert (await env.client.get(t["stream"])).status == 200
+    assert (await env.client.get(t["download"])).status == 200
+    assert ("direct_link", "1", 128) in env.ym.calls and ("download", "1", 192) in env.ym.calls
+
+
+async def test_token_is_shown_only_to_its_owner(env):
+    r = await env.client.get("/api/token")
+    assert (await r.json()) == {"token": "tok-owner"} and r.headers["Cache-Control"] == "no-store"
+    assert (await (await env.client.get("/api/token", headers=as_user(FRIEND_ID))).json())["token"] == "tok-friend"
+    r = await env.client.get("/api/token", headers=as_user(NEWBIE_ID))
+    assert r.status == 401 and (await r.json())["code"] == "login_required"
+    assert (await env.client.get("/api/token", headers={"X-Telegram-Init-Data": ""})).status == 401

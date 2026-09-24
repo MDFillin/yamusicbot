@@ -35,6 +35,7 @@ from bot.config import Config
 from bot.handlers.download import start_bulk_download
 from bot.placer import TopPlacer
 from bot.sender import TrackSender, TrackTooLargeError
+from bot.settings import QUALITY_LABELS, available_qualities, get_quality, set_quality
 from bot.sources import SourceNotFoundError, TrackSource, load_source, playlist_cover, playlist_ref, resolve
 from bot.storage import Storage
 from bot.web.auth import AuthError, MediaSigner, user_from_init_data
@@ -122,11 +123,12 @@ class WebContext:
         self.sources.drop(lambda key: key[0] == user_id)
 
     async def direct_link(self, user_id: int, ym: YandexMusic, track_id: str, fresh: bool = False) -> str:
-        key = (user_id, track_id)  # ссылка зависит от подписки аккаунта — не делимся ей между людьми
+        quality = get_quality(self.store, self.config, user_id, "stream")
+        key = (user_id, track_id, quality)  # ссылка зависит от подписки аккаунта — не делимся ей между людьми
         cached = None if fresh else self.links.get(key)
         if cached is not None:
             return cached
-        url = await ym.direct_link(await get_track(ym, track_id))
+        url = await ym.direct_link(await get_track(ym, track_id), quality)
         self.links.set(key, url)
         return url
 
@@ -322,8 +324,46 @@ async def api_me(request: web.Request) -> web.Response:
     ym = await ctx.accounts.get(user_id)  # не подключиться — 503 с объяснением
     if ym is not None:
         info.update(connected=True, login=ym.login, has_plus=ym.has_plus,
-                    upload_target=ctx.store.get_upload_target(user_id))
+                    upload_target=ctx.store.get_upload_target(user_id), settings=settings_json(ctx, user_id))
     return web.json_response(info)
+
+
+def settings_json(ctx: WebContext, user_id: int) -> dict[str, Any]:
+    return {
+        "download_quality": get_quality(ctx.store, ctx.config, user_id, "download"),
+        "stream_quality": get_quality(ctx.store, ctx.config, user_id, "stream"),
+        "qualities": [{"kbps": q, "label": QUALITY_LABELS[q]} for q in available_qualities(ctx.config)],
+    }
+
+
+@routes.get("/api/settings")
+async def api_settings(request: web.Request) -> web.Response:
+    return web.json_response(settings_json(_ctx(request), _user_id(request)))
+
+
+@routes.put("/api/settings")
+async def api_update_settings(request: web.Request) -> web.Response:
+    ctx = _ctx(request)
+    user_id = _user_id(request)
+    body = await _json_body(request)
+    for kind in ("download", "stream"):
+        value = body.get(f"{kind}_quality")
+        if value is not None:
+            try:
+                set_quality(ctx.store, ctx.config, user_id, kind, int(value))
+            except (TypeError, ValueError) as e:
+                raise web.HTTPBadRequest(text=str(e)) from e
+    ctx.links.drop(lambda key: key[0] == user_id)  # плеер возьмёт ссылки в новом качестве
+    return web.json_response(settings_json(ctx, user_id))
+
+
+@routes.get("/api/token")
+async def api_token(request: web.Request) -> web.Response:
+    """Свой OAuth-токен Яндекс Музыки — только его владельцу (подпись Telegram проверена), без кэширования."""
+    account = _ctx(request).store.get_account(_user_id(request))
+    if account is None:
+        raise AuthError(401, "Сначала подключите Яндекс Музыку", code="login_required")
+    return web.json_response({"token": account[0]}, headers={"Cache-Control": "no-store"})
 
 
 @routes.post("/api/login")
@@ -630,9 +670,10 @@ async def media_stream(request: web.Request) -> web.StreamResponse:
 
 @routes.get(r"/media/download/{track_id:[\w.\-]+}")
 async def media_download(request: web.Request) -> web.Response:
-    _, ym, track_id = await _media_account(request, "download")
+    ctx = _ctx(request)
+    user_id, ym, track_id = await _media_account(request, "download")
     track = await get_track(ym, track_id)
-    data, _ = await ym.download_tagged(track)
+    data, _ = await ym.download_tagged(track, get_quality(ctx.store, ctx.config, user_id, "download"))
     name = tagged_filename(track)
     return web.Response(body=data, content_type="audio/mpeg", headers={
         "Content-Disposition": f"attachment; filename=\"track.mp3\"; filename*=UTF-8''{quote(name)}",

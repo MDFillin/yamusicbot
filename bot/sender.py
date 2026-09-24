@@ -15,6 +15,7 @@ from yandex_music import Track
 
 from bot.config import Config
 from bot.keyboards import track_actions
+from bot.settings import get_quality
 from bot.storage import Storage
 from bot.ym import YandexMusic, tagged_filename, track_album, track_artists, track_title
 
@@ -52,15 +53,19 @@ class TrackSender:
         self._store = store
         self._config = config
 
-    async def send(self, chat_id: int, track: Track, ym: YandexMusic) -> Message:
-        """Отправляет трек из аккаунта ym; повторно тот же трек уходит по file_id без скачивания."""
+    async def send(self, chat_id: int, track: Track, ym: YandexMusic, user_id: int | None = None) -> Message:
+        """Отправляет трек из аккаунта ym; повторно тот же трек уходит по file_id без скачивания.
+
+        Качество — из настроек пользователя (в личном чате с ботом его ID совпадает с chat_id).
+        """
         track_id = str(track.id)
         markup = track_actions(track_id)
         caption = track_caption(track)
-        # Кэш — на аккаунт Яндекса: без Плюса Яндекс отдаёт другой файл (отрывок).
+        quality = get_quality(self._store, self._config, user_id or chat_id, "download")
+        # Кэш — на аккаунт Яндекса и качество: без Плюса Яндекс отдаёт другой файл (отрывок).
         account = ym.uid or 0
 
-        cached = self._store.get_file_id(account, track_id, self._config.max_bitrate)
+        cached = self._store.get_file_id(account, track_id, quality)
         if cached:
             try:
                 return await retry_telegram(
@@ -69,7 +74,9 @@ class TrackSender:
             except TelegramBadRequest:
                 log.info("file_id для %s устарел, скачиваю заново", track_id)
 
-        (data, bitrate), thumb = await asyncio.gather(ym.download_tagged(track), ym.download_cover(track, "200x200"))
+        (data, bitrate), thumb = await asyncio.gather(
+            ym.download_tagged(track, quality), ym.download_cover(track, "200x200"),
+        )
         if len(data) > self._config.max_tg_upload:
             raise TrackTooLargeError(
                 f"Файл {len(data) // (1024 * 1024)} МБ — больше лимита Telegram для ботов "
@@ -90,6 +97,6 @@ class TrackSender:
             )
         )
         if msg.audio:
-            self._store.set_file_id(account, track_id, self._config.max_bitrate, msg.audio.file_id)
+            self._store.set_file_id(account, track_id, quality, msg.audio.file_id)
         log.info("Отправлен трек %s (%s kbps)", track_id, bitrate)
         return msg

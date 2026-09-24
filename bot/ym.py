@@ -325,32 +325,35 @@ class YandexMusic:
 
     # ---------- скачивание ----------
 
-    async def _best_download_info(self, track: Track) -> DownloadInfo:
-        """Лучший MP3 (но не выше MAX_BITRATE) с уже полученной прямой ссылкой."""
+    async def _best_download_info(self, track: Track, max_bitrate: int | None = None) -> DownloadInfo:
+        """Лучший MP3 не выше max_bitrate (по умолчанию MAX_BITRATE) с уже полученной прямой ссылкой."""
+        limit = min(max_bitrate or self._max_bitrate, self._max_bitrate)
         if track.available is False:
             raise TrackUnavailableError("Трек недоступен для прослушивания")
         infos = await track.get_download_info_async()
         mp3 = [i for i in infos if i.codec == "mp3" and not i.preview] or [i for i in infos if i.codec == "mp3"]
         if not mp3:
             raise TrackUnavailableError("Для трека нет MP3 для скачивания")
-        allowed = [i for i in mp3 if i.bitrate_in_kbps <= self._max_bitrate]
+        allowed = [i for i in mp3 if i.bitrate_in_kbps <= limit]
         best = max(allowed, key=lambda i: i.bitrate_in_kbps) if allowed else min(mp3, key=lambda i: i.bitrate_in_kbps)
         # Прямую ссылку берём только для выбранного варианта, а не для всех сразу.
         await best.get_direct_link_async()
         return best
 
-    async def direct_link(self, track: Track) -> str:
+    async def direct_link(self, track: Track, max_bitrate: int | None = None) -> str:
         """Временная прямая ссылка на MP3 (для плеера в мини-приложении)."""
-        return (await self._best_download_info(track)).direct_link
+        return (await self._best_download_info(track, max_bitrate)).direct_link
 
-    async def download(self, track: Track) -> tuple[bytes, int]:
-        """Скачивает MP3 в лучшем доступном качестве (но не выше MAX_BITRATE)."""
-        best = await self._best_download_info(track)
+    async def download(self, track: Track, max_bitrate: int | None = None) -> tuple[bytes, int]:
+        """Скачивает MP3 в лучшем доступном качестве, но не выше max_bitrate."""
+        best = await self._best_download_info(track, max_bitrate)
         return await best.download_bytes_async(), best.bitrate_in_kbps
 
-    async def download_tagged(self, track: Track) -> tuple[bytes, int]:
+    async def download_tagged(self, track: Track, max_bitrate: int | None = None) -> tuple[bytes, int]:
         """MP3 с тегами (исполнитель, название, альбом, год) и обложкой."""
-        (data, bitrate), cover = await asyncio.gather(self.download(track), self.download_cover(track, "600x600"))
+        (data, bitrate), cover = await asyncio.gather(
+            self.download(track, max_bitrate), self.download_cover(track, "600x600"),
+        )
         album = track_album(track)
         data = tag_mp3(
             data,

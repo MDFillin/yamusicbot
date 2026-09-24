@@ -27,7 +27,7 @@ from aiogram.types import Audio, CallbackQuery, Chat, Document, File, Message, P
 from bot import accounts as accounts_module
 from bot.accounts import Accounts
 from bot.audio import read_mp3_tags, read_tags, tag_mp3
-from bot.callbacks import EditCb, MenuCb, TrackCb, UploadCb
+from bot.callbacks import EditCb, MenuCb, SettingsCb, TrackCb, UploadCb
 from bot.config import Config
 from bot.main import build_dependencies, build_dispatcher
 from bot.storage import Storage
@@ -111,6 +111,7 @@ class FakeYM:
         self.searches: list[str] = []
         self.playlist = NS(kind=1003, title="Мои записи", track_count=2)
         self.downloads = 0
+        self.bitrates: list[int | None] = []
 
     async def start(self):
         pass
@@ -135,9 +136,10 @@ class FakeYM:
     async def get_track(self, track_id):
         return make_track()
 
-    async def download_tagged(self, track):
+    async def download_tagged(self, track, max_bitrate=None):
         self.downloads += 1
-        return tag_mp3(FAKE_MP3, artist="Кино", title=track.title), 320
+        self.bitrates.append(max_bitrate)
+        return tag_mp3(FAKE_MP3, artist="Кино", title=track.title), max_bitrate or 320
 
     async def download_cover(self, track, size="400x400"):
         return b"\xff\xd8cover"
@@ -511,3 +513,28 @@ async def test_description_is_set_only_if_empty():
     [desc] = [c for c in session.calls if isinstance(c, SetMyDescription)]
     assert desc.description == DESCRIPTION
     assert not any(isinstance(c, SetMyShortDescription) for c in session.calls), "своё описание владельца не трогаем"
+
+
+async def test_settings_change_download_quality(env):
+    await env.dp.feed_update(env.bot, message_update(text="/settings"))
+    text = env.tg.texts()[-1]
+    assert "⚙️ <b>Настройки</b>" in text and "<b>320 kbps</b>" in text and "<b>me</b>" in text
+    assert [b.text for b in env.tg.buttons()][:4] == ["✅ 320", "192", "128", "64"]
+
+    await env.dp.feed_update(env.bot, callback_update(SettingsCb(kind="download", value=128).pack()))
+    assert "<b>128 kbps</b>" in env.tg.texts()[-1]
+    assert env.store.get_setting(OWNER.id, "download_quality") == "128"
+
+    def click() -> Update:
+        return callback_update(TrackCb(action="dl", track="123").pack())
+
+    await env.dp.feed_update(env.bot, click())
+    await env.dp.feed_update(env.bot, click())
+    assert env.ym.bitrates == [128], "качество из настроек; повтор — из кэша"
+
+    await env.dp.feed_update(env.bot, callback_update(SettingsCb(kind="download", value=320).pack()))
+    await env.dp.feed_update(env.bot, click())
+    assert env.ym.bitrates == [128, 320], "в другом качестве — другой файл"
+
+    await env.dp.feed_update(env.bot, callback_update(SettingsCb(kind="download", value=999).pack()))
+    assert env.store.get_setting(OWNER.id, "download_quality") == "320", "чужие значения не принимаем"

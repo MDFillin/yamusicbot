@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS file_ids (
     file_id TEXT NOT NULL,
     PRIMARY KEY (account, track_id, bitrate)
 );
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (user_id, key)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -103,6 +109,19 @@ class Storage:
             self._db.execute("DELETE FROM upload_targets WHERE user_id = ?", (user_id,))
         else:
             self._db.execute("INSERT OR REPLACE INTO upload_targets (user_id, kind) VALUES (?, ?)", (user_id, kind))
+
+    # ---------- настройки пользователя (качество и т. п.) ----------
+
+    def get_setting(self, user_id: int, key: str) -> str | None:
+        row = self._one("SELECT value FROM user_settings WHERE user_id = ? AND key = ?", user_id, key)
+        return row[0] if row else None
+
+    def set_setting(self, user_id: int, key: str, value: str | None) -> None:
+        if value is None:
+            self._db.execute("DELETE FROM user_settings WHERE user_id = ? AND key = ?", (user_id, key))
+        else:
+            self._db.execute("INSERT OR REPLACE INTO user_settings (user_id, key, value) VALUES (?, ?, ?)",
+                             (user_id, key, value))
 
     # ---------- служебное ----------
 

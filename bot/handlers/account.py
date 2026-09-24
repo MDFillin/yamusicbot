@@ -12,10 +12,13 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.accounts import Accounts, LoginError, LoginSession
-from bot.callbacks import MenuCb
+from bot.callbacks import MenuCb, SettingsCb
 from bot.config import Config
 from bot.handlers.common import PUBLIC, home, plus_label
+from bot.keyboards import app_button
 from bot.middlewares import login_button
+from bot.settings import QUALITY_LABELS, available_qualities, get_quality, set_quality
+from bot.storage import Storage
 from bot.ym import YandexMusic
 
 log = logging.getLogger(__name__)
@@ -100,22 +103,54 @@ async def on_login_cancel(call: CallbackQuery, accounts: Accounts) -> None:
     await _safe_edit(call.message, "Вход отменён.")
 
 
-def _account_text(ym: YandexMusic) -> str:
-    return (
-        f"👤 <b>Аккаунт Яндекса:</b> {html.escape(ym.login or '—')}\n"
+def settings_view(ym: YandexMusic, store: Storage, config: Config, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    quality = get_quality(store, config, user_id, "download")
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"👤 Аккаунт Яндекса: <b>{html.escape(ym.login or '—')}</b>\n"
         f"Подписка: {plus_label(ym)}\n\n"
-        "Сменить аккаунт — /login, отключить — /logout."
+        f"⬇️ Качество скачивания и отправки в чат: <b>{quality} kbps</b> ({QUALITY_LABELS.get(quality, '')})\n"
+        "Меньше — быстрее и экономнее, 320 — лучшее (нужен Плюс).\n\n"
+        "Оформление, качество в плеере и токен Яндекса — в настройках приложения (⚙️ в «Медиатеке»)."
     )
+    rows = [[
+        InlineKeyboardButton(text=f"✅ {q}" if q == quality else str(q),
+                             callback_data=SettingsCb(kind="download", value=q).pack())
+        for q in available_qualities(config)
+    ]]
+    if button := app_button(config.webapp_url, "🎨 Настройки приложения"):
+        rows.append([button])
+    rows.append([
+        InlineKeyboardButton(text="🔁 Сменить аккаунт", callback_data=MenuCb(action="login").pack()),
+        InlineKeyboardButton(text="🚪 Отключить", callback_data=MenuCb(action="logout").pack()),
+    ])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, ym: YandexMusic, store: Storage, config: Config) -> None:
+    text, markup = settings_view(ym, store, config, message.from_user.id)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(MenuCb.filter(F.action == "account"))
-async def on_account(call: CallbackQuery, ym: YandexMusic) -> None:
+async def on_account(call: CallbackQuery, ym: YandexMusic, store: Storage, config: Config) -> None:
     await call.answer()
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 Сменить аккаунт", callback_data=MenuCb(action="login").pack())],
-        [InlineKeyboardButton(text="🚪 Отключить", callback_data=MenuCb(action="logout").pack())],
-    ])
-    await call.message.answer(_account_text(ym), reply_markup=markup)
+    text, markup = settings_view(ym, store, config, call.from_user.id)
+    await call.message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(SettingsCb.filter())
+async def on_setting(call: CallbackQuery, callback_data: SettingsCb, ym: YandexMusic, store: Storage,
+                     config: Config) -> None:
+    try:
+        value = set_quality(store, config, call.from_user.id, callback_data.kind, callback_data.value)
+    except ValueError as e:
+        await call.answer(str(e), show_alert=True)
+        return
+    await call.answer(f"Качество: {value} kbps")
+    text, markup = settings_view(ym, store, config, call.from_user.id)
+    await _safe_edit(call.message, text, markup)
 
 
 LOGOUT_CONFIRM = (
