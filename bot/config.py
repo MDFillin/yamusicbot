@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+FXTUNNEL_DOMAIN_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,30}[a-z0-9]")
 
 
 class ConfigError(RuntimeError):
@@ -71,6 +74,11 @@ def load_config() -> Config:
         raise ConfigError("MAX_BITRATE должен быть одним из: 64, 128, 192, 320")
 
     webapp_url = os.getenv("WEBAPP_URL", "").strip().rstrip("/") or None
+    fxtunnel_domain = os.getenv("FXTUNNEL_DOMAIN", "").strip().lower() or None
+    if fxtunnel_domain and not FXTUNNEL_DOMAIN_RE.fullmatch(fxtunnel_domain):
+        raise ConfigError("FXTUNNEL_DOMAIN: 3–32 символа — латиница, цифры и дефис (не в начале и не в конце)")
+    if not webapp_url and fxtunnel_domain:
+        webapp_url = f"https://{fxtunnel_domain}.fxtun.dev"  # адрес, который выдаёт туннель fxTunnel
     if webapp_url and not webapp_url.startswith("https://"):
         raise ConfigError("WEBAPP_URL должен начинаться с https:// — мини-приложения Telegram работают только по HTTPS")
 

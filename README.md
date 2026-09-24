@@ -97,13 +97,19 @@ COMPOSE_PROFILES=https
 docker compose up -d --build --force-recreate
 ```
 
-**Вариант Б: без домена, через туннель Cloudflare (попробовать за минуту).**
+**Вариант Б: сервер без открытых портов (за NAT) — туннель [fxTunnel](https://github.com/mephistofox/fxtun.dev).**
+Российский сервис: бесплатно, свой поддомен `https://имя.fxtun.dev`, HTTPS, открывается из России
+(туннели Cloudflare там сейчас замедляют). Зарегистрируйтесь на https://fxtun.dev, создайте токен в разделе «Токены»
+и впишите в `.env`:
 ```bash
-cloudflared tunnel --url http://localhost:8080
+FXTUNNEL_TOKEN=sk_...
+FXTUNNEL_DOMAIN=my-music        # 3–32 символа: латиница, цифры, дефис
+COMPOSE_PROFILES=tunnel
 ```
-`cloudflared` напечатает адрес вида `https://....trycloudflare.com`. Впишите его в `WEBAPP_URL` и перезапустите бота.
-Такой адрес меняется при каждом перезапуске туннеля. Для постоянной работы используйте свой домен или
-[именованный туннель](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
+`WEBAPP_URL` бот возьмёт сам: `https://my-music.fxtun.dev`. Запуск: `docker compose up -d --build --force-recreate`,
+проверка: `docker compose logs --tail 20 tunnel` (строка `HTTP: https://…`).
+При первом открытии fxTunnel покажет страницу-предупреждение — нажмите «Продолжить» один раз, дальше приложение
+само продлевает согласие.
 
 **Что умеет:**
 - **Медиатека**: «Мне нравится» и ваши плейлисты. Плейлист можно создать, переименовать, удалить, убрать из него трек и назначить целевым для загрузки файлов из чата.

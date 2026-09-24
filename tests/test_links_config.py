@@ -62,3 +62,21 @@ def test_telegram_proxy(monkeypatch):
     assert bot.session.proxy == "socks5://user:pass@1.2.3.4:1080"
     monkeypatch.delenv("TELEGRAM_PROXY")
     assert build_bot(load_config()).session.proxy is None
+
+
+def test_fxtunnel_domain_sets_webapp_url(monkeypatch):
+    from bot.config import ConfigError, load_config
+
+    monkeypatch.setenv("BOT_TOKEN", "1:x")
+    monkeypatch.setenv("YANDEX_MUSIC_TOKEN", "y0")
+    monkeypatch.delenv("WEBAPP_URL", raising=False)
+    monkeypatch.setenv("FXTUNNEL_DOMAIN", "BobikMusic228")
+    assert load_config().webapp_url == "https://bobikmusic228.fxtun.dev"
+
+    monkeypatch.setenv("WEBAPP_URL", "https://other.example.com")
+    assert load_config().webapp_url == "https://other.example.com", "явный WEBAPP_URL важнее"
+
+    for bad in ("ab", "-music", "my_music", "x" * 33):
+        monkeypatch.setenv("FXTUNNEL_DOMAIN", bad)
+        with pytest.raises(ConfigError, match="FXTUNNEL_DOMAIN"):
+            load_config()

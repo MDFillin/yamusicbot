@@ -906,7 +906,15 @@
     $('#tabs').hidden = true;
   }
 
+  // fxTunnel показывает страницу-предупреждение при заходе на поддомен и после «Продолжить» помнит
+  // согласие 12 часов. Это наше собственное приложение — продлеваем согласие на год.
+  function extendTunnelConsent() {
+    const m = location.hostname.match(/^([a-z0-9-]+)\.fxtun\.(dev|ru)$/);
+    if (m) document.cookie = `_fxt_consent_${m[1]}=1; Path=/; Max-Age=31536000; SameSite=Lax; Secure`;
+  }
+
   async function boot() {
+    extendTunnelConsent();
     const labels = { library: ['library', 'Медиатека'], search: ['search', 'Поиск'], upload: ['upload', 'Загрузка'] };
     document.querySelectorAll('#tabs button').forEach((b) => {
       const [ic, label] = labels[b.dataset.tab];

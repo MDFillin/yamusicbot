@@ -22,6 +22,18 @@ services:
       - caddy_data:/data
     restart: unless-stopped
 
+  # Туннель fxTunnel — HTTPS для мини-приложения без открытых портов (сервер за NAT, нет файрвола в панели).
+  # Включается строкой COMPOSE_PROFILES=tunnel в .env; нужны FXTUNNEL_TOKEN и FXTUNNEL_DOMAIN.
+  tunnel:
+    build: ./tunnel
+    profiles: ["tunnel"]
+    # Общая сеть с ботом: localhost:8080 внутри туннеля — это веб-сервер бота.
+    network_mode: "service:bot"
+    command: ["http", "${WEB_PORT:-8080}", "--domain", "${FXTUNNEL_DOMAIN:-}", "--no-inspect"]
+    environment:
+      FXTUNNEL_SERVER_TOKEN: ${FXTUNNEL_TOKEN:-}
+    restart: unless-stopped
+
 volumes:
   caddy_data:
 
