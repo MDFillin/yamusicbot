@@ -17,6 +17,7 @@ from aiogram.methods import (
     AnswerCallbackQuery,
     AnswerInlineQuery,
     DeleteMessage,
+    DeleteMyCommands,
     EditMessageMedia,
     EditMessageText,
     GetFile,
@@ -25,6 +26,7 @@ from aiogram.methods import (
     SendDocument,
     SendMessage,
     SendPhoto,
+    SetMyCommands,
 )
 from aiogram.types import (
     Audio,
@@ -90,7 +92,8 @@ class FakeTelegram(BaseSession):
                 message_id=next(self._ids), date=datetime.now(), chat=Chat(id=method.chat_id, type="private"),
                 audio=Audio(file_id="AUDIO-1", file_unique_id="a1", duration=method.duration or 0),
             ).as_(bot)
-        if isinstance(method, (AnswerCallbackQuery, DeleteMessage, AnswerInlineQuery, EditMessageMedia)):
+        if isinstance(method, (AnswerCallbackQuery, DeleteMessage, AnswerInlineQuery, EditMessageMedia,
+                               SetMyCommands, DeleteMyCommands)):
             return True
         if isinstance(method, GetMe):
             return User(id=42, is_bot=True, first_name="Bot", username="testbot", supports_inline_queries=True)
@@ -759,3 +762,30 @@ async def test_user_blocking_the_bot_is_noted(env):
     assert env.store.get_user(FRIEND.id)["blocked_bot"]
     await env.dp.feed_update(env.bot, message_update(FRIEND, text="/start"))
     assert not env.store.get_user(FRIEND.id)["blocked_bot"], "вернулся — снова получает рассылки"
+
+
+async def test_owner_appoints_admin_in_chat(env):
+    from bot.callbacks import AdminCb
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="/start"))
+    await env.dp.feed_update(env.bot, message_update(text=f"/user {FRIEND.id}"))
+    assert AdminCb(action="grant_admin", user=FRIEND.id).pack() in [b.callback_data for b in env.tg.buttons()]
+    await env.dp.feed_update(env.bot, callback_update(AdminCb(action="grant_admin", user=FRIEND.id).pack()))
+    assert "🛡 Вам выданы права администратора" in [c.text for c in env.tg.calls if isinstance(c, SendMessage)
+                                                    and c.chat_id == FRIEND.id][-1]
+    assert any(isinstance(c, SetMyCommands) and c.scope.chat_id == FRIEND.id for c in env.tg.calls)
+
+    # Назначенный админ видит панель, но без бэкапа и без назначения админов.
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="/admin"))
+    assert "🛡 <b>Админ-панель</b>" in env.tg.texts()[-1]
+    assert AdminCb(action="backup").pack() not in [b.callback_data for b in env.tg.buttons()]
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text=f"/user {OWNER.id}"))
+    assert "👑 Владелец бота" in env.tg.texts()[-1]
+    assert not [b for b in env.tg.buttons() if "админ" in b.text.lower()]
+    await env.dp.feed_update(env.bot, callback_update(AdminCb(action="backup").pack(), FRIEND))
+    assert not [c for c in env.tg.calls if isinstance(c, SendDocument)]
+
+    await env.dp.feed_update(env.bot, callback_update(AdminCb(action="revoke_admin", user=FRIEND.id).pack()))
+    assert not env.dp["admin"].is_admin(FRIEND.id)
+    assert any(isinstance(c, DeleteMyCommands) and c.scope.chat_id == FRIEND.id for c in env.tg.calls)
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="/admin"))
+    assert "Не понял" in env.tg.texts()[-1]

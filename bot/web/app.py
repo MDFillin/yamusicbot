@@ -394,6 +394,7 @@ async def api_me(request: web.Request) -> web.Response:
     }
     if ctx.admin.is_admin(user_id):
         info["is_admin"] = True
+        info["is_owner"] = ctx.admin.is_owner(user_id)
     ym = await ctx.accounts.get(user_id)  # не подключиться — 503 с объяснением
     if ym is not None:
         info.update(connected=True, login=ym.login, has_plus=ym.has_plus,

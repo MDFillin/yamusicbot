@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS audit (
     target INTEGER,
     details TEXT
 );
+-- Админы, назначенные владельцем из приложения (владельцы — ADMIN_IDS в .env, их здесь нет).
+CREATE TABLE IF NOT EXISTS admins (
+    user_id INTEGER PRIMARY KEY,
+    granted_by INTEGER NOT NULL,
+    granted_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS users_last_seen ON users (last_seen);
 CREATE INDEX IF NOT EXISTS activity_day ON activity (day);
 CREATE INDEX IF NOT EXISTS counters_day ON counters (day, key);
@@ -322,6 +328,28 @@ class Storage:
         return self._all(
             "SELECT user_id, SUM(n) FROM counters WHERE key = ? AND day >= ? GROUP BY user_id "
             "ORDER BY 2 DESC LIMIT ?", key, since, limit)
+
+    # ---------- назначенные админы ----------
+
+    def admin_ids(self) -> set[int]:
+        return {r[0] for r in self._all("SELECT user_id FROM admins")}
+
+    def get_admin(self, user_id: int) -> tuple[int, int] | None:
+        """(кто назначил, когда) или None."""
+        return self._one("SELECT granted_by, granted_at FROM admins WHERE user_id = ?", user_id)
+
+    def add_admin(self, user_id: int, granted_by: int) -> None:
+        self._db.execute("INSERT OR IGNORE INTO admins (user_id, granted_by, granted_at) VALUES (?, ?, ?)",
+                         (user_id, granted_by, int(time.time())))
+
+    def remove_admin(self, user_id: int) -> bool:
+        return bool(self._db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,)).rowcount)
+
+    def users_by_ids(self, ids: list[int]) -> list[dict]:
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        return self._users(f"WHERE u.user_id IN ({marks}) ORDER BY u.last_seen DESC", tuple(ids), len(ids))
 
     # ---------- журнал действий админа ----------
 

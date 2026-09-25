@@ -1,4 +1,7 @@
-"""Админ-панель в чате: /admin, /user, /ban, /unban, /broadcast. Работает только для ADMIN_IDS из .env.
+"""Админ-панель в чате: /admin, /user, /ban, /unban, /broadcast, /admins.
+
+Работает для админов: владельцев из ADMIN_IDS (.env) и тех, кого владелец назначил. Назначать и снимать
+админов и получать бэкап базы может только владелец.
 
 Для всех остальных этих команд просто нет: фильтр IsAdmin пропускает их сообщения дальше, и бот отвечает
 как на любую непонятную команду.
@@ -24,7 +27,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-from bot.admin import AUDIENCES, Admin, display_name
+from bot.admin import AUDIENCES, Admin, Forbidden, display_name
 from bot.callbacks import AdminCb
 from bot.handlers.common import PUBLIC
 from bot.states import AdminStates
@@ -59,7 +62,7 @@ def _ago(ts: int | None) -> str:
     return time.strftime("%d.%m.%Y", time.localtime(ts))
 
 
-def panel(admin: Admin) -> tuple[str, InlineKeyboardMarkup]:
+def panel(admin: Admin, viewer: int) -> tuple[str, InlineKeyboardMarkup]:
     st = admin.stats(days=1)
     u, s = st["users"], admin.settings
     limits = []
@@ -89,16 +92,18 @@ def panel(admin: Admin) -> tuple[str, InlineKeyboardMarkup]:
     rows += [
         [_btn("🛠 Выключить техработы" if s.maintenance else "🛠 Включить техработы", "maintenance"),
          _btn("🚪 Открыть регистрацию" if s.closed_since else "🚪 Закрыть регистрацию", "closed")],
-        [_btn("📣 Рассылка", "broadcast"), _btn("💾 Бэкап базы", "backup")],
+        [_btn("📣 Рассылка", "broadcast"), _btn("👮 Админы", "admins")],
         [_btn("⚠️ Ошибки", "errors"), _btn("📜 Журнал", "audit")],
         [_btn("🔄 Обновить", "refresh")],
     ]
+    if admin.is_owner(viewer):
+        rows.insert(-1, [_btn("💾 Бэкап базы", "backup")])
     if admin.broadcaster.running:
         rows.insert(-1, [_btn("⏹ Остановить рассылку", "bc_stop")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def user_card(admin: Admin, user_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+def user_card(admin: Admin, user_id: int, viewer: int) -> tuple[str, InlineKeyboardMarkup] | None:
     user = admin.store.get_user(user_id)
     if user is None:
         return None
@@ -113,16 +118,21 @@ def user_card(admin: Admin, user_id: int) -> tuple[str, InlineKeyboardMarkup] | 
         lines.append("⛔ <b>Заблокирован</b>" + (f": {html.escape(user['ban_reason'])}" if user["ban_reason"] else ""))
     if user["blocked_bot"]:
         lines.append("🚫 Заблокировал бота")
-    if admin.is_admin(user_id):
+    if admin.is_owner(user_id):
+        lines.append("👑 Владелец бота")
+    elif admin.is_admin(user_id):
         lines.append("🛡 Админ")
     rows = []
     if not admin.is_admin(user_id):
         rows.append([_btn("✅ Разблокировать", "unban", user_id) if user["banned"]
                      else _btn("⛔ Заблокировать", "ban", user_id)])
     row = [_btn("♻️ Сбросить лимиты", "reset", user_id)]
-    if user["connected"]:
+    if user["connected"] and (not admin.is_admin(user_id) or admin.is_owner(viewer) or viewer == user_id):
         row.insert(0, _btn("🔌 Отключить Яндекс", "disconnect", user_id))
     rows.append(row)
+    if admin.is_owner(viewer) and not admin.is_owner(user_id):
+        rows.append([_btn("🚫 Снять права админа", "revoke_admin", user_id) if admin.is_admin(user_id)
+                     else _btn("🛡 Сделать админом", "grant_admin", user_id)])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -157,7 +167,7 @@ async def on_bot_blocked(update: ChatMemberUpdated, admin: Admin) -> None:
 @router.message(Command("admin"), flags=PUBLIC)
 async def cmd_admin(message: Message, state: FSMContext, admin: Admin) -> None:
     await state.clear()
-    text, markup = panel(admin)
+    text, markup = panel(admin, message.from_user.id)
     await message.answer(text, reply_markup=markup)
 
 
@@ -174,12 +184,15 @@ async def on_panel_action(call: CallbackQuery, callback_data: AdminCb, admin: Ad
         await call.answer("Останавливаю рассылку…" if admin.cancel_broadcast(actor) else "Рассылка не идёт")
     else:
         await call.answer("Обновлено")
-    text, markup = panel(admin)
+    text, markup = panel(admin, actor)
     await _edit(call.message, text, markup)
 
 
 @router.callback_query(AdminCb.filter(F.action == "backup"), flags=PUBLIC)
 async def on_backup(call: CallbackQuery, admin: Admin) -> None:
+    if not admin.is_owner(call.from_user.id):
+        await call.answer("Бэкап базы доступен только владельцу", show_alert=True)
+        return
     await call.answer("💾 Готовлю копию…")
     size = await admin.backup(call.from_user.id)
     await call.message.answer(f"💾 Копия базы отправлена ({max(1, size // 1024)} КБ).")
@@ -223,7 +236,7 @@ async def on_audit(call: CallbackQuery, admin: Admin) -> None:
 @router.message(Command("user"), flags=PUBLIC)
 async def cmd_user(message: Message, command: CommandObject, admin: Admin) -> None:
     user_id = _target(admin, command.args)
-    card = user_card(admin, user_id) if user_id is not None else None
+    card = user_card(admin, user_id, message.from_user.id) if user_id is not None else None
     if card is None:
         await message.answer("Укажите ID или @username: <code>/user 123456789</code>")
         return
@@ -255,7 +268,8 @@ async def cmd_unban(message: Message, command: CommandObject, admin: Admin) -> N
     await message.answer(f"✅ Пользователь <code>{user_id}</code> разблокирован.")
 
 
-@router.callback_query(AdminCb.filter(F.action.in_({"ban", "unban", "disconnect", "reset"})), flags=PUBLIC)
+@router.callback_query(AdminCb.filter(F.action.in_({"ban", "unban", "disconnect", "reset", "grant_admin",
+                                                     "revoke_admin"})), flags=PUBLIC)
 async def on_user_action(call: CallbackQuery, callback_data: AdminCb, admin: Admin) -> None:
     actor, user_id = call.from_user.id, callback_data.user
     try:
@@ -268,15 +282,44 @@ async def on_user_action(call: CallbackQuery, callback_data: AdminCb, admin: Adm
         elif callback_data.action == "disconnect":
             await admin.disconnect(actor, user_id)
             note = "🔌 Яндекс отключён"
+        elif callback_data.action == "grant_admin":
+            await admin.grant_admin(actor, user_id)
+            note = "🛡 Назначен админом"
+        elif callback_data.action == "revoke_admin":
+            await admin.revoke_admin(actor, user_id)
+            note = "Права админа сняты"
         else:
             admin.reset_limits(actor, user_id)
             note = "♻️ Лимиты на сегодня сброшены"
-    except ValueError as e:
+    except (ValueError, Forbidden) as e:
         await call.answer(str(e), show_alert=True)
         return
     await call.answer(note)
-    if card := user_card(admin, user_id):
+    if card := user_card(admin, user_id, actor):
         await _edit(call.message, card[0], card[1])
+
+
+def admins_text(admin: Admin, viewer: int) -> str:
+    lines = ["👮 <b>Администраторы</b>"]
+    for a in admin.admins():
+        since = time.strftime("%d.%m.%Y", time.localtime(a["granted_at"])) if a["granted_at"] else "—"
+        role = "👑 владелец (.env)" if a["owner"] else f"🛡 админ с {since}"
+        lines.append(f"• {html.escape(a['name'])} — <code>{a['id']}</code>, {role}")
+    if admin.is_owner(viewer):
+        lines.append("\nНазначить или снять: <code>/user ID</code> → «🛡 Сделать админом» "
+                     "(или в «Медиатеке»: админ-панель → Люди).")
+    return "\n".join(lines)
+
+
+@router.message(Command("admins"), flags=PUBLIC)
+async def cmd_admins(message: Message, admin: Admin) -> None:
+    await message.answer(admins_text(admin, message.from_user.id))
+
+
+@router.callback_query(AdminCb.filter(F.action == "admins"), flags=PUBLIC)
+async def on_admins(call: CallbackQuery, admin: Admin) -> None:
+    await call.answer()
+    await call.message.answer(admins_text(admin, call.from_user.id))
 
 
 # ---------- рассылка ----------

@@ -589,3 +589,4 @@ details.log pre {
 .adm-body > .seg-full { margin-bottom: 12px; }
 .adm-body .set-row .sub { white-space: normal; }
 .adm-body .search-field + .segments { margin-bottom: 4px; }
+#sheet .row .sub { white-space: normal; }

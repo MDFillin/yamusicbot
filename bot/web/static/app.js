@@ -625,6 +625,7 @@
 
   // ---------- админ-панель (только для ADMIN_IDS; сервер проверяет это сам, здесь — лишь интерфейс) ----------
   const isAdmin = () => !!(state.me && state.me.is_admin);
+  const isOwner = () => !!(state.me && state.me.is_owner);
 
   function openAdmin() {
     if (!isAdmin()) return;
@@ -710,11 +711,17 @@
     const render = () => {
       clearInterval(timer);
       put(body, h('div', { class: 'empty' }, spinner()));
-      ({ overview, users, broadcast, settings, journal })[tab]().catch((e) => { if (alive()) put(body, emptyEl('alert', e.message)); });
+      ({ overview, users, broadcast, settings, journal })[tab]().catch((e) => {
+        if (!alive()) return;
+        if (e.status === 404) { // права сняли, пока панель была открыта
+          state.me.is_admin = false;
+          put(body, emptyEl('lock', 'У вас больше нет доступа к админ-панели'));
+        } else put(body, emptyEl('alert', e.message));
+      });
     };
     entry.onShow = () => { if (tab === 'broadcast' || tab === 'overview') render(); };
     root.append(h('div', { class: 'lib-head' }, h('div', {},
-      h('div', { class: 'hello' }, 'Только для владельца'), h('h1', { class: 'page-title' }, 'Админ-панель')),
+      h('div', { class: 'hello' }, isOwner() ? 'Вы владелец бота' : 'Вы администратор'), h('h1', { class: 'page-title' }, 'Админ-панель')),
     h('span', { class: 'gear-btn adm-shield' }, icon('shield'))), bar, body);
     drawTabs();
     render();
@@ -762,7 +769,8 @@
           kv('Клиентов Яндекса в памяти', fmtNum(sv.clients)), kv('ffmpeg', sv.ffmpeg || 'не установлен'),
           kv('Python / aiogram', `${sv.python} / ${sv.aiogram}`), kv('Бот', sv.bot_username ? `@${sv.bot_username}` : '—'),
           kv('Инлайн-режим', sv.inline ? 'включён' : sv.inline === false ? 'выключен в @BotFather' : '—'),
-          kv('Админы', sv.admins.join(', '))), backupBtn));
+          kv('Владельцы (.env)', String(sv.owners.length)), kv('Назначенные админы', String(sv.admins.length))),
+        isOwner() ? backupBtn : null));
     }
 
     // ----- пользователи -----
@@ -773,7 +781,7 @@
       const more = h('div');
       const count = h('div', { class: 'set-note' });
       const chips = h('div', { class: 'segments' });
-      const filters = [['all', 'Все'], ['connected', 'С Яндексом'], ['banned', 'Заблокированы'], ['blocked', 'Ушли']];
+      const filters = [['all', 'Все'], ['connected', 'С Яндексом'], ['admins', 'Админы'], ['banned', 'Заблокированы'], ['blocked', 'Ушли']];
       const drawChips = () => put(chips, filters.map(([k, label]) => h('button', { class: k === filter ? 'on' : '',
         onclick: () => { filter = k; drawChips(); load(0); } }, label)));
       let seq = 0;
@@ -797,7 +805,8 @@
 
     function userRow(u) {
       const badges = [];
-      if (u.is_admin) badges.push(h('span', { class: 'badge plus' }, 'админ'));
+      if (u.is_owner) badges.push(h('span', { class: 'badge plus' }, 'владелец'));
+      else if (u.is_admin) badges.push(h('span', { class: 'badge plus' }, 'админ'));
       if (u.banned) badges.push(h('span', { class: 'badge bad' }, 'бан'));
       if (u.blocked_bot) badges.push(h('span', { class: 'badge' }, 'ушёл'));
       const hue = (u.id * 47) % 360;
@@ -812,7 +821,12 @@
       let u;
       try { u = await api(`/api/admin/users/${id}`); } catch (e) { fail(e); return; }
       const act = (action, body, note) => async () => {
-        try { u = await api(`/api/admin/users/${id}/${action}`, { method: 'POST', body: body || {} }); haptic.ok(); toast(note); draw(); if (tab === 'users') users().catch(fail); } catch (e) { fail(e); }
+        try {
+          u = await api(`/api/admin/users/${id}/${action}`, { method: 'POST', body: body || {} });
+          haptic.ok(); toast(note); draw();
+          if (tab === 'users') users().catch(fail);
+          if (tab === 'settings') settings().catch(fail);
+        } catch (e) { fail(e); }
       };
       const draw = () => {
         const limits = [u.downloads_left != null ? `скачиваний осталось ${u.downloads_left}` : null,
@@ -827,6 +841,8 @@
             h('div', { class: 'kv' }, h('span', {}, 'Был'), h('b', {}, fmtAgo(u.last_seen))),
             h('div', { class: 'kv' }, h('span', {}, 'Скачал / загрузил'), h('b', {}, `${fmtNum(u.downloads)} / ${fmtNum(u.uploads)}`)),
             limits ? h('div', { class: 'kv' }, h('span', {}, 'Сегодня'), h('b', {}, limits)) : null,
+            u.is_admin ? h('div', { class: 'kv' }, h('span', {}, 'Роль'),
+              h('b', {}, u.is_owner ? '👑 владелец (.env)' : `🛡 админ${u.admin_granted_at ? ` с ${new Date(u.admin_granted_at * 1000).toLocaleDateString('ru-RU')}` : ''}`)) : null,
             u.banned ? h('div', { class: 'kv bad' }, h('span', {}, 'Заблокирован'), h('b', {}, u.ban_reason || 'без причины')) : null,
             u.blocked_bot ? h('div', { class: 'kv' }, h('span', {}, 'Статус'), h('b', {}, 'заблокировал бота')) : null),
           h('button', { class: 'row', onclick: () => copyText(String(u.id)) }, icon('copy'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Скопировать ID'))),
@@ -836,7 +852,16 @@
           icon('send'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Написать от имени бота'))),
           h('button', { class: 'row', onclick: act('reset', null, 'Лимиты на сегодня сброшены') }, icon('refresh'),
             h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Сбросить лимиты на сегодня'))),
-          u.connected ? h('button', { class: 'row danger', onclick: async () => {
+          isOwner() && !u.is_owner ? (u.is_admin
+            ? h('button', { class: 'row danger', onclick: async () => {
+              if (await confirmAsk(`Снять права админа у «${userName(u)}»? Админ-панель у него сразу пропадёт.`)) await act('revoke_admin', null, 'Права админа сняты')();
+            } }, icon('shield'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Снять права админа')))
+            : h('button', { class: 'row', onclick: async () => {
+              if (await confirmAsk(`Назначить «${userName(u)}» админом? Ему откроется админ-панель: пользователи, блокировки, `
+                + 'рассылка, режимы и журнал. Назначать админов и делать бэкап базы сможете только вы.')) await act('grant_admin', null, 'Назначен админом')();
+            } }, icon('shield'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Сделать админом'),
+              h('div', { class: 'sub' }, 'Доступ к админ-панели, кроме бэкапа и назначения админов')))) : null,
+          u.connected && (!u.is_admin || isOwner() || u.id === (tgUser && tgUser.id)) ? h('button', { class: 'row danger', onclick: async () => {
             if (await confirmAsk('Отключить аккаунт Яндекса у этого пользователя? Он сможет подключить его снова.')) await act('disconnect', null, 'Яндекс отключён')();
           } }, icon('logout'), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Отключить его Яндекс'))) : null,
           u.is_admin ? null : u.banned
@@ -907,7 +932,7 @@
 
     // ----- режимы -----
     async function settings() {
-      const { settings: cfg } = await api('/api/admin/overview');
+      const [{ settings: cfg }, team] = await Promise.all([api('/api/admin/overview'), api('/api/admin/admins')]);
       if (!alive() || tab !== 'settings') return;
       const save = async (patch, note) => {
         try { Object.assign(cfg, await api('/api/admin/settings', { method: 'PUT', body: patch })); haptic.ok(); if (note) toast(note); return true; } catch (e) { fail(e); return false; }
@@ -929,7 +954,16 @@
           h('label', { class: 'field-row' }, h('span', {}, 'Скачиваний треков'), dl),
           h('label', { class: 'field-row' }, h('span', {}, 'Загрузок файлов'), ul), saveLimits),
         h('div', { class: 'set-note' }, '0 — без ограничений. Сутки считаются по Москве. На админов лимиты не действуют; '
-          + 'сбросить лимит конкретному человеку можно в его карточке.')));
+          + 'сбросить лимит конкретному человеку можно в его карточке.')),
+        group('Администраторы', h('div', { class: 'card list' }, team.admins.map((a) => h('button', { class: 'row', onclick: () => userSheet(a.id) },
+          h('span', { class: 'set-icon' }, icon('shield', 'sm')),
+          h('div', { class: 'meta' }, h('div', { class: 'title' }, a.name),
+            h('div', { class: 'sub' }, a.owner ? 'владелец · задан в .env' : `админ с ${new Date(a.granted_at * 1000).toLocaleDateString('ru-RU')}`)),
+          a.owner ? h('span', { class: 'badge plus' }, 'владелец') : icon('chevron', 'sm')))),
+        h('div', { class: 'set-note' }, team.can_manage
+          ? 'Чтобы назначить админа, откройте человека на вкладке «Люди» → «Сделать админом». Снять права — там же. '
+            + 'Владельцы задаются только в .env на сервере.'
+          : 'Назначать и снимать админов может только владелец бота.')));
     }
 
     // ----- журнал -----

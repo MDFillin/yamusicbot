@@ -14,7 +14,6 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    BotCommand,
     BotCommandScopeChat,
     ErrorEvent,
     MenuButtonDefault,
@@ -29,6 +28,7 @@ from yandex_music.exceptions import UnauthorizedError
 from bot.accounts import Accounts
 from bot.admin import Admin, LimitReached
 from bot.audio import ffmpeg_available
+from bot.commands import ADMIN_COMMANDS, COMMANDS
 from bot.config import Config, ConfigError, load_config
 from bot.handlers import build_router
 from bot.handlers.upload import UploadQueue
@@ -39,27 +39,6 @@ from bot.storage import Storage
 from bot.web.app import create_app
 
 log = logging.getLogger("bot")
-
-COMMANDS = [
-    BotCommand(command="app", description="🎧 Открыть медиатеку"),
-    BotCommand(command="likes", description="❤️ Мне нравится"),
-    BotCommand(command="playlists", description="📃 Мои плейлисты"),
-    BotCommand(command="target", description="📌 Плейлист по умолчанию для загрузки"),
-    BotCommand(command="newplaylist", description="➕ Создать плейлист"),
-    BotCommand(command="menu", description="🏠 Главное меню"),
-    BotCommand(command="settings", description="⚙️ Настройки: качество, аккаунт"),
-    BotCommand(command="login", description="🔑 Подключить Яндекс Музыку"),
-    BotCommand(command="logout", description="🚪 Отключить аккаунт"),
-    BotCommand(command="help", description="❓ Справка"),
-    BotCommand(command="cancel", description="Отменить действие"),
-]
-# Видны только админам (в их личном чате с ботом).
-ADMIN_COMMANDS = [
-    BotCommand(command="admin", description="🛡 Админ-панель"),
-    BotCommand(command="user", description="👤 Пользователь: /user ID"),
-    BotCommand(command="broadcast", description="📣 Рассылка всем"),
-    *COMMANDS,
-]
 
 # Что видит человек, впервые открыв бота (ставим, только если владелец не задал своё в @BotFather).
 DESCRIPTION = (
@@ -158,8 +137,8 @@ async def setup_menu_button(bot: Bot, config: Config) -> None:
         await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
 
 
-async def setup_admin_commands(bot: Bot, config: Config) -> None:
-    for admin_id in config.admin_ids:
+async def setup_admin_commands(bot: Bot, admin: Admin) -> None:
+    for admin_id in admin.all_admin_ids():
         try:
             await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
         except TelegramAPIError as e:  # админ ещё не писал боту
@@ -234,7 +213,7 @@ async def main() -> None:
     runner = await start_web(config, bot, accounts, store, dp["sender"], placer, admin)
     try:
         await bot.set_my_commands(COMMANDS)
-        await setup_admin_commands(bot, config)
+        await setup_admin_commands(bot, admin)
         await setup_menu_button(bot, config)
         await setup_description(bot)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

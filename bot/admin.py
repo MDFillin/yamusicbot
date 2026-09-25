@@ -1,7 +1,9 @@
-"""Админ-панель владельца: пользователи, блокировки, техработы, лимиты, рассылка, журнал, ошибки и бэкап.
+"""Админ-панель: пользователи, блокировки, техработы, лимиты, рассылка, журнал, ошибки и бэкап.
 
-Админы задаются только в .env (ADMIN_IDS) — из самой панели добавить админа нельзя. Кто админ, бот узнаёт
-по Telegram ID: в чате его подставляет Telegram, в мини-приложении — подписанный Telegram initData.
+Два уровня доступа:
+- владельцы — ADMIN_IDS в .env: всё, включая назначение админов и бэкап базы; из приложения их не снять;
+- админы, которых владелец назначил в приложении (хранятся в базе): панель без управления админами и бэкапа.
+Кто есть кто, бот узнаёт по Telegram ID: в чате его подставляет Telegram, в мини-приложении — подписанный initData.
 """
 
 from __future__ import annotations
@@ -27,9 +29,10 @@ from typing import Any
 import aiogram
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import FSInputFile
+from aiogram.types import BotCommandScopeChat, FSInputFile
 
 from bot.accounts import Accounts
+from bot.commands import ADMIN_COMMANDS
 from bot.config import Config
 from bot.storage import Storage
 
@@ -47,7 +50,15 @@ AUDIT_LABELS = {
     "reset_limits": "сбросил лимиты", "message": "написал", "broadcast": "запустил рассылку",
     "broadcast_cancel": "остановил рассылку", "broadcast_done": "рассылка завершена", "settings": "настройки",
     "backup": "бэкап базы", "denied": "🚨 попытка открыть админку",
+    "grant_admin": "назначил админом", "revoke_admin": "снял права админа у",
 }
+ADMIN_GRANTED = ("🛡 Вам выданы права администратора бота.\n\n"
+                 "Админ-панель — щит 🛡 в «Медиатеке» или команда /admin.")
+ADMIN_REVOKED = "Права администратора бота сняты."
+
+
+class Forbidden(PermissionError):
+    """Действие доступно только владельцу бота."""
 
 REASONS = {
     "banned": "⛔ Доступ к боту для вас закрыт.",
@@ -239,11 +250,75 @@ class Admin:
         self._denied: dict[int, float] = {}
         self._probes: dict[int, float] = {}
         self._ffmpeg_version: str | None = None
+        self._appointed = store.admin_ids() - set(config.admin_ids)
 
     # ---------- доступ ----------
 
-    def is_admin(self, user_id: int | None) -> bool:
+    def is_owner(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.config.admin_ids
+
+    def is_admin(self, user_id: int | None) -> bool:
+        return user_id is not None and (user_id in self.config.admin_ids or user_id in self._appointed)
+
+    def all_admin_ids(self) -> set[int]:
+        return set(self.config.admin_ids) | self._appointed
+
+    def _owner_only(self, actor: int) -> None:
+        if not self.is_owner(actor):
+            raise Forbidden("Это может только владелец бота (ADMIN_IDS в .env)")
+
+    def admins(self) -> list[dict[str, Any]]:
+        """Владельцы и назначенные админы — для списка в панели."""
+        ids = sorted(self.all_admin_ids())
+        known = {u["id"]: u for u in self.store.users_by_ids(ids)}
+        result = []
+        for user_id in ids:
+            user = known.get(user_id) or {"id": user_id}
+            granted = self.store.get_admin(user_id)
+            result.append({
+                "id": user_id, "name": display_name(user), "username": user.get("username"),
+                "owner": self.is_owner(user_id), "last_seen": user.get("last_seen"),
+                "granted_by": granted[0] if granted and not self.is_owner(user_id) else None,
+                "granted_at": granted[1] if granted and not self.is_owner(user_id) else None,
+            })
+        result.sort(key=lambda a: (not a["owner"], a["granted_at"] or 0))
+        return result
+
+    async def grant_admin(self, actor: int, user_id: int) -> None:
+        self._owner_only(actor)
+        if self.is_admin(user_id):
+            raise ValueError("Он уже админ")
+        user = self.store.get_user(user_id)
+        if user is None:
+            raise ValueError("Такого пользователя бот не знает — пусть сначала напишет боту /start")
+        if user["banned"]:
+            raise ValueError("Пользователь заблокирован — сначала разблокируйте его")
+        self.store.add_admin(user_id, actor)
+        self._appointed.add(user_id)
+        self.audit(actor, "grant_admin", user_id)
+        await self._notify_role(user_id, granted=True)
+
+    async def revoke_admin(self, actor: int, user_id: int) -> None:
+        self._owner_only(actor)
+        if self.is_owner(user_id):
+            raise ValueError("Владельца из ADMIN_IDS можно убрать только в .env на сервере")
+        if user_id not in self._appointed:
+            raise ValueError("Он не админ")
+        self.store.remove_admin(user_id)
+        self._appointed.discard(user_id)
+        self.audit(actor, "revoke_admin", user_id)
+        await self._notify_role(user_id, granted=False)
+
+    async def _notify_role(self, user_id: int, granted: bool) -> None:
+        """Сообщает человеку о новых правах и показывает (или прячет) ему админ-команды в меню бота."""
+        scope = BotCommandScopeChat(chat_id=user_id)
+        with contextlib.suppress(Exception):
+            if granted:
+                await self.bot.set_my_commands(ADMIN_COMMANDS, scope=scope)
+            else:
+                await self.bot.delete_my_commands(scope=scope)
+        with contextlib.suppress(Exception):
+            await self.bot.send_message(user_id, ADMIN_GRANTED if granted else ADMIN_REVOKED)
 
     def touch(self, user: Any) -> None:
         """Отмечает, что пользователь был в боте (не чаще раза в минуту на человека)."""
@@ -299,7 +374,7 @@ class Admin:
                                                                                     "username")}})
         self.audit(user.id, "denied", user.id, where)
         log.warning("Попытка открыть админ-панель: %s (%s), %s", name, user.id, where)
-        for admin_id in self.config.admin_ids:
+        for admin_id in self.config.admin_ids:  # о попытках — только владельцам
             with contextlib.suppress(Exception):
                 await self.bot.send_message(
                     admin_id, f"🚨 Кто-то пытался открыть админ-панель: <b>{html.escape(name)}</b> "
@@ -388,6 +463,8 @@ class Admin:
         self.audit(actor, "unban", user_id)
 
     async def disconnect(self, actor: int, user_id: int) -> bool:
+        if self.is_admin(user_id) and actor != user_id:
+            self._owner_only(actor)  # назначенный админ не трогает аккаунты других админов
         done = await self.accounts.logout(user_id)
         self.audit(actor, "disconnect", user_id)
         return done
@@ -426,7 +503,8 @@ class Admin:
         return False
 
     async def backup(self, actor: int) -> int:
-        """Отправляет копию базы админу в личный чат. Возвращает размер в байтах."""
+        """Отправляет копию базы владельцу в личный чат. Возвращает размер в байтах."""
+        self._owner_only(actor)  # в базе входы всех пользователей — только владельцу
         fd, name = tempfile.mkstemp(prefix="backup-", suffix=".db", dir=self.store.path.parent)
         os.close(fd)
         try:
@@ -507,7 +585,8 @@ class Admin:
             "webapp_url": self.config.webapp_url,
             "max_bitrate": self.config.max_bitrate,
             "web_max_upload_mb": self.config.web_max_upload_mb,
-            "admins": sorted(self.config.admin_ids),
+            "owners": sorted(self.config.admin_ids),
+            "admins": sorted(self._appointed),
         }
 
 

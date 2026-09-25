@@ -8,7 +8,7 @@ import time
 
 import pytest
 from aiogram import Bot
-from aiogram.methods import SendDocument, SendMessage
+from aiogram.methods import DeleteMyCommands, SendDocument, SendMessage, SetMyCommands
 from aiohttp.test_utils import TestClient, TestServer
 from test_bot_flow import FakeTelegram
 from test_web import (
@@ -91,7 +91,8 @@ async def test_overview(env):
     data = await (await env.client.get("/api/admin/overview")).json()
     assert data["stats"]["users"]["total"] == 2 and data["stats"]["users"]["connected"] == 2
     assert data["stats"]["users"]["active_today"] == 2 and len(data["stats"]["series"]) == 14
-    assert data["server"]["admins"] == [ADMIN_ID] and data["settings"]["maintenance"] is False
+    assert data["server"]["owners"] == [ADMIN_ID] and data["server"]["admins"] == []
+    assert data["settings"]["maintenance"] is False
     assert data["broadcast"]["state"] == "idle"
 
 
@@ -208,3 +209,71 @@ async def test_errors_audit_and_backup(env, tmp_path):
     assert not list(tmp_path.glob("backup-*"))
     audit = (await (await env.client.get("/api/admin/audit")).json())["entries"]
     assert audit[0]["action"] == "backup" and audit[0]["label"] == "бэкап базы"
+
+
+# ---------- назначенные админы ----------
+
+async def test_owner_appoints_and_revokes_admin(env, tmp_path):
+    c = env.client
+    friend = as_user(FRIEND_ID)
+    await c.get("/api/me", headers=friend)
+    assert (await c.get("/api/admin/overview", headers=friend)).status == 404
+
+    r = await c.post(f"/api/admin/users/{FRIEND_ID}/grant_admin")
+    body = await r.json()
+    assert r.status == 200 and body["is_admin"] and not body["is_owner"] and body["admin_granted_by"] == ADMIN_ID
+    me = await (await c.get("/api/me", headers=friend)).json()
+    assert me["is_admin"] is True and me["is_owner"] is False
+    assert (await c.get("/api/admin/overview", headers=friend)).status == 200, "права действуют сразу"
+    assert any(isinstance(m, SendMessage) and m.chat_id == FRIEND_ID and "права администратора" in m.text
+               for m in env.tg.calls)
+    assert any(isinstance(m, SetMyCommands) and m.scope.chat_id == FRIEND_ID for m in env.tg.calls)
+    team = (await (await c.get("/api/admin/admins")).json())
+    assert [(a["id"], a["owner"]) for a in team["admins"]] == [(ADMIN_ID, True), (FRIEND_ID, False)]
+    assert team["can_manage"] is True
+    listed = (await (await c.get("/api/admin/users?status=admins")).json())["users"]
+    assert {u["id"] for u in listed} == {ADMIN_ID, FRIEND_ID}
+
+    # Права сохраняются в базе и переживают перезапуск.
+    restarted = Admin(env.admin.config, env.store, env.admin.accounts, env.admin.bot)
+    assert restarted.is_admin(FRIEND_ID) and not restarted.is_owner(FRIEND_ID)
+
+    r = await c.post(f"/api/admin/users/{FRIEND_ID}/revoke_admin")
+    assert r.status == 200 and not (await r.json())["is_admin"]
+    assert (await c.get("/api/admin/overview", headers=friend)).status == 404, "и снимаются сразу"
+    assert any(isinstance(m, DeleteMyCommands) and m.scope.chat_id == FRIEND_ID for m in env.tg.calls)
+    assert [e["action"] for e in env.store.audit()][:2] == ["revoke_admin", "grant_admin"]
+
+
+async def test_appointed_admin_limits(env):
+    c = env.client
+    friend = as_user(FRIEND_ID)
+    await c.get("/api/me", headers=friend)
+    await c.get("/api/me", headers=as_user(NEWBIE_ID))
+    await c.post(f"/api/admin/users/{FRIEND_ID}/grant_admin")
+
+    r = await c.post(f"/api/admin/users/{NEWBIE_ID}/grant_admin", headers=friend)
+    assert r.status == 403 and "владелец" in (await r.json())["error"], "назначать может только владелец"
+    assert (await c.post(f"/api/admin/users/{ADMIN_ID}/revoke_admin", headers=friend)).status == 403
+    assert (await c.post("/api/admin/backup", headers=friend)).status == 403, "бэкап с токенами — только владельцу"
+    assert (await c.post(f"/api/admin/users/{ADMIN_ID}/disconnect", headers=friend)).status == 403
+    assert env.store.get_account(ADMIN_ID) is not None
+    assert (await c.post(f"/api/admin/users/{ADMIN_ID}/ban", json={}, headers=friend)).status == 400
+    team = await (await c.get("/api/admin/admins", headers=friend)).json()
+    assert team["can_manage"] is False
+    # А обычная работа админа доступна.
+    assert (await c.post(f"/api/admin/users/{NEWBIE_ID}/ban", json={}, headers=friend)).status == 200
+
+
+async def test_grant_admin_validation(env):
+    c = env.client
+    r = await c.post(f"/api/admin/users/{ADMIN_ID}/revoke_admin")
+    assert r.status == 400 and ".env" in (await r.json())["error"], "владельца из приложения не снять"
+    r = await c.post("/api/admin/users/555/grant_admin")
+    assert r.status == 400 and "не знает" in (await r.json())["error"]
+    await c.get("/api/me", headers=as_user(NEWBIE_ID))
+    await c.post(f"/api/admin/users/{NEWBIE_ID}/ban", json={})
+    r = await c.post(f"/api/admin/users/{NEWBIE_ID}/grant_admin")
+    assert r.status == 400 and "разблокируйте" in (await r.json())["error"]
+    r = await c.post(f"/api/admin/users/{FRIEND_ID}/revoke_admin")
+    assert r.status == 400

@@ -1,7 +1,8 @@
 """API админ-панели мини-приложения: /api/admin/*.
 
 Доступ проверяет auth_middleware (bot/web/app.py) до вызова любого обработчика отсюда: подпись Telegram,
-Telegram ID из ADMIN_IDS и свежесть подписи (не старше часа). Всем остальным эти адреса отвечают 404.
+Telegram ID админа (владелец из ADMIN_IDS или назначенный им) и свежесть подписи (не старше часа).
+Всем остальным эти адреса отвечают 404. Что доступно только владельцу, проверяет сам Admin (Forbidden -> 403).
 """
 
 from __future__ import annotations
@@ -11,11 +12,11 @@ from typing import Any
 from aiogram.exceptions import TelegramBadRequest
 from aiohttp import web
 
-from bot.admin import AUDIENCES, Admin
+from bot.admin import AUDIENCES, Admin, Forbidden
 from bot.web.app import CTX, USER, _json_body
 
 routes = web.RouteTableDef()
-USER_ACTIONS = {"ban", "unban", "disconnect", "reset", "message"}
+USER_ACTIONS = {"ban", "unban", "disconnect", "reset", "message", "grant_admin", "revoke_admin"}
 
 
 def _admin(request: web.Request) -> Admin:
@@ -49,20 +50,33 @@ async def users(request: web.Request) -> web.Response:
     admin = _admin(request)
     query = request.query.get("q", "").strip()[:100]
     status = request.query.get("status", "all")
-    if status not in {"all", "connected", "banned", "blocked"}:
+    if status not in {"all", "connected", "banned", "blocked", "admins"}:
         raise web.HTTPBadRequest(text="Неизвестный фильтр")
     offset = max(_int(request.query.get("offset")), 0)
-    items = admin.store.list_users(query, status, offset, 50)
+    if status == "admins":
+        items = admin.store.users_by_ids(sorted(admin.all_admin_ids()))
+        total, offset = len(items), 0
+    else:
+        items = admin.store.list_users(query, status, offset, 50)
+        total = admin.store.count_users(query, status)
     for user in items:
-        user["is_admin"] = admin.is_admin(user["id"])
-    return web.json_response({"users": items, "total": admin.store.count_users(query, status), "offset": offset})
+        _roles(admin, user)
+    return web.json_response({"users": items, "total": total, "offset": offset})
+
+
+def _roles(admin: Admin, user: dict[str, Any]) -> dict[str, Any]:
+    user["is_admin"] = admin.is_admin(user["id"])
+    user["is_owner"] = admin.is_owner(user["id"])
+    return user
 
 
 def _user_json(admin: Admin, user_id: int) -> dict[str, Any]:
     user = admin.store.get_user(user_id)
     if user is None:
         raise web.HTTPNotFound(text="Пользователь не найден")
-    user["is_admin"] = admin.is_admin(user_id)
+    _roles(admin, user)
+    granted = admin.store.get_admin(user_id) if user["is_admin"] and not user["is_owner"] else None
+    user["admin_granted_by"], user["admin_granted_at"] = granted or (None, None)
     user["downloads_left"] = admin.left(user_id, "download")
     user["uploads_left"] = admin.left(user_id, "upload")
     return user
@@ -91,11 +105,23 @@ async def user_action(request: web.Request) -> web.Response:
             request.app[CTX].invalidate(user_id)
         elif action == "reset":
             admin.reset_limits(actor, user_id)
+        elif action == "grant_admin":
+            await admin.grant_admin(actor, user_id)
+        elif action == "revoke_admin":
+            await admin.revoke_admin(actor, user_id)
         else:
             await admin.message(actor, user_id, str(body.get("text") or "")[:4000])
+    except Forbidden as e:
+        raise web.HTTPForbidden(text=str(e)) from e
     except ValueError as e:
         raise web.HTTPBadRequest(text=str(e)) from e
     return web.json_response(_user_json(admin, user_id))
+
+
+@routes.get("/api/admin/admins")
+async def admins(request: web.Request) -> web.Response:
+    admin = _admin(request)
+    return web.json_response({"admins": admin.admins(), "can_manage": admin.is_owner(_actor(request))})
 
 
 @routes.put("/api/admin/settings")
@@ -164,6 +190,8 @@ async def backup(request: web.Request) -> web.Response:
     """Копия базы уходит админу в личный чат с ботом — скачать её по ссылке нельзя."""
     try:
         size = await _admin(request).backup(_actor(request))
+    except Forbidden as e:
+        raise web.HTTPForbidden(text=str(e)) from e
     except TelegramBadRequest as e:
         raise web.HTTPBadRequest(text=f"Telegram не принял файл: {e.message}") from e
     return web.json_response({"size": size})
