@@ -346,3 +346,15 @@ async def test_live_tracking_switch_and_self_check(env):
     assert overview["listening"]["live"] == {"enabled": True, "connections": 0, "connected": 0,
                                              "health": env.admin.live_health.json()}
     assert (await c.get("/api/admin/live", headers=as_user(FRIEND_ID))).status == 404
+
+
+async def test_user_search_resists_sql_injection(env):
+    c = env.client
+    for q in ("' OR '1'='1", "x') UNION SELECT token, login FROM accounts --", "%", "1; DROP TABLE users"):
+        r = await c.get("/api/admin/users", params={"q": q})
+        data = await r.json()
+        assert r.status == 200 and data["total"] == 0 and data["users"] == [], q
+        assert "tok-owner" not in await r.text()
+    r = await c.get("/api/admin/users", params={"status": "all' OR 1=1 --"})
+    assert r.status == 400
+    assert env.store.get_account(OWNER_ID) == ("tok-owner", "me"), "таблицы и входы целы"

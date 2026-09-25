@@ -13,6 +13,38 @@ from bot.crypto import KeyMismatch, TokenCipher
 
 log = logging.getLogger(__name__)
 
+# ---------- защита от SQL-инъекций ----------
+# Главное правило: значения попадают в запрос только параметрами (?, :имя), а текст запроса собирается лишь
+# из литералов и заранее известных фрагментов. Это правило проверяет tests/test_sql_safety.py по исходникам.
+# Ниже — второй рубеж на случай, если правило когда-нибудь нарушат: после запуска соединение не может
+# подключить другой файл (ATTACH — через него инъекция в SQLite пишет файлы на диск), поменять схему,
+# настройки (PRAGMA) и загрузить расширение. Обычным запросам бота всё это после запуска не нужно.
+_DENIED_ACTIONS = {
+    getattr(sqlite3, name) for name in (
+        "SQLITE_ATTACH", "SQLITE_DETACH", "SQLITE_ALTER_TABLE", "SQLITE_REINDEX", "SQLITE_ANALYZE",
+        "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX", "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER", "SQLITE_CREATE_TEMP_VIEW", "SQLITE_CREATE_TRIGGER", "SQLITE_CREATE_VIEW",
+        "SQLITE_CREATE_VTABLE", "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE", "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TABLE", "SQLITE_DROP_TEMP_TRIGGER", "SQLITE_DROP_TEMP_VIEW", "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW", "SQLITE_DROP_VTABLE",
+    ) if hasattr(sqlite3, name)
+}
+_READABLE_PRAGMAS = {"journal_mode", "synchronous", "busy_timeout", "secure_delete", "page_count", "page_size",
+                     "freelist_count", "trusted_schema"}
+_DENIED_FUNCTIONS = {"load_extension", "fts3_tokenizer", "readfile", "writefile", "edit", "sqlite_offset"}
+
+
+def _authorizer(action: int, arg1: str | None, arg2: str | None, db_name: str | None, source: str | None) -> int:
+    if action in _DENIED_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_PRAGMA:  # arg1 — имя, arg2 — значение: читать можно, менять нельзя
+        return sqlite3.SQLITE_OK if arg2 is None and (arg1 or "").lower() in _READABLE_PRAGMAS else sqlite3.SQLITE_DENY
+    if action == getattr(sqlite3, "SQLITE_FUNCTION", -1) and (arg2 or "").lower() in _DENIED_FUNCTIONS:
+        return sqlite3.SQLITE_DENY
+    if db_name not in (None, "main", "temp"):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     user_id INTEGER PRIMARY KEY,   -- Telegram ID
@@ -152,6 +184,8 @@ class Storage:
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.execute("PRAGMA busy_timeout=5000")  # если базу держит кто-то ещё (sqlite3 в консоли) — подождать
         self._db.execute("PRAGMA secure_delete=ON")  # удалённое (входы после /logout) затирается нулями
+        # Функции и триггеры, записанные в самой базе, не выполняются с правами бота (если файл базы подменят).
+        self._db.execute("PRAGMA trusted_schema=OFF")
         # LOWER в SQLite понимает только латиницу, а искать людей нужно и по-русски.
         self._db.create_function("PYLOWER", 1, lambda v: v.lower() if isinstance(v, str) else v, deterministic=True)
         self._db.executescript(SCHEMA)
@@ -164,6 +198,16 @@ class Storage:
         self._backfill_users()
         self._encrypt_tokens()
         self._forget_unparsed_live()
+        self._lock_down()
+
+    def _lock_down(self) -> None:
+        """Схема и миграции готовы — дальше соединению можно только читать и писать строки (см. _authorizer)."""
+        if hasattr(self._db, "enable_load_extension"):
+            self._db.enable_load_extension(False)
+        if hasattr(self._db, "setlimit"):
+            self._db.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)  # другой файл не подключить вовсе
+            self._db.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 100_000)  # самый длинный запрос бота — ~2 тыс.
+        self._db.set_authorizer(_authorizer)
 
     def close(self) -> None:
         self._db.close()
