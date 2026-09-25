@@ -383,6 +383,8 @@ class LiveTracker:
 
     def user_status(self, user_id: int) -> dict[str, Any]:
         conn = self.conns.get(user_id)
+        if conn is not None:
+            conn.tracker.tick()  # позиция и «слушали» — на эту секунду, а не на прошлый цикл
         cur = conn.tracker.cur if conn else None
         return {
             "enabled": self.enabled,

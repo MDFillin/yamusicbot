@@ -24,24 +24,36 @@ _versions = iter(range(1, 10**9))
 
 
 def frame(track="1", progress=0, duration=180_000, paused=False, status_ts=1_000_000, frame_ts=None,
-          entity=("RADIO", "user:onyourwave"), camel=False, kind="TRACK", version=None):
-    """Кадр состояния, как его присылает Ynison (snake_case или camelCase, числа — строками).
+          entity=("RADIO", "user:onyourwave"), camel=False, kind="TRACK", version=None, index=1, full=False):
+    """Кадр состояния, как его присылает Ynison: protobuf-JSON — поля со значением по умолчанию (false, 0, "")
+    не передаются (full=True — передать всё), имена в snake_case или camelCase, 64-битные числа — строками.
 
     Каждый кадр — новый статус (устройство что-то поменяло), если не задать version явно."""
-    playables = [{"playable_id": "999", "playable_type": "TRACK"},
-                 {"playable_id": track, "album_id_optional": "10", "playable_type": kind, "title": "t"}]
+    playables = [{"playable_id": "999", "playable_type": "TRACK"}]
+    playables.insert(index, {"playable_id": track, "album_id_optional": "10", "playable_type": kind, "title": "t"})
     data = {
         "player_state": {
             "status": {"progress_ms": str(progress), "duration_ms": str(duration), "paused": paused,
                        "playback_speed": 1, "version": {"device_id": "phone",
                                                         "version": str(version or next(_versions)),
                                                         "timestamp_ms": str(status_ts)}},
-            "player_queue": {"entity_id": entity[1], "entity_type": entity[0], "current_playable_index": 1,
+            "player_queue": {"entity_id": entity[1], "entity_type": entity[0], "current_playable_index": index,
                              "playable_list": playables, "options": {"repeat_mode": "NONE"}},
         },
         "devices": [], "timestamp_ms": str(frame_ts if frame_ts is not None else status_ts), "rid": "r",
     }
+    data = data if full else _proto3(data)
     return _camel(data) if camel else data
+
+
+def _proto3(obj):
+    """Убрать поля со значениями по умолчанию — так их отдаёт сервер."""
+    if isinstance(obj, dict):
+        return {k: _proto3(v) for k, v in obj.items() if v not in (False, 0, "0", "", [], None)
+                or isinstance(v, dict)}
+    if isinstance(obj, list):
+        return [_proto3(x) for x in obj]
+    return obj
 
 
 def _camel(obj):
@@ -60,6 +72,44 @@ def test_parse_state(camel):
     assert snap == Snapshot(track_id="123", album_id="10", context="wave:user:onyourwave", context_type="wave",
                             progress_ms=5_000, duration_ms=180_000, paused=False, speed=1.0, status_ts=1_000_000,
                             frame_ts=1_000_000, status_key="phone:7:1000000")
+
+
+def test_default_fields_are_omitted_by_the_server():
+    """Регрессия: играющий трек приходит без "paused" — это «играет», а не «пауза»; без индекса — первый трек."""
+    raw = frame(track="42", progress=0, index=0)
+    status = raw["player_state"]["status"]
+    assert "paused" not in status and "progress_ms" not in status
+    assert "current_playable_index" not in raw["player_state"]["player_queue"]
+    snap = parse_state(raw)
+    assert snap.track_id == "42" and not snap.paused and snap.progress_ms == 0
+    assert parse_state(frame(paused=True)).paused
+    assert parse_state({"player_state": {}}).track_id is None, "пустое состояние (ничего ещё не играло)"
+    assert parse_state(frame(full=True, version=5)) == parse_state(frame(version=5)), "полный кадр — то же самое"
+
+
+def test_full_track_is_counted_from_real_frames(store):
+    """Как на сайте: трек включили (без "paused" и "progress_ms"), дослушали, включился следующий."""
+    t, c = PlayTracker(store, 1), Clock()
+    t.on_snapshot(parse_state(frame(track="1", index=0, status_ts=0, frame_ts=0)), now=c(), wall=WALL)
+    t.tick(c(30))
+    assert t.cur.playing and t.cur.listened_ms == 30_000
+    t.on_snapshot(parse_state(frame(track="2", index=1)), now=c(150), wall=WALL + 180)
+    assert plays(store) == [("1", 180_000, "live")]
+
+
+def test_marks_from_the_paused_bug_are_forgotten_once(tmp_path):
+    s = Storage(tmp_path / "bot.db")
+    s.mark_seen(1, "1", "2026-09-25")  # «видел», но не засчитал — след ошибки
+    s.add_play(1, 1, "2026-09-25", "2", "none", 100_000, "live")  # настоящее прослушивание остаётся
+    s._db.execute("DELETE FROM meta WHERE key = 'live_seen_fixed'")
+    s.close()
+    s = Storage(tmp_path / "bot.db")
+    assert s._all("SELECT track_id FROM live_seen") == [("2",)]
+    s.mark_seen(1, "3", "2026-09-25")
+    s.close()
+    s = Storage(tmp_path / "bot.db")
+    assert len(s._all("SELECT track_id FROM live_seen")) == 2, "только один раз"
+    s.close()
 
 
 def test_parse_state_edge_cases():

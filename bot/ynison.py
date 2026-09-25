@@ -7,6 +7,10 @@
 Протокол неофициальный: JSON-представление protobuf, как у официальных клиентов (сверено с модулем ynison
 библиотеки yandex-music, 2026). Имена полей бывают в snake_case и camelCase, 64-битные числа — строками,
 перечисления — именами или числами; разбор ниже терпим ко всему этому.
+
+Главное правило protobuf-JSON: поле со значением по умолчанию (false, 0, "") в кадр не попадает. Играющий трек
+приходит без "paused" (false), первый трек очереди — без "current_playable_index" (0), начало трека — без
+"progress_ms". Отсутствующее поле — это значение по умолчанию, а не «неизвестно».
 """
 
 from __future__ import annotations
@@ -142,13 +146,13 @@ def parse_state(frame: Any) -> Snapshot | None:
     player = _get(frame, "player_state")
     if player is None:
         return None
-    queue, status = _get(player, "player_queue"), _get(player, "status")
-    if not isinstance(queue, dict) or not isinstance(status, dict):
-        raise YnisonProtocolError(f"нет очереди или статуса: {json.dumps(player, ensure_ascii=False)[:300]}")
+    queue, status = _get(player, "player_queue", {}), _get(player, "status", {})
+    if not isinstance(player, dict) or not isinstance(queue, dict) or not isinstance(status, dict):
+        raise YnisonProtocolError(f"очередь или статус не объект: {json.dumps(player, ensure_ascii=False)[:300]}")
     playables = _get(queue, "playable_list") or []
     if not isinstance(playables, list):
         raise YnisonProtocolError("playable_list не список")
-    index = _int(_get(queue, "current_playable_index"), -1)
+    index = _int(_get(queue, "current_playable_index"), 0)  # нет поля — это 0, первый трек (см. вверху)
     track_id = album_id = None
     if 0 <= index < len(playables) and isinstance(playables[index], dict):
         item = playables[index]
@@ -163,7 +167,7 @@ def parse_state(frame: Any) -> Snapshot | None:
     return Snapshot(
         track_id=track_id, album_id=album_id, context=context, context_type=context_type,
         progress_ms=max(_int(_get(status, "progress_ms")), 0), duration_ms=max(_int(_get(status, "duration_ms")), 0),
-        paused=bool(_get(status, "paused", True)), speed=_float(_get(status, "playback_speed")),
+        paused=bool(_get(status, "paused", False)), speed=_float(_get(status, "playback_speed")),
         status_ts=_int(_get(version, "timestamp_ms")), frame_ts=_int(_get(frame, "timestamp_ms")),
         status_key=status_key,
     )

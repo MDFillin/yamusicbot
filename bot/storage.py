@@ -163,6 +163,7 @@ class Storage:
         self._import_json(path.with_name("storage.json"))
         self._backfill_users()
         self._encrypt_tokens()
+        self._forget_unparsed_live()
 
     def close(self) -> None:
         self._db.close()
@@ -636,6 +637,16 @@ class Storage:
 
     def set_meta(self, key: str, value: str) -> None:
         self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+    def _forget_unparsed_live(self) -> None:
+        """Однократно: в первой версии точного подсчёта играющий трек принимался за «паузу» (Ynison не присылает
+        paused=false), и треки только помечались «виденными вживую», не засчитываясь. Эти пометки убираем —
+        пусть такие дни доберутся из истории Яндекса, а не пропадут."""
+        if self.get_meta("live_seen_fixed"):
+            return
+        self._db.execute("DELETE FROM live_seen WHERE NOT EXISTS (SELECT 1 FROM plays p WHERE p.user_id = "
+                         "live_seen.user_id AND p.track_id = live_seen.track_id AND p.day = live_seen.day)")
+        self.set_meta("live_seen_fixed", "1")
 
     def _import_json(self, legacy: Path) -> None:
         """Однократно переносит настройки из прежнего storage.json (кэш file_id не переносим — он без аккаунта)."""
