@@ -653,7 +653,9 @@
   }
 
   // Столбики по дням: одна метрика за раз, подпись значения — по нажатию на столбик.
-  function barChart(series, key, title) {
+  function barChart(series, key, title, opts = {}) {
+    const tickOf = opts.tick || ((d) => `${d.day.slice(8)}.${d.day.slice(5, 7)}`);
+    const tipOf = opts.tip || ((d) => new Date(`${d.day}T12:00:00`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' }));
     const W = 336; const H = 132; const padB = 18; const padT = 14;
     const max = Math.max(1, ...series.map((d) => d[key]));
     const step = W / series.length; const bw = Math.max(4, step - 4);
@@ -662,7 +664,7 @@
     svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
     svg.setAttribute('class', 'bars');
     svg.setAttribute('role', 'img');
-    svg.setAttribute('aria-label', `${title}: ${series.map((d) => `${d.day.slice(5)} — ${d[key]}`).join(', ')}`);
+    svg.setAttribute('aria-label', `${title}: ${series.map((d) => `${tickOf(d)} — ${d[key]}`).join(', ')}`);
     const el = (tag, attrs) => { const n = document.createElementNS(NS, tag); Object.entries(attrs).forEach(([k, v]) => n.setAttribute(k, v)); return n; };
     svg.append(el('line', { x1: 0, x2: W, y1: H - padB + 0.5, y2: H - padB + 0.5, class: 'axis' }));
     const tip = h('div', { class: 'bar-tip' });
@@ -670,7 +672,7 @@
       svg.querySelectorAll('.bar').forEach((b) => b.classList.remove('on'));
       bar.classList.add('on');
       const d = series[i];
-      tip.textContent = `${new Date(`${d.day}T12:00:00`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' })}: ${fmtNum(d[key])}`;
+      tip.textContent = `${tipOf(d)}: ${fmtNum(d[key])}`;
     };
     series.forEach((d, i) => {
       const hgt = d[key] ? Math.max(3, ((H - padB - padT) * d[key]) / max) : 0;
@@ -683,14 +685,14 @@
       hit.addEventListener('click', () => { haptic.tap(); pick(i, bar); });
       hit.addEventListener('mouseenter', () => pick(i, bar));
       svg.append(bar, hit);
-      if (i === 0 || i === series.length - 1 || i === Math.floor(series.length / 2)) {
+      if (opts.allTicks || i === 0 || i === series.length - 1 || i === Math.floor(series.length / 2)) {
         const t = el('text', { x: x + bw / 2, y: H - 4, class: 'tick' });
-        t.textContent = d.day.slice(8) + '.' + d.day.slice(5, 7);
+        t.textContent = tickOf(d);
         svg.append(t);
       }
     });
-    const last = series.length - 1;
-    pick(last, svg.querySelectorAll('.bar')[last]);
+    const first = opts.initial != null && opts.initial >= 0 ? opts.initial : series.length - 1;
+    pick(first, svg.querySelectorAll('.bar')[first]);
     return h('div', { class: 'chart' }, svg, tip);
   }
 
@@ -727,7 +729,7 @@
     async function overview() {
       const data = await api('/api/admin/overview');
       if (!alive() || tab !== 'overview') return;
-      const { stats: st, server: sv, settings: cfg, broadcast: bc, upload_health: uh } = data;
+      const { stats: st, server: sv, settings: cfg, broadcast: bc, upload_health: uh, listening: ls } = data;
       const u = st.users;
       const banners = [];
       if (uh.broken) {
@@ -736,6 +738,12 @@
             'Похоже, Яндекс изменил сайт. Обновите бота (git pull), а если не поможет — запустите на сервере ',
             h('code', {}, 'docker compose run --rm bot python -m bot.diag_upload'), '.',
             uh.last_error_text ? h('div', { class: 'banner-detail' }, uh.last_error_text) : null)));
+      }
+      if (ls.health.broken) {
+        banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'),
+          h('div', {}, h('b', {}, `Статистика прослушиваний не обновляется с ${fmtStamp(ls.health.broken_since)}. `),
+            'Похоже, Яндекс изменил историю прослушивания. Обновите бота (git pull). Собранное раньше сохранено.',
+            ls.health.last_error_text ? h('div', { class: 'banner-detail' }, ls.health.last_error_text) : null)));
       }
       if (cfg.maintenance) banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'), 'Включены техработы — бот отвечает только вам'));
       if (cfg.closed) banners.push(h('div', { class: 'adm-banner' }, icon('lock', 'sm'), 'Регистрация закрыта — новые пользователи не допускаются'));
@@ -769,12 +777,30 @@
         group('Сервер', h('div', { class: 'card set-card kvs' },
           kv('Работает', fmtUptime(sv.uptime)), kv('Память', sv.memory_mb ? `${sv.memory_mb} МБ` : '—'),
           kv('Загрузка в Яндекс', uh.broken ? '❌ не работает' : uh.last_ok ? `✅ работает · ${fmtAgo(uh.last_ok)}` : 'ещё не было'),
+          kv('Статистика прослушиваний', `${fmtNum(ls.users)} чел. · ${ls.health.broken ? '❌ не обновляется' : ls.health.last_ok ? `✅ ${fmtAgo(ls.health.last_ok)}` : 'ещё не собиралась'}`),
           kv('База', fmtSize(sv.db_bytes)), kv('Свободно на диске', `${fmtSize(sv.disk_free)} из ${fmtSize(sv.disk_total)}`),
           kv('Клиентов Яндекса в памяти', fmtNum(sv.clients)), kv('ffmpeg', sv.ffmpeg || 'не установлен'),
           kv('Python / aiogram', `${sv.python} / ${sv.aiogram}`), kv('Бот', sv.bot_username ? `@${sv.bot_username}` : '—'),
           kv('Инлайн-режим', sv.inline ? 'включён' : sv.inline === false ? 'выключен в @BotFather' : '—'),
           kv('Владельцы (.env)', String(sv.owners.length)), kv('Назначенные админы', String(sv.admins.length))),
-        isOwner() ? backupBtn : null));
+        isOwner() ? backupBtn : null,
+        h('button', { class: 'btn secondary block', onclick: historyRaw }, icon('list', 'sm'), 'Моя история Яндекса (проверка)')));
+    }
+
+    // Сырая история своего аккаунта: сверить, что бот считает так же, как показывает Яндекс.
+    async function historyRaw() {
+      let data;
+      try { data = await api('/api/admin/history_raw'); } catch (e) { fail(e); return; }
+      openSheet([
+        h('div', { class: 'sheet-title' }, 'История Яндекса'),
+        h('div', { class: 'sheet-note' }, `Бот разобрал ${data.listens} ${plural(data.listens, 'запись', 'записи', 'записей')} (трек + источник) по дням. Сравните с разделом «История» в приложении Яндекс Музыки.`),
+        h('div', { class: 'card set-card kvs' }, data.days.length
+          ? data.days.map((d) => h('div', { class: 'kv' }, h('span', {}, new Date(`${d.date}T12:00:00`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', weekday: 'short' })),
+            h('b', {}, `${d.unique} ${plural(d.unique, 'трек', 'трека', 'треков')}`)))
+          : h('div', { class: 'kv' }, h('span', {}, 'Яндекс не вернул ни одного дня'))),
+        h('details', { class: 'card log' }, h('summary', {}, h('b', {}, 'Ответ Яндекса как есть'), h('span', {}, data.raw_truncated ? 'первые 60 000 символов' : 'полностью')),
+          h('pre', {}, data.raw)),
+      ]);
     }
 
     // ----- пользователи -----
@@ -1174,12 +1200,16 @@
       h('button', { class: 'tile-play', 'aria-label': 'Слушать', onclick: (e) => { e.stopPropagation(); haptic.tap(); playSource('likes', '', true); } },
         icon('play')));
     const grid = h('div', { class: 'grid' }, skTiles(4));
+    const statsTile = h('button', { class: 'row stats-tile', onclick: () => { haptic.tap(); openStats('week'); } },
+      h('span', { class: 'set-icon' }, icon('chart', 'sm')),
+      h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Моя статистика'),
+        h('div', { class: 'sub' }, 'Итоги дня, недели и месяца по истории Яндекса')), icon('chevron', 'sm'));
 
     root.append(
       h('div', { class: 'lib-head' },
         h('div', {}, h('div', { class: 'hello' }, name ? `Привет, ${name} 👋` : 'Привет 👋'), h('h1', { class: 'page-title' }, 'Медиатека')),
         h('div', { class: 'head-btns' }, shield, gear)),
-      chip, likes,
+      chip, likes, statsTile,
       h('div', { class: 'section-head' }, h('h2', {}, 'Мои плейлисты'),
         h('button', { class: 'link-btn', onclick: () => createPlaylistSheet() }, icon('plus', 'sm'), 'Создать')),
       grid);
@@ -1208,6 +1238,139 @@
     };
     if (state.libraryLoaded) draw();
     refresh();
+  }
+
+  // ---------- экран: статистика прослушиваний ----------
+  const KIND_LABELS = [['day', 'День'], ['week', 'Неделя'], ['month', 'Месяц'], ['year', 'Год']];
+  // Для плитки: от 10 часов минуты уже не важны (и не помещаются).
+  const fmtMinutes = (m) => { const hh = Math.floor(m / 60); const mm = m % 60; if (hh >= 10) return `${Math.round(m / 60)} ч`; return hh ? (mm ? `${hh} ч ${mm} мин` : `${hh} ч`) : `${mm} мин`; };
+  const PREF_LABELS = [['day', 'Итоги дня', 'каждый вечер в 22:00'], ['week', 'Итоги недели', 'в воскресенье в 21:00'],
+    ['month', 'Итоги месяца', '1-го числа за прошлый месяц']];
+
+  function openStats(kind) {
+    if (state.tab !== 'library') setTab('library');
+    if (top() && top().kind === 'stats') return;
+    push((root, alive, entry) => statsView(root, alive, entry, kind));
+  }
+
+  function statsView(root, alive, entry, initialKind = 'week') {
+    entry.kind = 'stats';
+    let kind = ['day', 'week', 'month', 'year'].includes(initialKind) ? initialKind : 'week';
+    let offset = 0;
+    const body = h('div', { class: 'stats-body' }, h('div', { class: 'empty' }, spinner()));
+    root.append(h('div', { class: 'lib-head' }, h('div', {},
+      h('div', { class: 'hello' }, 'По истории Яндекс Музыки'), h('h1', { class: 'page-title' }, 'Статистика')),
+    h('span', { class: 'gear-btn adm-shield' }, icon('chart'))), body);
+
+    let seq = 0;
+    async function load() {
+      const my = ++seq;
+      const data = await api(`/api/stats?kind=${kind}&offset=${offset}`);
+      if (!alive() || my !== seq) return;
+      if (!data.enabled) put(body, intro());
+      else put(body, view(data));
+    }
+    const reload = () => load().catch((e) => { if (alive()) put(body, emptyEl('alert', e.message)); });
+
+    function intro() {
+      const btn = h('button', { class: 'btn block', onclick: async () => {
+        btn.disabled = true;
+        put(btn, spinner(), 'Забираю историю из Яндекс Музыки…');
+        try { await api('/api/stats', { method: 'PUT', body: { enabled: true } }); haptic.ok(); await load(); } catch (e) { fail(e); btn.disabled = false; put(btn, 'Включить статистику'); }
+      } }, 'Включить статистику');
+      return h('div', { class: 'card set-card stats-intro' },
+        h('div', { class: 'stats-intro-icon' }, icon('chart')),
+        h('b', {}, 'Итоги прослушиваний — когда захотите, а не раз в год'),
+        h('ul', { class: 'perks' },
+          h('li', {}, icon('headphones', 'sm'), 'Что и сколько вы слушаете: в приложении, на сайте и на колонке'),
+          h('li', {}, icon('user', 'sm'), 'Любимые исполнители, треки, альбомы и жанры'),
+          h('li', {}, icon('sparkle', 'sm'), 'Новые открытия и серии дней с музыкой'),
+          h('li', {}, icon('send', 'sm'), 'Итоги недели и месяца — сообщением в чат')),
+        h('div', { class: 'set-note' }, 'Бот раз в час забирает вашу историю из Яндекс Музыки. Яндекс хранит её недолго, '
+          + 'поэтому статистика копится с момента включения. Выключить и удалить её можно в любой момент.'),
+        btn);
+    }
+
+    function view(data) {
+      const st = data.stats;
+      const seg = segmented(KIND_LABELS, kind, (v) => { kind = v; offset = 0; reload(); });
+      const nav = h('div', { class: 'period-nav' },
+        h('button', { class: 'icon-btn', 'aria-label': 'Раньше', onclick: () => { offset -= 1; haptic.tap(); reload(); } }, h('span', { class: 'flip' }, icon('chevron'))),
+        h('div', { class: 'period-title' }, data.period.title),
+        h('button', { class: 'icon-btn', 'aria-label': 'Позже', disabled: offset >= 0, onclick: () => { if (offset < 0) { offset += 1; haptic.tap(); reload(); } } }, icon('chevron')));
+      const parts = [seg, nav];
+      if (!st.plays) {
+        parts.push(emptyEl('headphones', offset === 0
+          ? 'Пока пусто. Слушайте музыку в Яндекс Музыке — в приложении, на сайте или на колонке. История обновляется раз в час.'
+          : 'За этот период прослушиваний нет'));
+      } else {
+        const change = st.change_pct == null || kind === 'day' ? 'первый период' : `${st.change_pct >= 0 ? '▲' : '▼'} ${Math.abs(st.change_pct)}% к прошлому`;
+        parts.push(h('div', { class: 'stat-grid' },
+          statTile('music', 'Прослушано', fmtNum(st.plays), `${plural(st.plays, 'трек', 'трека', 'треков')} · ${change}`),
+          statTile('clock', 'Время', `≈ ${fmtMinutes(st.minutes)}`, kind === 'day' ? 'по длительности треков' : `дней с музыкой: ${st.active_days} из ${st.days}`),
+          statTile('user', 'Исполнителей', fmtNum(st.artists), st.new_artists_count ? `🆕 ${st.new_artists_count} новых` : `${fmtNum(st.tracks)} разных треков`),
+          statTile('sparkle', 'Открытия', st.new_tracks == null ? '—' : fmtNum(st.new_tracks), st.new_tracks == null ? 'считаем со следующего периода' : 'треков впервые')));
+        if (st.streak >= 2) parts.push(h('div', { class: 'adm-banner streak' }, h('span', { class: 'fire' }, '🔥'), `${st.streak} ${plural(st.streak, 'день', 'дня', 'дней')} подряд с музыкой`));
+        if (kind !== 'day') {
+          // Подсказка сразу на сегодняшнем дне (в году — на текущем месяце), а не на пустом будущем.
+          const initial = st.series.map((d) => d.day <= data.period.today).lastIndexOf(true);
+          const opts = kind === 'year'
+            ? { tick: (d) => d.label, tip: (d) => new Date(`${d.day}T12:00:00`).toLocaleDateString('ru-RU', { month: 'long' }), allTicks: true, initial }
+            : { initial };
+          parts.push(group(kind === 'year' ? 'По месяцам' : 'По дням', h('div', { class: 'card set-card' }, barChart(st.series, 'plays', 'Прослушивания', opts))));
+        }
+        if (st.top_artists.length) {
+          const max = st.top_artists[0].plays;
+          parts.push(group('Топ исполнителей', h('div', { class: 'card list' }, st.top_artists.slice(0, 10).map((a, i) => h('div', { class: 'row rank-row' },
+            h('span', { class: 'rank' }, String(i + 1)),
+            h('div', { class: 'meta' }, h('div', { class: 'title' }, a.name || '—'),
+              h('div', { class: 'share' }, h('div', { style: `width:${Math.max(4, Math.round((100 * a.plays) / max))}%` }))),
+            h('span', { class: 'num' }, fmtNum(a.plays)))))));
+        }
+        if (data.top_tracks.length) {
+          const ctx = { tracks: data.top_tracks };
+          parts.push(group(kind === 'day' ? 'Треки дня' : 'Топ треков — по числу дней', h('div', { class: 'card list' }, data.top_tracks.map((t) => trackRow(t, ctx)))));
+        }
+        if (st.genres.length) {
+          parts.push(group('Жанры', h('div', { class: 'card set-card' }, st.genres.map((g) => shareRow(g.label, g.pct)))));
+        }
+        if (st.sources.length) {
+          parts.push(group('Откуда слушаете', h('div', { class: 'card set-card' }, st.sources.map((x) => shareRow(x.label, x.pct)),
+            st.top_sources.length ? h('div', { class: 'set-note' }, `Чаще всего: ${st.top_sources.slice(0, 3).map((x) => x.title || x.type).join(', ')}`) : null)));
+        }
+        if (st.new_artists && st.new_artists.length) {
+          parts.push(group('Открытия', h('div', { class: 'chips new-artists' }, st.new_artists.map((a) => h('span', { class: 'chip' }, icon('sparkle', 'sm'), a.name)))));
+        }
+        if (st.collecting) parts.push(h('div', { class: 'set-note' }, 'Статистика только начала собираться — новые открытия и сравнение появятся со следующего периода.'));
+      }
+      parts.push(settingsBox(data));
+      return parts;
+    }
+
+    function shareRow(label, pct) {
+      return h('div', { class: 'share-row' }, h('div', { class: 'share-head' }, h('span', {}, label), h('b', {}, `${pct}%`)),
+        h('div', { class: 'share' }, h('div', { style: `width:${Math.max(2, pct)}%` })));
+    }
+
+    function settingsBox(data) {
+      const setPref = (key) => async (value) => {
+        try { data.prefs = (await api('/api/stats', { method: 'PUT', body: { [key]: value } })).prefs; } catch (e) { fail(e); }
+      };
+      const syncBtn = h('button', { class: 'row set-row', onclick: async () => {
+        try { const r = await api('/api/stats/sync', { method: 'POST' }); haptic.ok(); toast(r.added ? `Новых прослушиваний: ${r.added}` : 'Новых прослушиваний нет'); reload(); } catch (e) { fail(e); }
+      } }, h('span', { class: 'set-icon' }, icon('refresh', 'sm')), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Обновить сейчас'),
+        h('div', { class: 'sub' }, 'Обычно история обновляется сама раз в час')));
+      const off = h('button', { class: 'row set-row danger', onclick: async () => {
+        if (!(await confirmAsk('Выключить статистику и удалить всю собранную историю? Вернуть её не получится.'))) return;
+        try { await api('/api/stats', { method: 'DELETE' }); toast('Статистика выключена, история удалена'); reload(); } catch (e) { fail(e); }
+      } }, h('span', { class: 'set-icon' }, icon('trash', 'sm')), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Выключить и удалить историю')));
+      return group('Итоги в чат', h('div', { class: 'card list' },
+        PREF_LABELS.map(([key, title, sub]) => toggleRow(key === 'day' ? 'clock' : 'send', title, sub, data.prefs[key], setPref(key))),
+        syncBtn, off));
+    }
+
+    entry.onShow = () => { if (offset === 0) reload(); };
+    reload();
   }
 
   // ---------- экран: список треков (плейлист, альбом, артист, лайки) ----------
@@ -2179,7 +2342,9 @@
     $('#tabs').hidden = false;
     document.body.classList.remove('no-tabs');
     setTab('library');
+    const wantsStats = new URLSearchParams(location.search).get('stats');
     if (wantsAdmin) openAdmin();
+    else if (wantsStats) openStats(wantsStats);
   }
 
   // fxTunnel показывает страницу-предупреждение при заходе на поддомен и после «Продолжить» помнит

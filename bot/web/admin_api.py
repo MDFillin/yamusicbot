@@ -7,6 +7,7 @@ Telegram ID админа (владелец из ADMIN_IDS или назначе�
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from aiogram.exceptions import TelegramBadRequest
@@ -43,6 +44,33 @@ async def overview(request: web.Request) -> web.Response:
         "settings": admin.settings_json(),
         "broadcast": admin.broadcaster.status,
         "upload_health": admin.upload_health_json(),
+        "listening": {"users": len(admin.store.stats_users()), "health": admin.history_health.json()},
+    })
+
+
+@routes.get("/api/admin/history_raw")
+async def history_raw(request: web.Request) -> web.Response:
+    """История прослушивания своего аккаунта как её отдаёт Яндекс — чтобы сверить, что бот считает верно."""
+    from bot.listening import parse_history
+
+    admin = _admin(request)
+    ym = await admin.accounts.get(_actor(request))
+    if ym is None:
+        raise web.HTTPBadRequest(text="Подключите свой аккаунт Яндекса — показываю только вашу историю")
+    raw = await ym.music_history_raw()
+    listens = parse_history(await ym.music_history())
+    days: dict[str, dict[str, int]] = {}
+    for x in listens:
+        d = days.setdefault(x.day, {"tracks": 0, "unique": 0})
+        d["tracks"] += 1
+    for day in days:
+        days[day]["unique"] = len({x.track_id for x in listens if x.day == day})
+    text = json.dumps(raw, ensure_ascii=False, indent=1)
+    return web.json_response({
+        "days": [{"date": d, **v} for d, v in sorted(days.items(), reverse=True)],
+        "listens": len(listens),
+        "raw": text[:60000],
+        "raw_truncated": len(text) > 60000,
     })
 
 

@@ -6,6 +6,7 @@ COMMANDS = [
     BotCommand(command="app", description="🎧 Открыть медиатеку"),
     BotCommand(command="likes", description="❤️ Мне нравится"),
     BotCommand(command="playlists", description="📃 Мои плейлисты"),
+    BotCommand(command="stats", description="📊 Моя статистика прослушиваний"),
     BotCommand(command="target", description="📌 Плейлист по умолчанию для загрузки"),
     BotCommand(command="newplaylist", description="➕ Создать плейлист"),
     BotCommand(command="menu", description="🏠 Главное меню"),

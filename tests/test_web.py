@@ -93,6 +93,13 @@ class FakeYM:
         self.calls.append(("likes",))
         return self.likes
 
+    async def music_history(self):
+        from bot.listening import msk_now
+        self.calls.append(("music_history",))
+        wave = NS(type="wave", data=NS(item_id=NS(seeds=["user:onyourwave"]), full_model=None))
+        tracks = [NS(type="track", data=NS(item_id=NS(track_id=t, album_id="10"), full_model=None)) for t in ("1", "2")]
+        return NS(history_tabs=[NS(date=msk_now().date().isoformat(), items=[NS(context=wave, tracks=tracks)])])
+
     async def get_playlist(self, kind, owner=None):
         self.calls.append(("get_playlist", int(kind)))
         return self.playlist if int(kind) == self.playlist.kind else None
@@ -626,3 +633,34 @@ async def test_uploads_are_queued_per_user(env):
     assert [r.status for r in replies] == [200, 200, 200]
     assert peak["me"] == 1, "свои файлы — по одному"
     assert peak["all"] == 2, "а разные люди загружают одновременно"
+
+
+# ---------- статистика прослушиваний ----------
+
+async def test_stats_api(env):
+    c = env.client
+    assert (await (await c.get("/api/stats")).json()) == {
+        "enabled": False, "prefs": {"day": False, "week": True, "month": True}}
+    r = await c.put("/api/stats", json={"enabled": True})
+    assert (await r.json())["enabled"] is True
+    data = await (await c.get("/api/stats?kind=week")).json()
+    assert data["stats"]["plays"] == 2 and data["stats"]["artists"] == 1
+    assert data["period"]["offset"] == 0 and data["period"]["today"]
+    assert [t["title"] for t in data["top_tracks"]] == ["Кукушка", "Группа крови"] or \
+        {t["title"] for t in data["top_tracks"]} == {"Кукушка", "Группа крови"}
+    assert all(t["stream"].startswith("/media/stream/") for t in data["top_tracks"]), "треки сразу можно слушать"
+    assert (await c.get("/api/stats?kind=decade")).status == 400
+
+    friend = await (await c.get("/api/stats", headers=as_user(FRIEND_ID))).json()
+    assert friend["enabled"] is False, "у каждого своя статистика"
+
+    r = await c.post("/api/stats/sync")
+    assert r.status == 429, "только что обновляли"
+    for enabled in (False, True, False, True):  # выключить-включить подряд
+        await c.put("/api/stats", json={"enabled": enabled})
+    assert env.ym.calls.count(("music_history",)) == 1, "повторное включение не дёргает Яндекс чаще раза в минуту"
+    r = await c.put("/api/stats", json={"day": True})
+    assert (await r.json())["prefs"]["day"] is True
+    r = await c.delete("/api/stats")
+    assert (await r.json())["deleted"] == 2
+    assert (await (await c.get("/api/stats")).json())["enabled"] is False

@@ -33,6 +33,7 @@ from bot.config import Config, ConfigError, load_config
 from bot.crypto import TokenCipher
 from bot.handlers import build_router
 from bot.handlers.upload import UploadQueue
+from bot.listening import Listening
 from bot.middlewares import AccessMiddleware, AccountMiddleware
 from bot.placer import TopPlacer
 from bot.sender import TrackSender
@@ -64,14 +65,17 @@ def build_bot(config: Config) -> Bot:
 
 
 def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Storage,
-                       placer: TopPlacer | None = None, admin: Admin | None = None) -> dict[str, Any]:
+                       placer: TopPlacer | None = None, admin: Admin | None = None,
+                       listening: Listening | None = None) -> dict[str, Any]:
     """Объекты, которые aiogram подставляет в обработчики по имени аргумента (ym — AccountMiddleware)."""
     admin = admin or Admin(config, store, accounts, bot)
+    listening = listening or Listening(store, accounts, admin, bot, config)
     return {
         "config": config,
         "accounts": accounts,
         "store": store,
         "admin": admin,
+        "listening": listening,
         "sender": TrackSender(bot, store, config, admin),
         "uploads": UploadQueue(admin),
         "placer": placer or TopPlacer(),
@@ -79,8 +83,10 @@ def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Stor
 
 
 def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storage,
-                     placer: TopPlacer | None = None, admin: Admin | None = None) -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage(), **build_dependencies(config, bot, accounts, store, placer, admin))
+                     placer: TopPlacer | None = None, admin: Admin | None = None,
+                     listening: Listening | None = None) -> Dispatcher:
+    dp = Dispatcher(storage=MemoryStorage(),
+                    **build_dependencies(config, bot, accounts, store, placer, admin, listening))
 
     # Кто пользуется ботом; заблокированных, а в техработы — всех, кроме админов, дальше не пускаем.
     dp.update.outer_middleware(AccessMiddleware())
@@ -121,8 +127,9 @@ def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storag
 
 
 async def start_web(config: Config, bot: Bot, accounts: Accounts, store: Storage,
-                    sender: TrackSender, placer: TopPlacer, admin: Admin) -> web.AppRunner:
-    runner = web.AppRunner(create_app(config, bot, accounts, store, sender, placer, admin), access_log=None)
+                    sender: TrackSender, placer: TopPlacer, admin: Admin, listening: Listening) -> web.AppRunner:
+    app = create_app(config, bot, accounts, store, sender, placer, admin, listening)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, config.web_host, config.web_port).start()
     log.info("Мини-приложение слушает http://%s:%s (публичный адрес: %s)",
@@ -214,8 +221,10 @@ async def main() -> None:
         log.info("ADMIN_IDS не задан — админ-панель выключена. Свой Telegram ID можно узнать у @userinfobot")
     if not me.supports_inline_queries:
         log.info("Инлайн-режим выключен: включите его в @BotFather (/setinline и /setinlinefeedback)")
-    dp = build_dispatcher(config, bot, accounts, store, placer, admin)
-    runner = await start_web(config, bot, accounts, store, dp["sender"], placer, admin)
+    listening = Listening(store, accounts, admin, bot, config)  # статистика прослушиваний: сбор и итоги
+    dp = build_dispatcher(config, bot, accounts, store, placer, admin, listening)
+    runner = await start_web(config, bot, accounts, store, dp["sender"], placer, admin, listening)
+    listening.start()
     try:
         await bot.set_my_commands(COMMANDS)
         await setup_admin_commands(bot, admin)
@@ -223,6 +232,7 @@ async def main() -> None:
         await setup_description(bot)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        await listening.close()
         await runner.cleanup()
         await placer.close()
         await accounts.close()

@@ -58,8 +58,8 @@ ADMIN_GRANTED = ("🛡 Вам выданы права администратор
 ADMIN_REVOKED = "Права администратора бота сняты."
 
 
-UPLOAD_ALERT_STREAK = 3  # неудач подряд без единой успешной загрузки — считаем, что Яндекс всё сломал
-UPLOAD_ALERT_USERS = 2  # …или неудачи у стольких разных людей
+API_ALERT_STREAK = 3  # неудач подряд без единой успешной загрузки — считаем, что Яндекс всё сломал
+API_ALERT_USERS = 2  # …или неудачи у стольких разных людей
 UPLOAD_BROKEN = (
     "⚠️ <b>Загрузка треков в Яндекс Музыку перестала работать</b>\n\n"
     "Похоже, Яндекс изменил свой сайт: загрузка держится на его неофициальном API. Последний ответ:\n"
@@ -71,6 +71,61 @@ UPLOAD_BROKEN = (
     "Остальное работает как обычно. Когда загрузка снова заработает, я напишу."
 )
 UPLOAD_FIXED = "✅ Загрузка треков в Яндекс Музыку снова работает."
+HISTORY_BROKEN = (
+    "⚠️ <b>Статистика прослушиваний перестала обновляться</b>\n\n"
+    "Похоже, Яндекс изменил историю прослушивания (это неофициальный API). Последний ответ:\n"
+    "<code>{details}</code>\n\n"
+    "Обновите бота — возможно, исправление уже есть: <code>git pull &amp;&amp; docker compose up -d --build</code>\n"
+    "Уже собранная статистика сохранена. Когда сбор снова заработает, я напишу."
+)
+HISTORY_FIXED = "✅ Статистика прослушиваний снова обновляется."
+
+
+class ApiHealth:
+    """Следит за неофициальным API Яндекса: сбои, по которым видно, что Яндекс его изменил, — отдельно от проблем
+    конкретного человека. После API_ALERT_STREAK сбоев подряд или сбоев у API_ALERT_USERS разных людей
+    владельцы получают одно сообщение, а после первого успеха — что всё снова работает."""
+
+    def __init__(self, admin: Admin, key: str, broken_text: str, fixed_text: str) -> None:
+        self._admin, self._key = admin, key
+        self._broken_text, self._fixed_text = broken_text, fixed_text
+        try:
+            self.state: dict[str, Any] = json.loads(admin.store.get_meta(key) or "{}")
+        except ValueError:
+            self.state = {}
+
+    def _save(self) -> None:
+        self._admin.store.set_meta(self._key, json.dumps(self.state, ensure_ascii=False))
+
+    async def succeeded(self) -> None:
+        h = self.state
+        was_broken = h.get("broken", False)
+        if h.get("streak") or was_broken or not h.get("last_ok") or time.time() - h["last_ok"] > 60:
+            h.update(last_ok=int(time.time()), streak=0, users=[], broken=False)
+            self._save()
+        if was_broken:
+            log.info("%s: снова работает", self._key)
+            await self._admin.tell_owners(self._fixed_text)
+
+    async def failed(self, user_id: int, details: str) -> None:
+        h = self.state
+        users = set(h.get("users", [])) | {user_id}
+        h.update(last_error=int(time.time()), last_error_text=details[:500], streak=h.get("streak", 0) + 1,
+                 users=sorted(users)[:10])
+        alert = not h.get("broken") and (h["streak"] >= API_ALERT_STREAK or len(users) >= API_ALERT_USERS)
+        if alert:
+            h["broken"], h["broken_since"] = True, int(time.time())
+        self._save()
+        log.error("%s: неофициальный API Яндекса не отвечает как раньше (подряд: %s): %s", self._key, h["streak"],
+                  details)
+        if alert:
+            await self._admin.tell_owners(self._broken_text.format(details=html.escape(details[:400])))
+
+    def json(self) -> dict[str, Any]:
+        h = self.state
+        return {"broken": h.get("broken", False), "broken_since": h.get("broken_since"), "last_ok": h.get("last_ok"),
+                "last_error": h.get("last_error"), "last_error_text": h.get("last_error_text"),
+                "streak": h.get("streak", 0)}
 
 
 class Forbidden(PermissionError):
@@ -267,10 +322,8 @@ class Admin:
         self._probes: dict[int, float] = {}
         self._ffmpeg_version: str | None = None
         self._appointed = store.admin_ids() - set(config.admin_ids)
-        try:
-            self.upload_health: dict[str, Any] = json.loads(store.get_meta("upload_health") or "{}")
-        except ValueError:
-            self.upload_health = {}
+        self.upload_health = ApiHealth(self, "upload_health", UPLOAD_BROKEN, UPLOAD_FIXED)
+        self.history_health = ApiHealth(self, "history_health", HISTORY_BROKEN, HISTORY_FIXED)
 
     # ---------- доступ ----------
 
@@ -544,42 +597,20 @@ class Admin:
 
     # ---------- здоровье загрузки в Яндекс ----------
 
-    def _save_upload_health(self) -> None:
-        self.store.set_meta("upload_health", json.dumps(self.upload_health, ensure_ascii=False))
-
     async def upload_succeeded(self) -> None:
-        h = self.upload_health
-        was_broken = h.get("broken", False)
-        h.update(last_ok=int(time.time()), streak=0, users=[], broken=False)
-        self._save_upload_health()
-        if was_broken:
-            log.info("Загрузка в Яндекс снова работает")
-            await self._tell_owners(UPLOAD_FIXED)
+        await self.upload_health.succeeded()
 
     async def upload_failed(self, user_id: int, details: str) -> None:
         """Адрес загрузки ответил не так, как раньше. Если это повторяется — сообщаем владельцам (один раз)."""
-        h = self.upload_health
-        users = set(h.get("users", [])) | {user_id}
-        h.update(last_error=int(time.time()), last_error_text=details[:500], streak=h.get("streak", 0) + 1,
-                 users=sorted(users)[:10])
-        alert = not h.get("broken") and (h["streak"] >= UPLOAD_ALERT_STREAK or len(users) >= UPLOAD_ALERT_USERS)
-        if alert:
-            h["broken"], h["broken_since"] = True, int(time.time())
-        self._save_upload_health()
-        log.error("Адрес загрузки Яндекса не работает (подряд: %s): %s", h["streak"], details)
-        if alert:
-            await self._tell_owners(UPLOAD_BROKEN.format(details=html.escape(details[:400])))
+        await self.upload_health.failed(user_id, details)
 
-    async def _tell_owners(self, text: str) -> None:
+    async def tell_owners(self, text: str) -> None:
         for owner in self.config.admin_ids:
             with contextlib.suppress(Exception):
                 await self.bot.send_message(owner, text, disable_web_page_preview=True)
 
     def upload_health_json(self) -> dict[str, Any]:
-        h = self.upload_health
-        return {"broken": h.get("broken", False), "broken_since": h.get("broken_since"), "last_ok": h.get("last_ok"),
-                "last_error": h.get("last_error"), "last_error_text": h.get("last_error_text"),
-                "streak": h.get("streak", 0)}
+        return self.upload_health.json()
 
     # ---------- статистика ----------
 

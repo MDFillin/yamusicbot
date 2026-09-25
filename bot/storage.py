@@ -79,6 +79,37 @@ CREATE TABLE IF NOT EXISTS admins (
     granted_by INTEGER NOT NULL,
     granted_at INTEGER NOT NULL
 );
+-- Статистика прослушиваний: история Яндекса, собранная ботом (день, трек, откуда играл).
+CREATE TABLE IF NOT EXISTS listens (
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,             -- ГГГГ-ММ-ДД, как в истории Яндекса
+    track_id TEXT NOT NULL,
+    context TEXT NOT NULL,         -- album:ID | playlist:UID:KIND | artist:ID | wave:SEEDS | none
+    PRIMARY KEY (user_id, day, track_id, context)
+);
+CREATE TABLE IF NOT EXISTS track_meta (
+    track_id TEXT PRIMARY KEY,
+    title TEXT,
+    album_id TEXT,
+    album TEXT,
+    genre TEXT,
+    duration_ms INTEGER,
+    cover_uri TEXT
+);
+CREATE TABLE IF NOT EXISTS track_artists (
+    track_id TEXT NOT NULL,
+    pos INTEGER NOT NULL,
+    artist_id TEXT NOT NULL,
+    name TEXT,
+    PRIMARY KEY (track_id, pos)
+);
+CREATE TABLE IF NOT EXISTS contexts (
+    key TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    title TEXT
+);
+CREATE INDEX IF NOT EXISTS listens_user_track ON listens (user_id, track_id);
+CREATE INDEX IF NOT EXISTS track_artists_artist ON track_artists (artist_id);
 CREATE INDEX IF NOT EXISTS users_last_seen ON users (last_seen);
 CREATE INDEX IF NOT EXISTS activity_day ON activity (day);
 CREATE INDEX IF NOT EXISTS counters_day ON counters (day, key);
@@ -393,6 +424,131 @@ class Storage:
             return []
         marks = ",".join("?" * len(ids))
         return self._users(f"WHERE u.user_id IN ({marks}) ORDER BY u.last_seen DESC", tuple(ids), len(ids))
+
+    # ---------- статистика прослушиваний ----------
+
+    def add_listens(self, user_id: int, rows: list[tuple[str, str, str]]) -> int:
+        """rows: (день, трек, контекст). Возвращает, сколько записей новых."""
+        before = self._db.total_changes
+        self._db.execute("BEGIN")
+        try:
+            self._db.executemany("INSERT OR IGNORE INTO listens (user_id, day, track_id, context) VALUES (?, ?, ?, ?)",
+                                 [(user_id, *r) for r in rows])
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+        return self._db.total_changes - before
+
+    def known_tracks(self, track_ids: list[str]) -> set[str]:
+        found: set[str] = set()
+        for i in range(0, len(track_ids), 500):
+            chunk = track_ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            found |= {r[0] for r in self._all(f"SELECT track_id FROM track_meta WHERE track_id IN ({marks})", *chunk)}
+        return found
+
+    def save_track_meta(self, track_id: str, title: str | None, album_id: str | None, album: str | None,
+                        genre: str | None, duration_ms: int | None, cover_uri: str | None,
+                        artists: list[tuple[str, str | None]]) -> None:
+        self._db.execute("INSERT OR REPLACE INTO track_meta VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (track_id, title, album_id, album, genre, duration_ms, cover_uri))
+        self._db.execute("DELETE FROM track_artists WHERE track_id = ?", (track_id,))
+        self._db.executemany("INSERT INTO track_artists VALUES (?, ?, ?, ?)",
+                             [(track_id, i, artist_id, name) for i, (artist_id, name) in enumerate(artists)])
+
+    def unknown_contexts(self, keys: list[str]) -> list[str]:
+        known: set[str] = set()
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            known |= {r[0] for r in self._all(f"SELECT key FROM contexts WHERE key IN ({marks})", *chunk)}
+        return [k for k in keys if k not in known]
+
+    def save_context(self, key: str, type_: str, title: str | None) -> None:
+        self._db.execute("INSERT OR REPLACE INTO contexts VALUES (?, ?, ?)", (key, type_, title))
+
+    def delete_listens(self, user_id: int) -> int:
+        return self._db.execute("DELETE FROM listens WHERE user_id = ?", (user_id,)).rowcount
+
+    def listening_since(self, user_id: int) -> str | None:
+        return self._one("SELECT MIN(day) FROM listens WHERE user_id = ?", user_id)[0]
+
+    def listening_days(self, user_id: int) -> list[str]:
+        return [r[0] for r in self._all("SELECT DISTINCT day FROM listens WHERE user_id = ? ORDER BY day", user_id)]
+
+    def listening_stats(self, user_id: int, start: str, end: str, top: int = 10) -> dict:
+        """Статистика за дни start..end включительно. Прослушивание = пара (день, трек): повтор трека в тот же
+        день история Яндекса не различает, а один трек из двух источников за день считаем один раз."""
+        args = (user_id, start, end)
+        plays = "SELECT DISTINCT day, track_id FROM listens WHERE user_id = ? AND day BETWEEN ? AND ?"
+        total, minutes = self._one(
+            f"SELECT COUNT(*), COALESCE(SUM(m.duration_ms), 0) / 60000 FROM ({plays}) p "
+            "LEFT JOIN track_meta m USING (track_id)", *args)
+        tracks, artists = self._one(
+            f"SELECT COUNT(DISTINCT p.track_id), COUNT(DISTINCT a.artist_id) FROM ({plays}) p "
+            "LEFT JOIN track_artists a USING (track_id)", *args)
+        by_day = dict(self._all(f"SELECT day, COUNT(*) FROM ({plays}) GROUP BY day", *args))
+        top_artists = self._all(
+            f"SELECT a.artist_id, MAX(a.name), COUNT(*) c FROM ({plays}) p JOIN track_artists a USING (track_id) "
+            "GROUP BY a.artist_id ORDER BY c DESC, MAX(a.name) LIMIT ?", *args, top)
+        top_tracks = self._all(
+            f"SELECT p.track_id, COUNT(*) c FROM ({plays}) p GROUP BY p.track_id ORDER BY c DESC, "
+            "MAX(p.day) DESC LIMIT ?", *args, top)
+        top_albums = self._all(
+            f"SELECT m.album_id, MAX(m.album), COUNT(*) c FROM ({plays}) p JOIN track_meta m USING (track_id) "
+            "WHERE m.album_id IS NOT NULL GROUP BY m.album_id ORDER BY c DESC LIMIT ?", *args, top)
+        genres = self._all(
+            f"SELECT m.genre, COUNT(*) c FROM ({plays}) p JOIN track_meta m USING (track_id) "
+            "WHERE m.genre IS NOT NULL AND m.genre != '' GROUP BY m.genre ORDER BY c DESC", *args)
+        sources = self._all(
+            "SELECT COALESCE(c.type, CASE WHEN l.context = 'none' THEN 'other' ELSE substr(l.context, 1, "
+            "instr(l.context, ':') - 1) END) t, COUNT(*) n FROM listens l LEFT JOIN contexts c ON c.key = l.context "
+            "WHERE l.user_id = ? AND l.day BETWEEN ? AND ? GROUP BY t ORDER BY n DESC", *args)
+        top_sources = self._all(
+            "SELECT l.context, MAX(c.type), MAX(c.title), COUNT(*) n FROM listens l LEFT JOIN contexts c "
+            "ON c.key = l.context WHERE l.user_id = ? AND l.day BETWEEN ? AND ? AND l.context != 'none' "
+            "GROUP BY l.context ORDER BY n DESC LIMIT ?", *args, 5)
+        new_tracks = self._one(
+            "SELECT COUNT(*) FROM (SELECT track_id FROM listens WHERE user_id = ? GROUP BY track_id "
+            "HAVING MIN(day) BETWEEN ? AND ?)", *args)[0]
+        new_artists = self._all(
+            "SELECT a.artist_id, MAX(a.name) FROM listens l JOIN track_artists a USING (track_id) "
+            "WHERE l.user_id = ? GROUP BY a.artist_id HAVING MIN(l.day) BETWEEN ? AND ? "
+            "ORDER BY COUNT(*) DESC", *args)
+        return {
+            "plays": total, "minutes": minutes, "tracks": tracks, "artists": artists, "by_day": by_day,
+            "top_artists": [{"id": i, "name": n, "plays": c} for i, n, c in top_artists],
+            "top_tracks": [{"id": i, "plays": c} for i, c in top_tracks],
+            "top_albums": [{"id": i, "title": t, "plays": c} for i, t, c in top_albums],
+            "genres": [{"id": g, "plays": c} for g, c in genres],
+            "sources": [{"type": t, "plays": n} for t, n in sources],
+            "top_sources": [{"key": k, "type": t, "title": title, "plays": n} for k, t, title, n in top_sources],
+            "new_tracks": new_tracks,
+            "new_artists": [{"id": i, "name": n} for i, n in new_artists],
+        }
+
+    def track_names(self, track_ids: list[str]) -> dict[str, tuple[str, str]]:
+        """{трек: (название, «Исполнитель, Исполнитель»)} из кэша данных треков."""
+        result: dict[str, tuple[str, str]] = {}
+        for track_id in track_ids:
+            row = self._one("SELECT title FROM track_meta WHERE track_id = ?", track_id)
+            if row and row[0]:
+                names = [r[0] for r in self._all(
+                    "SELECT name FROM track_artists WHERE track_id = ? ORDER BY pos", track_id) if r[0]]
+                result[track_id] = (row[0], ", ".join(names))
+        return result
+
+    def album_title(self, album_id: str) -> str | None:
+        row = self._one("SELECT album FROM track_meta WHERE album_id = ? AND album IS NOT NULL LIMIT 1", album_id)
+        return row[0] if row else None
+
+    def artist_name(self, artist_id: str) -> str | None:
+        row = self._one("SELECT name FROM track_artists WHERE artist_id = ? AND name IS NOT NULL LIMIT 1", artist_id)
+        return row[0] if row else None
+
+    def stats_users(self) -> list[int]:
+        return [r[0] for r in self._all("SELECT user_id FROM user_settings WHERE key = 'stats' AND value = '1'")]
 
     # ---------- журнал действий админа ----------
 

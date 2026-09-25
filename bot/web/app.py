@@ -36,6 +36,7 @@ from bot.audio import (
 )
 from bot.config import Config
 from bot.handlers.download import start_bulk_download
+from bot.listening import Listening
 from bot.placer import TopPlacer
 from bot.sender import PARALLEL_DOWNLOADS, TrackSender, TrackTooLargeError
 from bot.settings import QUALITY_LABELS, available_qualities, get_quality, set_quality
@@ -126,6 +127,7 @@ class WebContext:
     static: StaticFiles
     placer: TopPlacer = field(default_factory=TopPlacer)
     admin: Admin | None = None  # задаётся в create_app
+    listening: Listening | None = None
     http: aiohttp.ClientSession | None = None
     sources: TTLCache = field(default_factory=lambda: TTLCache(SOURCE_TTL, 300))
     links: TTLCache = field(default_factory=lambda: TTLCache(LINK_TTL, 2000))
@@ -852,16 +854,19 @@ async def _cleanup(app: web.Application) -> None:
 
 
 def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sender: TrackSender,
-               placer: TopPlacer | None = None, admin: Admin | None = None) -> web.Application:
-    from bot.web import admin_api  # модуль берёт CTX и USER отсюда
+               placer: TopPlacer | None = None, admin: Admin | None = None,
+               listening: Listening | None = None) -> web.Application:
+    from bot.web import admin_api, stats_api  # модули берут CTX и USER отсюда
     app = web.Application(
         client_max_size=config.web_max_upload_mb * 1024 * 1024,
         middlewares=[compress_middleware, errors_middleware, auth_middleware],
     )
+    admin = admin or Admin(config, store, accounts, bot)
     app[CTX] = WebContext(config, bot, accounts, store, sender, MediaSigner(config.bot_token), StaticFiles(STATIC_DIR),
-                          placer or TopPlacer(), admin or Admin(config, store, accounts, bot))
+                          placer or TopPlacer(), admin, listening or Listening(store, accounts, admin, bot, config))
     app.add_routes(routes)
     app.add_routes(admin_api.routes)
+    app.add_routes(stats_api.routes)
     app.on_response_prepare.append(security_headers)
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)

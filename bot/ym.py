@@ -9,6 +9,7 @@ import mimetypes
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -261,6 +262,14 @@ class YandexMusic:
 
     async def get_my_playlists(self) -> list[Playlist]:
         return await self.client.users_playlists_list()
+
+    async def music_history(self):
+        """История прослушивания (раздел «История» в приложении): дни → откуда играло → треки."""
+        return await self.client.music_history()
+
+    async def music_history_raw(self) -> Any:
+        """Та же история как есть, без разбора — чтобы владелец мог сверить формат ответа Яндекса."""
+        return await self.client._request.get(f"{self.client.base_url}/music-history", {"fullModelsCount": 0})
 
     async def get_playlist(self, kind: int | str, owner: int | str | None = None) -> Playlist | None:
         playlist = await self.client.users_playlists(kind, owner if owner is not None else self.uid)

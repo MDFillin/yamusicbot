@@ -42,9 +42,10 @@ def main_menu(webapp_url: str | None) -> InlineKeyboardMarkup:
         rows = []
     kb.button(text="❤️ Мне нравится", callback_data=MenuCb(action="likes"))
     kb.button(text="📃 Плейлисты", callback_data=MenuCb(action="playlists"))
+    kb.button(text="📊 Моя статистика", callback_data=MenuCb(action="stats"))
     kb.button(text="📌 Куда загружать", callback_data=MenuCb(action="target"))
     kb.button(text="⚙️ Настройки", callback_data=MenuCb(action="account"))
-    kb.adjust(*rows, 2, 2)
+    kb.adjust(*rows, 2, 1, 2)
     return kb.as_markup()
 
 

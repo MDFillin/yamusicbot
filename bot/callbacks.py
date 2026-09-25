@@ -74,3 +74,16 @@ class AdminCb(CallbackData, prefix="adm"):
 
     action: str
     user: int = 0
+
+
+class StatsCb(CallbackData, prefix="st"):
+    """Статистика прослушиваний: kind — day | week | month | year, offset — 0 текущий период, -1 прошлый…"""
+
+    kind: str
+    offset: int = 0
+
+
+class StatsSetCb(CallbackData, prefix="sts"):
+    """Настройки статистики: key — on | off | delete | daily | weekly | monthly | menu."""
+
+    key: str

@@ -117,7 +117,7 @@ class FakeTelegram(BaseSession):
 
 def make_track():
     album = NS(id=1, title="Звезда по имени Солнце", year=1989)
-    return NS(id=123, title="Кукушка", version=None, artists=[NS(name="Кино")], duration_ms=400_000,
+    return NS(id=123, title="Кукушка", version=None, artists=[NS(id=7, name="Кино")], duration_ms=400_000,
               albums=[album], available=True, cover_uri="avatars.yandex.net/get-music-content/x/%%")
 
 
@@ -170,6 +170,12 @@ class FakeYM:
 
     async def get_liked_track_ids(self):
         return ["123:1"]
+
+    async def music_history(self):
+        from bot.listening import msk_now
+        wave = NS(type="wave", data=NS(item_id=NS(seeds=["user:onyourwave"]), full_model=None))
+        tracks = [NS(type="track", data=NS(item_id=NS(track_id="123", album_id="1"), full_model=None))]
+        return NS(history_tabs=[NS(date=msk_now().date().isoformat(), items=[NS(context=wave, tracks=tracks)])])
 
     async def get_tracks(self, ids):
         return [make_track() for _ in ids]
@@ -789,3 +795,57 @@ async def test_owner_appoints_admin_in_chat(env):
     assert any(isinstance(c, DeleteMyCommands) and c.scope.chat_id == FRIEND.id for c in env.tg.calls)
     await env.dp.feed_update(env.bot, message_update(FRIEND, text="/admin"))
     assert "Не понял" in env.tg.texts()[-1]
+
+
+# ---------- статистика прослушиваний ----------
+
+async def test_stats_enable_and_browse(env):
+    from bot.callbacks import StatsCb, StatsSetCb
+
+    await env.dp.feed_update(env.bot, message_update(text="/stats"))
+    assert "Статистика прослушиваний" in env.tg.texts()[-1]
+    assert env.tg.buttons()[0].callback_data == StatsSetCb(key="on").pack()
+
+    await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="on").pack()))
+    text = env.tg.texts()[-1]
+    assert "Твоя неделя в музыке" in text and "<b>1</b> трек" in text and "Кино — Кукушка" in text
+    assert "Моя волна 100%" in text
+
+    await env.dp.feed_update(env.bot, callback_update(StatsCb(kind="month").pack()))
+    assert "Твой месяц в музыке" in env.tg.texts()[-1]
+    await env.dp.feed_update(env.bot, callback_update(StatsCb(kind="week", offset=-1).pack()))
+    assert "Пока пусто" in env.tg.texts()[-1]
+
+    await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="menu").pack()))
+    assert "⬜ Итоги дня" in [b.text[:12] + b.text[12:] for b in env.tg.buttons()][0]
+    await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="day").pack()))
+    assert env.tg.buttons()[0].text.startswith("✅ Итоги дня")
+    assert env.dp["listening"].prefs(OWNER.id)["day"] is True
+
+
+async def test_stats_scheduled_report_once(env, monkeypatch):
+    from datetime import datetime
+
+    sunday = datetime(2026, 9, 27, 21, 5)
+    monkeypatch.setattr("bot.listening.msk_now", lambda: sunday)
+    listening = env.dp["listening"]
+    listening.enable(OWNER.id)
+    listening.enable(FRIEND.id)
+    listening.set_pref(FRIEND.id, "week", False)
+    await listening.tick(sunday)
+    await listening.tick(sunday)
+    reports = [c for c in env.tg.calls if isinstance(c, SendMessage) and "Твоя неделя в музыке" in c.text]
+    assert [r.chat_id for r in reports] == [OWNER.id], "один раз и только тем, кто не отключил итоги недели"
+    assert "21–27 сентября" in reports[0].text
+
+
+async def test_stats_delete_history(env):
+    from bot.callbacks import StatsSetCb
+
+    await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="on").pack()))
+    assert env.store.listening_since(OWNER.id)
+    await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="delete").pack()))
+    assert "Удалить всю собранную историю" in env.tg.texts()[-1]
+    await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="delete_ok").pack()))
+    assert env.store.listening_since(OWNER.id) is None and not env.dp["listening"].enabled(OWNER.id)
+    assert "Статистика прослушиваний" in env.tg.texts()[-1], "снова предложение включить"
