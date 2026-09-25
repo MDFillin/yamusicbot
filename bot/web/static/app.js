@@ -745,6 +745,13 @@
             'Похоже, Яндекс изменил историю прослушивания. Обновите бота (git pull). Собранное раньше сохранено.',
             ls.health.last_error_text ? h('div', { class: 'banner-detail' }, ls.health.last_error_text) : null)));
       }
+      const lv = ls.live || {};
+      if (lv.enabled && lv.health && lv.health.broken) {
+        banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'),
+          h('div', {}, h('b', {}, `Точный подсчёт прослушиваний не работает с ${fmtStamp(lv.health.broken_since)}. `),
+            'Похоже, Яндекс изменил протокол плеера (Ynison). Статистика пока собирается по истории — без повторов. Обновите бота (git pull) или выключите точный подсчёт в «Режимах».',
+            lv.health.last_error_text ? h('div', { class: 'banner-detail' }, lv.health.last_error_text) : null)));
+      }
       if (cfg.maintenance) banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'), 'Включены техработы — бот отвечает только вам'));
       if (cfg.closed) banners.push(h('div', { class: 'adm-banner' }, icon('lock', 'sm'), 'Регистрация закрыта — новые пользователи не допускаются'));
       if (bc.state === 'running') banners.push(h('div', { class: 'adm-banner' }, icon('megaphone', 'sm'), `Идёт рассылка: ${bc.sent} из ${bc.total}`));
@@ -778,13 +785,45 @@
           kv('Работает', fmtUptime(sv.uptime)), kv('Память', sv.memory_mb ? `${sv.memory_mb} МБ` : '—'),
           kv('Загрузка в Яндекс', uh.broken ? '❌ не работает' : uh.last_ok ? `✅ работает · ${fmtAgo(uh.last_ok)}` : 'ещё не было'),
           kv('Статистика прослушиваний', `${fmtNum(ls.users)} чел. · ${ls.health.broken ? '❌ не обновляется' : ls.health.last_ok ? `✅ ${fmtAgo(ls.health.last_ok)}` : 'ещё не собиралась'}`),
+          kv('Точный подсчёт (Ynison)', !lv.enabled ? 'выключен' : lv.health && lv.health.broken ? '❌ не работает' : `на связи ${fmtNum(lv.connected || 0)} из ${fmtNum(lv.connections || 0)}`),
           kv('База', fmtSize(sv.db_bytes)), kv('Свободно на диске', `${fmtSize(sv.disk_free)} из ${fmtSize(sv.disk_total)}`),
           kv('Клиентов Яндекса в памяти', fmtNum(sv.clients)), kv('ffmpeg', sv.ffmpeg || 'не установлен'),
           kv('Python / aiogram', `${sv.python} / ${sv.aiogram}`), kv('Бот', sv.bot_username ? `@${sv.bot_username}` : '—'),
           kv('Инлайн-режим', sv.inline ? 'включён' : sv.inline === false ? 'выключен в @BotFather' : '—'),
           kv('Владельцы (.env)', String(sv.owners.length)), kv('Назначенные админы', String(sv.admins.length))),
         isOwner() ? backupBtn : null,
+        h('button', { class: 'btn secondary block', onclick: liveRaw }, icon('headphones', 'sm'), 'Мой плеер вживую (проверка)'),
         h('button', { class: 'btn secondary block', onclick: historyRaw }, icon('list', 'sm'), 'Моя история Яндекса (проверка)')));
+    }
+
+    // Точный подсчёт на своём аккаунте: что бот видит в плеере прямо сейчас и что уже засчитал.
+    async function liveRaw() {
+      let data;
+      try { data = await api('/api/admin/live'); } catch (e) { fail(e); return; }
+      const me = data.me || {};
+      const kv = (k, v) => h('div', { class: 'kv' }, h('span', {}, k), h('b', {}, v));
+      const clock = (ms) => fmtTime(Math.round((ms || 0) / 1000));
+      const n = me.now;
+      const conn = !data.enabled ? 'точный подсчёт выключен в «Режимах»'
+        : !me.stats_enabled ? 'включите себе статистику (/stats)'
+          : me.connected ? `✅ на связи с ${fmtAgo(me.since)}`
+            : me.cooldown ? `⏸ вход не принят, повтор через ${Math.ceil(me.cooldown / 60)} мин`
+              : me.last_error ? `⏳ переподключаюсь: ${me.last_error}` : '⏳ подключаюсь…';
+      openSheet([
+        h('div', { class: 'sheet-title' }, 'Плеер вживую'),
+        h('div', { class: 'sheet-note' }, 'Включите трек в приложении Яндекс Музыки или на сайте и откройте это окно снова: здесь должен появиться трек, а после половины трека — прослушивание в списке.'),
+        h('div', { class: 'card set-card kvs' },
+          kv('Подключение', conn),
+          kv('Последний кадр', me.last_frame ? fmtAgo(me.last_frame) : '—'),
+          kv('Сейчас', n ? `${n.title || `трек ${n.track_id}`}${n.artists ? ` — ${n.artists}` : ''}` : 'ничего не играет'),
+          n ? kv('Позиция', `${clock(n.pos_ms)} из ${clock(n.duration_ms)} · ${n.playing ? 'играет' : 'пауза'}`) : null,
+          n ? kv('Слушали', `${clock(n.listened_ms)} · ${n.counted ? '✅ засчитано' : `засчитаю после ${clock(n.needed_ms)}`}`) : null),
+        group('Последние прослушивания', h('div', { class: 'card set-card kvs' }, (data.recent || []).length
+          ? data.recent.map((r) => kv(`${new Date(r.ts * 1000).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })} · ${r.source === 'app' ? 'Медиатека' : 'Яндекс'}`,
+            `${r.title || `трек ${r.track_id}`} · ${clock(r.ms)}`))
+          : h('div', { class: 'kv' }, h('span', {}, 'Пока ни одного')))),
+        me.raw ? h('details', { class: 'card log' }, h('summary', {}, h('b', {}, 'Последний кадр от Яндекса'), h('span', {}, 'как есть')), h('pre', {}, me.raw)) : null,
+      ]);
     }
 
     // Сырая история своего аккаунта: сверить, что бот считает так же, как показывает Яндекс.
@@ -978,7 +1017,9 @@
         group('Доступ', h('div', { class: 'card list' },
           toggleRow('alert', 'Техработы', 'Бот и приложение отвечают только админам', cfg.maintenance, (v) => save({ maintenance: v }, v ? 'Техработы включены' : 'Техработы выключены')),
           toggleRow('lock', 'Закрыть регистрацию', cfg.closed ? `Закрыта с ${fmtStamp(cfg.closed_since)} — новые не допускаются` : 'Новые пользователи не смогут пользоваться ботом',
-            cfg.closed, (v) => save({ closed: v }, v ? 'Регистрация закрыта' : 'Регистрация открыта'))),
+            cfg.closed, (v) => save({ closed: v }, v ? 'Регистрация закрыта' : 'Регистрация открыта')),
+          toggleRow('headphones', 'Точный подсчёт прослушиваний', 'Следить за плеером Яндекс Музыки (Ynison): повторы и реальное время в статистике. Без него — только история Яндекса',
+            cfg.live_tracking !== false, (v) => save({ live_tracking: v }, v ? 'Точный подсчёт включён' : 'Точный подсчёт выключен'))),
         h('div', { class: 'card set-card', style: 'margin-top:10px' }, h('div', { class: 'set-label' }, icon('edit', 'sm'), 'Текст на время техработ'), mText)),
         group('Лимиты на человека в сутки', h('div', { class: 'card set-card' },
           h('label', { class: 'field-row' }, h('span', {}, 'Скачиваний треков'), dl),
@@ -1259,7 +1300,7 @@
     let offset = 0;
     const body = h('div', { class: 'stats-body' }, h('div', { class: 'empty' }, spinner()));
     root.append(h('div', { class: 'lib-head' }, h('div', {},
-      h('div', { class: 'hello' }, 'По истории Яндекс Музыки'), h('h1', { class: 'page-title' }, 'Статистика')),
+      h('div', { class: 'hello' }, 'Всё, что вы слушаете в Яндекс Музыке'), h('h1', { class: 'page-title' }, 'Статистика')),
     h('span', { class: 'gear-btn adm-shield' }, icon('chart'))), body);
 
     let seq = 0;
@@ -1282,12 +1323,12 @@
         h('div', { class: 'stats-intro-icon' }, icon('chart')),
         h('b', {}, 'Итоги прослушиваний — когда захотите, а не раз в год'),
         h('ul', { class: 'perks' },
-          h('li', {}, icon('headphones', 'sm'), 'Что и сколько вы слушаете: в приложении, на сайте и на колонке'),
-          h('li', {}, icon('user', 'sm'), 'Любимые исполнители, треки, альбомы и жанры'),
+          h('li', {}, icon('headphones', 'sm'), 'Каждое прослушивание, включая повторы: в приложении, на сайте, на колонке и здесь'),
+          h('li', {}, icon('user', 'sm'), 'Любимые исполнители, треки, альбомы и жанры — нажмите, чтобы послушать'),
           h('li', {}, icon('sparkle', 'sm'), 'Новые открытия и серии дней с музыкой'),
           h('li', {}, icon('send', 'sm'), 'Итоги недели и месяца — сообщением в чат')),
-        h('div', { class: 'set-note' }, 'Бот раз в час забирает вашу историю из Яндекс Музыки. Яндекс хранит её недолго, '
-          + 'поэтому статистика копится с момента включения. Выключить и удалить её можно в любой момент.'),
+        h('div', { class: 'set-note' }, 'Бот следит за плеером Яндекс Музыки и засчитывает трек, если его слушали хотя бы половину (или 4 минуты). '
+          + 'Статистика копится с момента включения. Выключить и удалить её можно в любой момент.'),
         btn);
     }
 
@@ -1301,13 +1342,13 @@
       const parts = [seg, nav];
       if (!st.plays) {
         parts.push(emptyEl('headphones', offset === 0
-          ? 'Пока пусто. Слушайте музыку в Яндекс Музыке — в приложении, на сайте или на колонке. История обновляется раз в час.'
+          ? 'Пока пусто. Слушайте музыку в Яндекс Музыке — в приложении, на сайте, на колонке или здесь, в «Медиатеке».'
           : 'За этот период прослушиваний нет'));
       } else {
         const change = st.change_pct == null || kind === 'day' ? 'первый период' : `${st.change_pct >= 0 ? '▲' : '▼'} ${Math.abs(st.change_pct)}% к прошлому`;
         parts.push(h('div', { class: 'stat-grid' },
-          statTile('music', 'Прослушано', fmtNum(st.plays), `${plural(st.plays, 'трек', 'трека', 'треков')} · ${change}`),
-          statTile('clock', 'Время', `≈ ${fmtMinutes(st.minutes)}`, kind === 'day' ? 'по длительности треков' : `дней с музыкой: ${st.active_days} из ${st.days}`),
+          statTile('music', 'Прослушивания', fmtNum(st.plays), change),
+          statTile('clock', 'Время', `${st.estimated ? '≈ ' : ''}${fmtMinutes(st.minutes)}`, kind === 'day' ? (st.estimated ? 'частично по длительности треков' : 'сколько на самом деле слушали') : `дней с музыкой: ${st.active_days} из ${st.days}`),
           statTile('user', 'Исполнителей', fmtNum(st.artists), st.new_artists_count ? `🆕 ${st.new_artists_count} новых` : `${fmtNum(st.tracks)} разных треков`),
           statTile('sparkle', 'Открытия', st.new_tracks == null ? '—' : fmtNum(st.new_tracks), st.new_tracks == null ? 'считаем со следующего периода' : 'треков впервые')));
         if (st.streak >= 2) parts.push(h('div', { class: 'adm-banner streak' }, h('span', { class: 'fire' }, '🔥'), `${st.streak} ${plural(st.streak, 'день', 'дня', 'дней')} подряд с музыкой`));
@@ -1321,15 +1362,26 @@
         }
         if (st.top_artists.length) {
           const max = st.top_artists[0].plays;
-          parts.push(group('Топ исполнителей', h('div', { class: 'card list' }, st.top_artists.slice(0, 10).map((a, i) => h('div', { class: 'row rank-row' },
+          parts.push(group('Топ исполнителей', h('div', { class: 'card list' }, st.top_artists.slice(0, 10).map((a, i) => h('button', { class: 'row rank-row', onclick: () => push(sourceView('art', a.id)) },
             h('span', { class: 'rank' }, String(i + 1)),
             h('div', { class: 'meta' }, h('div', { class: 'title' }, a.name || '—'),
               h('div', { class: 'share' }, h('div', { style: `width:${Math.max(4, Math.round((100 * a.plays) / max))}%` }))),
-            h('span', { class: 'num' }, fmtNum(a.plays)))))));
+            h('span', { class: 'num' }, fmtNum(a.plays)), icon('chevron', 'sm'))))));
         }
         if (data.top_tracks.length) {
           const ctx = { tracks: data.top_tracks };
-          parts.push(group(kind === 'day' ? 'Треки дня' : 'Топ треков — по числу дней', h('div', { class: 'card list' }, data.top_tracks.map((t) => trackRow(t, ctx)))));
+          parts.push(group(kind === 'day' ? 'Треки дня' : 'Топ треков', h('div', { class: 'card list' }, data.top_tracks.map((t) => {
+            const row = trackRow(t, ctx);
+            const sub = row.querySelector('.sub');
+            if (sub) sub.textContent = `${t.artists} · ${t.plays} ${plural(t.plays, 'раз', 'раза', 'раз')}`;
+            return row;
+          }))));
+        }
+        if (st.top_albums && st.top_albums.length) {
+          parts.push(group('Топ альбомов', h('div', { class: 'card list' }, st.top_albums.slice(0, 5).map((a) => h('button', { class: 'row', onclick: () => push(sourceView('alb', a.id)) },
+            coverEl(a.cover, '', 'disc'),
+            h('div', { class: 'meta' }, h('div', { class: 'title' }, a.title || 'Альбом'), h('div', { class: 'sub' }, `${a.plays} ${plural(a.plays, 'прослушивание', 'прослушивания', 'прослушиваний')}`)),
+            icon('chevron', 'sm'))))));
         }
         if (st.genres.length) {
           parts.push(group('Жанры', h('div', { class: 'card set-card' }, st.genres.map((g) => shareRow(g.label, g.pct)))));
@@ -1339,7 +1391,10 @@
             st.top_sources.length ? h('div', { class: 'set-note' }, `Чаще всего: ${st.top_sources.slice(0, 3).map((x) => x.title || x.type).join(', ')}`) : null)));
         }
         if (st.new_artists && st.new_artists.length) {
-          parts.push(group('Открытия', h('div', { class: 'chips new-artists' }, st.new_artists.map((a) => h('span', { class: 'chip' }, icon('sparkle', 'sm'), a.name)))));
+          parts.push(group('Открытия', h('div', { class: 'chips new-artists' }, st.new_artists.map((a) => h('button', { class: 'chip', onclick: () => push(sourceView('art', a.id)) }, icon('sparkle', 'sm'), a.name)))));
+        }
+        if (st.estimated) {
+          parts.push(h('div', { class: 'set-note' }, `${st.estimated === st.plays ? 'Все прослушивания' : `${fmtNum(st.estimated)} ${plural(st.estimated, 'прослушивание', 'прослушивания', 'прослушиваний')}`} — из истории Яндекса: бот их не видел вживую (был выключен или трек играл на устройстве, которое не сообщает о себе). Там нет повторов, а время посчитано по длительности треков.`));
         }
         if (st.collecting) parts.push(h('div', { class: 'set-note' }, 'Статистика только начала собираться — новые открытия и сравнение появятся со следующего периода.'));
       }
@@ -1358,15 +1413,20 @@
       };
       const syncBtn = h('button', { class: 'row set-row', onclick: async () => {
         try { const r = await api('/api/stats/sync', { method: 'POST' }); haptic.ok(); toast(r.added ? `Новых прослушиваний: ${r.added}` : 'Новых прослушиваний нет'); reload(); } catch (e) { fail(e); }
-      } }, h('span', { class: 'set-icon' }, icon('refresh', 'sm')), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Обновить сейчас'),
-        h('div', { class: 'sub' }, 'Обычно история обновляется сама раз в час')));
+      } }, h('span', { class: 'set-icon' }, icon('refresh', 'sm')), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Добрать из истории Яндекса'),
+        h('div', { class: 'sub' }, 'Обычно бот делает это сам раз в час')));
+      const live = data.live || {};
+      const liveRow = h('div', { class: 'row set-row' }, h('span', { class: 'set-icon' }, icon('headphones', 'sm')),
+        h('div', { class: 'meta' }, h('div', { class: 'title' }, !live.enabled ? 'Считаю по истории Яндекса' : live.connected ? 'Слежу за плеером Яндекс Музыки' : 'Подключаюсь к плееру Яндекс Музыки…'),
+          h('div', { class: 'sub' }, !live.enabled ? 'Точный подсчёт выключен админом: без повторов, время примерное'
+            : live.connected ? 'Каждое прослушивание и повторы — сразу, как только трек дослушан до половины' : 'Обычно это занимает несколько секунд')));
       const off = h('button', { class: 'row set-row danger', onclick: async () => {
         if (!(await confirmAsk('Выключить статистику и удалить всю собранную историю? Вернуть её не получится.'))) return;
         try { await api('/api/stats', { method: 'DELETE' }); toast('Статистика выключена, история удалена'); reload(); } catch (e) { fail(e); }
       } }, h('span', { class: 'set-icon' }, icon('trash', 'sm')), h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Выключить и удалить историю')));
-      return group('Итоги в чат', h('div', { class: 'card list' },
+      return group('Итоги в чат и подсчёт', h('div', { class: 'card list' },
         PREF_LABELS.map(([key, title, sub]) => toggleRow(key === 'day' ? 'clock' : 'send', title, sub, data.prefs[key], setPref(key))),
-        syncBtn, off));
+        liveRow, syncBtn, off));
     }
 
     entry.onShow = () => { if (offset === 0) reload(); };
@@ -2122,6 +2182,28 @@
 
   const current = () => player.queue[player.index];
 
+  // Статистика: о прослушиваниях в этом плеере Яндекс не знает, поэтому плеер сообщает о них боту сам —
+  // по тому же правилу, что и для приложений Яндекса: трек слушали хотя бы половину (или 4 минуты).
+  const heard = { id: null, ms: 0, last: null, sent: false };
+  const neededMs = (ms) => (!ms ? 30000 : ms < 30000 ? ms * 0.8 : Math.min(ms / 2, 240000));
+  function heardReset() {
+    const t = current();
+    Object.assign(heard, { id: t ? t.id : null, ms: 0, last: null, sent: false });
+  }
+  function heardTick() {
+    const t = current();
+    if (!t || heard.sent || t.id !== heard.id) return;
+    const pos = audio.currentTime;
+    const d = heard.last == null ? 0 : pos - heard.last;
+    if (!audio.paused && d > 0 && d < 2) heard.ms += d * 1000; // перемотка вперёд — не прослушивание
+    heard.last = pos;
+    const duration = (Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : t.duration) * 1000;
+    if (heard.ms >= neededMs(duration)) {
+      heard.sent = true;
+      api('/api/stats/played', { method: 'POST', body: { id: String(t.id), ms: Math.round(heard.ms) } }).catch(() => {});
+    }
+  }
+
   function playQueue(queue, index, shuffle = false) {
     if (shuffle) {
       const pool = queue.filter((x) => x.available);
@@ -2138,6 +2220,7 @@
 
   function start() {
     const t = current();
+    heardReset();
     audio.src = t.stream;
     audio.play().catch((e) => { if (e.name !== 'AbortError') toast('Не удалось включить трек'); });
     drawBar();
@@ -2153,7 +2236,7 @@
 
   function step(delta, auto = false) {
     if (!player.queue.length) return false;
-    if (auto && player.repeat === 'one') { audio.currentTime = 0; audio.play().catch(() => {}); return true; }
+    if (auto && player.repeat === 'one') { heardReset(); audio.currentTime = 0; audio.play().catch(() => {}); return true; }
     const n = player.queue.length;
     let i = player.index;
     for (let k = 0; k < n; k += 1) {
@@ -2291,6 +2374,8 @@
     openNowPlaying();
   });
   audio.addEventListener('timeupdate', drawProgress);
+  audio.addEventListener('timeupdate', heardTick);
+  audio.addEventListener('seeking', () => { heard.last = null; });
   audio.addEventListener('loadedmetadata', drawProgress);
   for (const ev of ['play', 'pause']) audio.addEventListener(ev, () => { drawBar(); if (now) drawNow(); });
   audio.addEventListener('ended', () => { if (!step(1, true)) drawBar(); });

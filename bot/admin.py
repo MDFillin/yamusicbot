@@ -79,6 +79,15 @@ HISTORY_BROKEN = (
     "Уже собранная статистика сохранена. Когда сбор снова заработает, я напишу."
 )
 HISTORY_FIXED = "✅ Статистика прослушиваний снова обновляется."
+LIVE_BROKEN = (
+    "⚠️ <b>Точный подсчёт прослушиваний перестал работать</b>\n\n"
+    "Бот не может следить за плеером Яндекс Музыки (Ynison — неофициальный протокол, похоже, Яндекс его изменил). "
+    "Последний ответ:\n<code>{details}</code>\n\n"
+    "Статистика продолжает собираться по истории Яндекса, но без повторов и с примерным временем.\n"
+    "Обновите бота — возможно, исправление уже есть: <code>git pull &amp;&amp; docker compose up -d --build</code>\n"
+    "Выключить точный подсчёт можно в админ-панели → «Режимы». Когда он снова заработает, я напишу."
+)
+LIVE_FIXED = "✅ Точный подсчёт прослушиваний снова работает."
 
 
 class ApiHealth:
@@ -169,6 +178,7 @@ class BotSettings:
     closed_since: int | None = None  # с этого момента новые пользователи не допускаются
     download_limit: int = 0  # треков в сутки на человека, 0 — без ограничений
     upload_limit: int = 0
+    live_tracking: bool = True  # следить за плеером через Ynison (повторы и точное время в статистике)
 
     @classmethod
     def load(cls, raw: str | None) -> BotSettings:
@@ -324,6 +334,7 @@ class Admin:
         self._appointed = store.admin_ids() - set(config.admin_ids)
         self.upload_health = ApiHealth(self, "upload_health", UPLOAD_BROKEN, UPLOAD_FIXED)
         self.history_health = ApiHealth(self, "history_health", HISTORY_BROKEN, HISTORY_FIXED)
+        self.live_health = ApiHealth(self, "live_health", LIVE_BROKEN, LIVE_FIXED)
 
     # ---------- доступ ----------
 
@@ -488,6 +499,9 @@ class Admin:
             if closed != (s.closed_since is not None):
                 s.closed_since = int(time.time()) if closed else None
                 details.append("регистрация закрыта" if closed else "регистрация открыта")
+        if "live_tracking" in changes:
+            s.live_tracking = bool(changes["live_tracking"])
+            details.append(f"точный подсчёт прослушиваний {'вкл' if s.live_tracking else 'выкл'}")
         for key in ("download_limit", "upload_limit"):
             if key in changes:
                 value = int(changes[key] or 0)
@@ -504,7 +518,8 @@ class Admin:
         s = self.settings
         return {"maintenance": s.maintenance, "maintenance_text": s.maintenance_text,
                 "closed": s.closed_since is not None, "closed_since": s.closed_since,
-                "download_limit": s.download_limit, "upload_limit": s.upload_limit}
+                "download_limit": s.download_limit, "upload_limit": s.upload_limit,
+                "live_tracking": s.live_tracking}
 
     # ---------- действия с пользователями ----------
 

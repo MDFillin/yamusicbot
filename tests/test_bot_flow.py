@@ -180,6 +180,16 @@ class FakeYM:
     async def get_tracks(self, ids):
         return [make_track() for _ in ids]
 
+    async def get_artist_tracks(self, artist_id):
+        track = make_track()
+        track.artists[0].cover = None
+        return [track]
+
+    async def get_album(self, album_id):
+        track = make_track()
+        return NS(id=album_id, title="Звезда по имени Солнце", year=1989, artists=track.artists, volumes=[[track]],
+                  cover_uri=None)
+
     async def search(self, query, type_, page=0):
         self.searches.append(query)
         return NS(misspell_corrected=False, misspell_result=None, tracks=NS(results=[make_track()], total=1),
@@ -808,8 +818,11 @@ async def test_stats_enable_and_browse(env):
 
     await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="on").pack()))
     text = env.tg.texts()[-1]
-    assert "Твоя неделя в музыке" in text and "<b>1</b> трек" in text and "Кино — Кукушка" in text
-    assert "Моя волна 100%" in text
+    assert "Твоя неделя в музыке" in text and "<b>1</b> прослушивание" in text and "Моя волна 100%" in text
+    # Трек и исполнитель — ссылки на бота: нажал — трек пришёл, исполнитель открылся.
+    assert '<a href="https://t.me/testbot?start=t123">Кукушка</a> — <a href="https://t.me/testbot?start=ar7">Кино</a>' \
+        in text
+    assert '1. <a href="https://t.me/testbot?start=ar7">Кино</a> — 1' in text
 
     await env.dp.feed_update(env.bot, callback_update(StatsCb(kind="month").pack()))
     assert "Твой месяц в музыке" in env.tg.texts()[-1]
@@ -821,6 +834,15 @@ async def test_stats_enable_and_browse(env):
     await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="day").pack()))
     assert env.tg.buttons()[0].text.startswith("✅ Итоги дня")
     assert env.dp["listening"].prefs(OWNER.id)["day"] is True
+
+
+async def test_stats_links_open_artist_and_album(env):
+    await env.dp.feed_update(env.bot, message_update(text="/start ar7"))
+    assert "Кино" in env.tg.texts()[-1] and "популярные треки" in env.tg.texts()[-1]
+    await env.dp.feed_update(env.bot, message_update(text="/start al1"))
+    assert "Звезда по имени Солнце" in env.tg.texts()[-1]
+    await env.dp.feed_update(env.bot, message_update(text="/start ar7x"))
+    assert "Всё остальное — в медиатеке" in env.tg.texts()[-1], "непонятный параметр — просто главное меню"
 
 
 async def test_stats_scheduled_report_once(env, monkeypatch):

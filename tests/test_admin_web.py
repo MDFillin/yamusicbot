@@ -319,3 +319,30 @@ async def test_owner_is_alerted_when_yandex_changes_upload(env):
     assert alerts("снова работает")
     health = (await (await env.client.get("/api/admin/overview")).json())["upload_health"]
     assert not health["broken"] and health["last_ok"]
+
+
+async def test_live_tracking_switch_and_self_check(env):
+    from bot.live import LiveTracker
+    from bot.web.app import CTX
+
+    c = env.client
+    r = await c.put("/api/admin/settings", json={"live_tracking": False})
+    assert (await r.json())["live_tracking"] is False and not env.admin.settings.live_tracking
+    assert any("точный подсчёт прослушиваний выкл" in (e["details"] or "") for e in env.store.audit())
+    await c.put("/api/admin/settings", json={"live_tracking": True})
+
+    env.store.save_track_meta("1", "Кукушка", "10", "Альбом", "rusrock", 180_000, None, [("7", "Кино")])
+    env.store.add_play(ADMIN_ID, int(time.time()), "2026-09-23", "1", "none", 100_000, "live")
+    env.store.add_play(FRIEND_ID, int(time.time()), "2026-09-23", "1", "none", 100_000, "live")
+    data = await (await c.get("/api/admin/live")).json()
+    assert data["enabled"] is False and data["me"] is None, "бот без точного подсчёта (как в тестах)"
+    assert [(r["title"], r["artists"]) for r in data["recent"]] == [("Кукушка", "Кино")], "только свой аккаунт"
+
+    listening = c.server.app[CTX].listening
+    listening.live = LiveTracker(env.store, env.admin.accounts, env.admin, listening)
+    data = await (await c.get("/api/admin/live")).json()
+    assert data["enabled"] is True and data["me"]["connected"] is False and data["me"]["stats_enabled"] is False
+    overview = await (await c.get("/api/admin/overview")).json()
+    assert overview["listening"]["live"] == {"enabled": True, "connections": 0, "connected": 0,
+                                             "health": env.admin.live_health.json()}
+    assert (await c.get("/api/admin/live", headers=as_user(FRIEND_ID))).status == 404

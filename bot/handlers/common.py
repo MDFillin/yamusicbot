@@ -45,8 +45,9 @@ HELP = f"""<b>🎧 Что умеет бот</b>
 • Наберите <code>@{{bot}}</code> и название песни — трек уйдёт собеседнику. Без запроса покажу «Мне нравится».
 
 <b>📊 Статистика</b>
-• /stats — что и сколько вы слушаете в Яндекс Музыке (приложение, сайт, колонки): топы исполнителей и треков, \
-жанры, новые открытия, серии дней. После включения итоги недели и месяца буду присылать сам.
+• /stats — что и сколько вы слушаете в Яндекс Музыке (приложение, сайт, колонки): каждое прослушивание \
+с повторами, топы исполнителей и треков, жанры, новые открытия. Итоги недели и месяца буду присылать сам, \
+треки в них — ссылки: нажали, и трек пришёл.
 
 <b>⚙️ Управление</b>
 • Под каждым треком: ❤️ в любимые, ➕ добавить в плейлист.
@@ -88,10 +89,12 @@ def welcome(user: User | None, config: Config) -> tuple[str, InlineKeyboardMarku
     return WELCOME.format(name=name), welcome_menu(config.webapp_url)
 
 
-@router.message(CommandStart(deep_link=True, magic=F.args.regexp(r"^(login|t[\w-]+)$")), flags=PUBLIC)
+@router.message(CommandStart(deep_link=True, magic=F.args.regexp(r"^(login|t[\w-]+|ar\d{1,20}|al\d{1,20})$")),
+                flags=PUBLIC)
 async def start_link(message: Message, command: CommandObject, state: FSMContext, config: Config,
                      accounts: Accounts, sender: TrackSender, ym: YandexMusic | None, ym_error: str | None) -> None:
-    """Ссылки t.me/бот?start=…: login — сразу ко входу, t<id> — прислать трек (кнопка под треком из инлайна)."""
+    """Ссылки t.me/бот?start=…: login — сразу ко входу, t<id> — прислать трек (кнопка под треком из инлайна,
+    трек в итогах статистики), ar<id> / al<id> — треки исполнителя / альбом (ссылки в итогах)."""
     await state.clear()
     arg = command.args
     if arg == "login":
@@ -101,6 +104,9 @@ async def start_link(message: Message, command: CommandObject, state: FSMContext
         return
     if ym is None:
         await start(message, state, config, ym, ym_error)
+        return
+    if arg.startswith(("ar", "al")):
+        await show_source(message, ym, "art" if arg.startswith("ar") else "alb", arg[2:])
         return
     track = await ym.get_track(arg[1:])
     if track is None:

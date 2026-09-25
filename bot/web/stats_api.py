@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import re
+import time
 from typing import Any
 
 from aiohttp import web
 
-from bot.listening import MANUAL_SYNC_INTERVAL, Listening, msk_now, period_at
-from bot.web.app import CTX, USER, YM, _json_body, track_json
+from bot.listening import APP_CONTEXT, MANUAL_SYNC_INTERVAL, Listening, msk_now, period_at
+from bot.live import msk_day
+from bot.web.app import CTX, USER, YM, _json_body, cover_url, track_json
 
 routes = web.RouteTableDef()
 KINDS = ("day", "week", "month", "year")
+_TRACK_ID = re.compile(r"^\d{1,20}$")
+APP_PLAY_GAP = 10  # сек: чаще плеер «Медиатеки» прослушивания не присылает (порог — от 24 секунд трека)
 
 
 def _listening(request: web.Request) -> Listening:
@@ -27,6 +32,9 @@ async def stats(request: web.Request) -> web.Response:
     body: dict[str, Any] = {"enabled": listening.enabled(user_id), "prefs": listening.prefs(user_id)}
     if not body["enabled"]:
         return web.json_response(body)
+    live = listening.live
+    body["live"] = {"enabled": bool(live and live.enabled),
+                    "connected": bool(live and (c := live.conns.get(user_id)) and c.connected)}
     kind = request.query.get("kind", "week")
     if kind not in KINDS:
         raise web.HTTPBadRequest(text="Неизвестный период")
@@ -46,9 +54,34 @@ async def stats(request: web.Request) -> web.Response:
         for t in top:
             if (full := by_id.get(t["id"])) is not None:
                 tracks.append({**track_json(full, ctx.signer, user_id), "plays": t["plays"]})
+    for album in st["top_albums"]:
+        album["cover"] = cover_url(album.pop("cover_uri", None))
     body.update(period={"kind": kind, "offset": offset, "title": p.title, "start": p.start.isoformat(),
                         "end": p.end.isoformat(), "today": msk_now().date().isoformat()}, stats=st, top_tracks=tracks)
     return web.json_response(body)
+
+
+@routes.post("/api/stats/played")
+async def played(request: web.Request) -> web.Response:
+    """Плеер «Медиатеки» дослушал трек до порога — засчитать (Яндекс о таком прослушивании не знает)."""
+    listening, user_id = _listening(request), _user(request)
+    if not listening.enabled(user_id):
+        return web.json_response({"counted": False})
+    body = await _json_body(request)
+    track_id, ms = str(body.get("id") or ""), body.get("ms")
+    if not _TRACK_ID.match(track_id) or not isinstance(ms, int) or not 1_000 <= ms <= 4 * 3600 * 1000:
+        raise web.HTTPBadRequest(text="Неверные данные прослушивания")
+    # Прослушать ms за время, прошедшее с прошлого сообщения, физически нельзя быстрее, чем за ms.
+    last = listening.app_reports.get(user_id)
+    if last is not None and time.monotonic() - last < max(APP_PLAY_GAP, ms / 1000 * 0.8):
+        raise web.HTTPTooManyRequests(text="Слишком часто")
+    listening.app_reports[user_id] = time.monotonic()
+    now = time.time()
+    listening.store.add_play(user_id, int(now - ms / 1000), msk_day(now - ms / 1000), track_id, APP_CONTEXT, ms,
+                             "app")
+    await listening.fill_meta(request[YM], [track_id])
+    await listening.fill_contexts(request[YM], {APP_CONTEXT: "bot"})
+    return web.json_response({"counted": True})
 
 
 @routes.put("/api/stats")

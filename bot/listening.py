@@ -1,9 +1,13 @@
-"""Статистика прослушиваний: история Яндекс Музыки → база бота → итоги дня, недели, месяца и года.
+"""Статистика прослушиваний: откуда берутся прослушивания, подсчёт и итоги дня, недели, месяца и года.
 
-История прослушивания Яндекса (раздел «История» в приложении) общая для всех устройств: приложения, сайта,
-колонок. В ней есть день, трек и откуда он играл, но нет времени и числа повторов. Поэтому «прослушивание»
-здесь — трек в конкретный день, а время — оценка по длительности треков. Яндекс хранит историю недолго,
-бот копит её сам с момента, когда человек включил статистику (раз в час забирает свежую).
+Прослушивания бот собирает из трёх мест:
+- вживую из плеера Яндекс Музыки (bot/live.py, Ynison): каждое, включая повторы, и сколько слушали;
+- из плеера «Медиатеки» (сообщает само мини-приложение);
+- из истории Яндекса (раздел «История» в приложении) — раз в час, как запасной источник: там есть день,
+  трек и откуда он играл, но нет времени и повторов. Из неё добирается то, чего бот не видел вживую
+  (был выключен, трек играл на устройстве без Ynison) — один раз за день, время по длительности трека.
+Как это сводится в один набор, описано в Storage._PLAYS. Яндекс хранит историю недолго, поэтому статистика
+копится с момента, когда человек её включил.
 """
 
 from __future__ import annotations
@@ -12,11 +16,12 @@ import asyncio
 import contextlib
 import html
 import logging
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
@@ -31,6 +36,9 @@ from bot.errors import log_failure, spawn
 from bot.keyboards import plural
 from bot.storage import Storage
 from bot.ym import YandexMusic, YandexNotReady
+
+if TYPE_CHECKING:
+    from bot.live import LiveTracker
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +59,9 @@ MONTHS_NOM = ["Январь", "Февраль", "Март", "Апрель", "М�
               "Ноябрь", "Декабрь"]
 MONTHS_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 SOURCE_LABELS = {"wave": "Моя волна", "playlist": "Плейлисты", "album": "Альбомы", "artist": "Исполнители",
-                 "track": "Треки", "other": "Другое"}
+                 "track": "Треки", "bot": "Плеер «Медиатеки»", "other": "Другое"}
+APP_CONTEXT = "bot:app"  # прослушивания из плеера мини-приложения
+_LINK_ID = re.compile(r"^[\w-]{1,60}$")
 GENRES = {
     "pop": "поп", "ruspop": "русская поп-музыка", "rusestrada": "эстрада", "estrada": "эстрада", "rock": "рок",
     "rusrock": "русский рок", "alternative": "альтернатива", "indie": "инди", "local-indie": "инди",
@@ -248,6 +258,9 @@ class Listening:
         self._locks: dict[int, asyncio.Lock] = {}
         self._task: asyncio.Task | None = None
         self._jobs: set[asyncio.Task] = set()
+        self.live: LiveTracker | None = None  # bot/live.py; None — только история
+        self._username: str | None = None
+        self.app_reports: dict[int, float] = {}  # когда плеер «Медиатеки» прислал прошлое прослушивание
 
     # ---------- настройки ----------
 
@@ -269,9 +282,13 @@ class Listening:
 
     def enable(self, user_id: int) -> None:
         self.store.set_setting(user_id, "stats", "1")
+        if self.live is not None:
+            self.live.wake(user_id)
 
     def disable(self, user_id: int, delete: bool = False) -> int:
         self.store.set_setting(user_id, "stats", None)
+        if self.live is not None:
+            self.live.forget(user_id)
         return self.store.delete_listens(user_id) if delete else 0
 
     def can_sync_now(self, user_id: int) -> bool:
@@ -309,19 +326,21 @@ class Listening:
             await self.admin.history_health.succeeded()
             if not listens:
                 return 0
-            await self._fill_meta(ym, listens)
+            full = {x.track_id: x.track for x in listens if x.track is not None and getattr(x.track, "id", None)}
+            await self.fill_meta(ym, [x.track_id for x in listens], full)
             added = self.store.add_listens(user_id, [(x.day, x.track_id, x.context) for x in listens])
-            await self._fill_contexts(ym, listens)
+            await self.fill_contexts(ym, {x.context: x.context_type for x in listens})
             if added:
                 log.info("Статистика %s: +%s прослушиваний", user_id, added)
             return added
 
-    async def _fill_meta(self, ym: YandexMusic, listens: list[Listen]) -> None:
-        ids = sorted({x.track_id for x in listens})
+    async def fill_meta(self, ym: YandexMusic, track_ids: Iterable[str], full: dict[str, Any] | None = None) -> None:
+        """Название, исполнители, альбом, жанр и длительность треков, которых ещё нет в кэше."""
+        ids = sorted(set(track_ids))
         missing = [i for i in ids if i not in self.store.known_tracks(ids)]
         if not missing:
             return
-        full = {x.track_id: x.track for x in listens if x.track is not None and getattr(x.track, "id", None)}
+        full = dict(full or {})
         fetch = [i for i in missing if i not in full]
         if fetch:
             try:
@@ -336,13 +355,16 @@ class Listening:
             else:  # трек удалён или недоступен — запоминаем, чтобы не спрашивать каждый час
                 self.store.save_track_meta(track_id, None, None, None, None, None, None, [])
 
-    async def _fill_contexts(self, ym: YandexMusic, listens: list[Listen]) -> None:
-        types = {x.context: x.context_type for x in listens if x.context != "none"}
+    async def fill_contexts(self, ym: YandexMusic, contexts: dict[str, str]) -> None:
+        """Названия источников (плейлист, альбом, волна) — {ключ: тип}."""
+        types = {k: v for k, v in contexts.items() if k != "none"}
         for key in self.store.unknown_contexts(sorted(types)):
             type_, title = types[key], None
             parts = key.split(":")
             if type_ == "wave":
                 title = "Моя волна" if "onyourwave" in key else "Волна"
+            elif type_ == "bot":
+                title = SOURCE_LABELS["bot"]
             elif type_ == "playlist" and len(parts) == 3:
                 with contextlib.suppress(Exception):
                     playlist = await ym.get_playlist(parts[2], parts[1])
@@ -377,6 +399,7 @@ class Listening:
         return {
             "plays": plays,
             "minutes": raw["minutes"],
+            "estimated": raw["estimated"],  # сколько из них — по истории Яндекса (без повторов, время примерное)
             "tracks": raw["tracks"],
             "artists": raw["artists"],
             "active_days": len(raw["by_day"]),
@@ -400,25 +423,46 @@ class Listening:
             "top_sources": raw["top_sources"],
         }
 
-    def report_text(self, user_id: int, p: Period, heading: str | None = None) -> str:
+    async def username(self) -> str | None:
+        if self._username is None:
+            with contextlib.suppress(Exception):
+                self._username = (await self.bot.me()).username
+        return self._username
+
+    async def report(self, user_id: int, p: Period, offset: int = 0,
+                     heading: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
+        """Итоги сообщением: текст со ссылками на треки и исполнителей и кнопки периодов."""
+        return self.report_text(user_id, p, heading, await self.username()), self.report_markup(p, offset)
+
+    def report_text(self, user_id: int, p: Period, heading: str | None = None, username: str | None = None) -> str:
+        """Итоги текстом. С username треки и исполнители — ссылки: нажал — бот прислал трек или открыл исполнителя."""
         st = self.stats(user_id, p)
+
+        def link(prefix: str, ref: str | None, text: str) -> str:
+            text = html.escape(text)
+            if username and ref and _LINK_ID.match(ref):
+                return f'<a href="https://t.me/{username}?start={prefix}{ref}">{text}</a>'
+            return text
+
         heads = {"day": "Твой день в музыке", "week": "Твоя неделя в музыке", "month": "Твой месяц в музыке",
                  "year": "Твой год в музыке"}
         lines = [f"📊 <b>{heading or heads[p.kind]}</b> · {p.title}", ""]
         if not st["plays"]:
             lines.append("Пока пусто: слушайте музыку в Яндекс Музыке — в приложении, на сайте или на колонке, "
-                         "а я посчитаю. История обновляется раз в час.")
+                         "а я посчитаю.")
             return "\n".join(lines)
         change = ""
         if st["change_pct"] is not None and p.kind != "day":
             arrow = "▲" if st["change_pct"] >= 0 else "▼"
             what = {"week": "прошлой неделе", "month": "прошлому месяцу", "year": "прошлому году"}[p.kind]
             change = f" ({arrow} {abs(st['change_pct'])}% к {what})"
-        lines.append(f"🎧 <b>{st['plays']}</b> {plural(st['plays'], 'трек', 'трека', 'треков')} · "
-                     f"≈ {fmt_minutes(st['minutes'])}{change}")
+        approx = "≈ " if st["estimated"] else ""
+        lines.append(f"🎧 <b>{st['plays']}</b> {plural(st['plays'], 'прослушивание', 'прослушивания', 'прослушиваний')}"
+                     f" · {approx}{fmt_minutes(st['minutes'])}{change}")
         artists = f"👤 <b>{st['artists']}</b> {plural(st['artists'], 'исполнитель', 'исполнителя', 'исполнителей')}"
+        artists += f" · {st['tracks']} {plural(st['tracks'], 'трек', 'трека', 'треков')}"
         if st["new_artists_count"]:
-            artists += f", из них 🆕 {st['new_artists_count']} новых"
+            artists += f", 🆕 {st['new_artists_count']} новых исполнителей"
         lines.append(artists)
         if p.kind != "day":
             lines.append(f"📅 Дней с музыкой: {st['active_days']} из {st['days']}")
@@ -426,16 +470,19 @@ class Listening:
             lines.append(f"🔥 Серия: {st['streak']} {plural(st['streak'], 'день', 'дня', 'дней')} подряд")
         if st["top_artists"]:
             lines += ["", "<b>Топ исполнителей</b>"]
-            lines += [f"{i}. {html.escape(a['name'] or '—')} — {a['plays']}"
+            lines += [f"{i}. {link('ar', a['id'], a['name'] or '—')} — {a['plays']}"
                       for i, a in enumerate(st["top_artists"][:5], 1)]
         if st["top_tracks"]:
-            names = self.store.track_names([t["id"] for t in st["top_tracks"][:5]])
+            info = self.store.track_info([t["id"] for t in st["top_tracks"][:5]])
             lines += ["", "<b>Топ треков</b>"]
             for i, t in enumerate(st["top_tracks"][:5], 1):
-                title, artists_ = names.get(t["id"], ("Трек", ""))
-                label = f"{artists_} — {title}" if artists_ else title
-                days = f" ({t['plays']} {plural(t['plays'], 'день', 'дня', 'дней')})" if p.kind != "day" else ""
-                lines.append(f"{i}. {html.escape(label)}{days}")
+                title, track_artists = info.get(t["id"], ("Трек", []))
+                line = f"{i}. {link('t', t['id'], title)}"
+                if track_artists:
+                    line += " — " + ", ".join(link("ar", a_id, name) for a_id, name in track_artists[:3])
+                if t["plays"] > 1:
+                    line += f" · {t['plays']} {plural(t['plays'], 'раз', 'раза', 'раз')}"
+                lines.append(line)
         if st["genres"]:
             lines += ["", "<b>Жанры:</b> " + " · ".join(f"{html.escape(g['label'])} {g['pct']}%"
                                                         for g in st["genres"][:4])]
@@ -443,7 +490,10 @@ class Listening:
             lines.append("<b>Откуда:</b> " + " · ".join(f"{html.escape(x['label'])} {x['pct']}%"
                                                         for x in st["sources"][:4]))
         if st["new_artists"]:
-            lines.append("<b>Открытия:</b> " + ", ".join(html.escape(a["name"] or "—") for a in st["new_artists"][:3]))
+            lines.append("<b>Открытия:</b> " + ", ".join(link("ar", a["id"], a["name"] or "—")
+                                                          for a in st["new_artists"][:3]))
+        if username:
+            lines += ["", "<i>Нажмите на трек — пришлю его, на исполнителя — покажу его треки.</i>"]
         if st["collecting"]:
             lines += ["", "<i>Статистика только начала собираться — новые открытия появятся со следующего периода.</i>"]
         return "\n".join(lines)
@@ -511,8 +561,8 @@ class Listening:
             if not self.stats(user_id, p)["plays"]:
                 continue  # пустые итоги не шлём
             try:
-                await self.bot.send_message(user_id, self.report_text(user_id, p),
-                                            reply_markup=self.report_markup(p, offset_of(p, now.date())))
+                text, markup = await self.report(user_id, p, offset_of(p, now.date()))
+                await self.bot.send_message(user_id, text, reply_markup=markup, disable_web_page_preview=True)
             except TelegramForbiddenError:
                 self.admin.mark_blocked(user_id)
             except Exception as e:

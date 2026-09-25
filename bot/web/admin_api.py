@@ -44,8 +44,39 @@ async def overview(request: web.Request) -> web.Response:
         "settings": admin.settings_json(),
         "broadcast": admin.broadcaster.status,
         "upload_health": admin.upload_health_json(),
-        "listening": {"users": len(admin.store.stats_users()), "health": admin.history_health.json()},
+        "listening": {"users": len(admin.store.stats_users()), "health": admin.history_health.json(),
+                      "live": _live_status(request)},
     })
+
+
+def _live_status(request: web.Request) -> dict[str, Any]:
+    listening = request.app[CTX].listening
+    live = listening.live if listening is not None else None
+    if live is None:
+        return {"enabled": False, "connections": 0, "connected": 0, "health": _admin(request).live_health.json()}
+    return live.status()
+
+
+@routes.get("/api/admin/live")
+async def live_raw(request: web.Request) -> web.Response:
+    """Точный подсчёт на своём аккаунте: подключение, что играет сейчас, последние засчитанные прослушивания
+    и последний кадр от Яндекса как есть — чтобы проверить, что бот видит всё верно."""
+    listening, user_id = request.app[CTX].listening, _actor(request)
+    live = listening.live if listening is not None else None
+    me = live.user_status(user_id) if live is not None else None
+    recent = listening.store.recent_plays(user_id, 20) if listening is not None else []
+    ids = [r["track_id"] for r in recent] + ([me["now"]["track_id"]] if me and me["now"] else [])
+    info = listening.store.track_info(ids) if listening is not None else {}
+
+    def named(track_id: str) -> dict[str, Any]:
+        title, artists = info.get(track_id, (None, []))
+        return {"title": title, "artists": ", ".join(n for _, n in artists)}
+
+    for r in recent:
+        r.update(named(r["track_id"]))
+    if me and me["now"]:
+        me["now"].update(named(me["now"]["track_id"]))
+    return web.json_response({**_live_status(request), "me": me, "recent": recent})
 
 
 @routes.get("/api/admin/history_raw")
@@ -157,7 +188,7 @@ async def admins(request: web.Request) -> web.Response:
 async def settings(request: web.Request) -> web.Response:
     admin = _admin(request)
     body = await _json_body(request)
-    allowed = {"maintenance", "maintenance_text", "closed", "download_limit", "upload_limit"}
+    allowed = {"maintenance", "maintenance_text", "closed", "download_limit", "upload_limit", "live_tracking"}
     try:
         admin.update_settings(_actor(request), {k: v for k, v in body.items() if k in allowed})
     except (TypeError, ValueError) as e:

@@ -145,16 +145,22 @@ async def test_sync_and_stats(listening, monkeypatch):
     assert [(a["name"], a["plays"]) for a in st["top_artists"]] == [("Кино", 3), ("Земфира", 2)]
     assert st["top_tracks"][0] == {"id": "1", "plays": 2}
     assert [g["label"] for g in st["genres"]] == ["русский рок"]
-    assert {x["type"]: x["plays"] for x in st["sources"]} == {"wave": 3, "playlist": 2, "album": 1}
+    # Источник у прослушивания один: «Кукушку» 21-го засчитали один раз, а не и волне, и плейлисту.
+    assert {x["type"]: x["plays"] for x in st["sources"]} == {"wave": 2, "playlist": 2, "album": 1}
     assert {s["title"] for s in st["top_sources"]} == {"Моя волна", "Мои записи", "ПММЛ"}
     assert not st["collecting"] and st["new_tracks"] == 3, "a-ha слушали раньше — это не открытие"
     assert [a["name"] for a in st["new_artists"]] == ["Кино", "Земфира"]
     assert [d["plays"] for d in st["series"]] == [3, 2, 0, 0, 0, 0, 0]
 
+    assert st["estimated"] == 5, "всё из истории: время по длительности"
+
     text = listening.report_text(1, week)
-    assert "Твоя неделя в музыке</b> · 21–27 сентября" in text and "<b>5</b> треков" in text
-    assert "1. Кино — 3" in text and "Кино — Кукушка (2 дня)" in text and "Моя волна 50%" in text
-    assert "▲ 400% к прошлой неделе" in text
+    assert "Твоя неделя в музыке</b> · 21–27 сентября" in text and "<b>5</b> прослушиваний · ≈ 15 мин" in text
+    assert "1. Кино — 3" in text and "1. Кукушка — Кино · 2 раза" in text and "Моя волна 40%" in text
+    assert "▲ 400% к прошлой неделе" in text and "<a " not in text, "без имени бота — без ссылок"
+    linked = listening.report_text(1, week, username="testbot")
+    assert '<a href="https://t.me/testbot?start=t1">Кукушка</a> — <a href="https://t.me/testbot?start=ar7">Кино</a>' \
+        in linked
 
 
 async def test_first_period_is_marked_as_collecting(listening, monkeypatch):

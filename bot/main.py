@@ -34,6 +34,7 @@ from bot.crypto import TokenCipher
 from bot.handlers import build_router
 from bot.handlers.upload import UploadQueue
 from bot.listening import Listening
+from bot.live import LiveTracker
 from bot.middlewares import AccessMiddleware, AccountMiddleware
 from bot.placer import TopPlacer
 from bot.sender import TrackSender
@@ -222,9 +223,11 @@ async def main() -> None:
     if not me.supports_inline_queries:
         log.info("Инлайн-режим выключен: включите его в @BotFather (/setinline и /setinlinefeedback)")
     listening = Listening(store, accounts, admin, bot, config)  # статистика прослушиваний: сбор и итоги
+    listening.live = LiveTracker(store, accounts, admin, listening)  # каждое прослушивание вживую (Ynison)
     dp = build_dispatcher(config, bot, accounts, store, placer, admin, listening)
     runner = await start_web(config, bot, accounts, store, dp["sender"], placer, admin, listening)
     listening.start()
+    listening.live.start()
     try:
         await bot.set_my_commands(COMMANDS)
         await setup_admin_commands(bot, admin)
@@ -232,6 +235,7 @@ async def main() -> None:
         await setup_description(bot)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        await listening.live.close()
         await listening.close()
         await runner.cleanup()
         await placer.close()

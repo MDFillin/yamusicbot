@@ -108,6 +108,27 @@ CREATE TABLE IF NOT EXISTS contexts (
     type TEXT NOT NULL,
     title TEXT
 );
+-- Каждое прослушивание, замеченное вживую (Ynison — плеер официальных приложений, или плеер «Медиатеки»):
+-- с временем начала и сколько слушали. Повтор трека — отдельная строка.
+CREATE TABLE IF NOT EXISTS plays (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL,           -- начало, unix-время
+    day TEXT NOT NULL,             -- ГГГГ-ММ-ДД по Москве
+    track_id TEXT NOT NULL,
+    context TEXT NOT NULL,
+    ms INTEGER NOT NULL,           -- сколько слушали
+    source TEXT NOT NULL           -- live | app
+);
+-- Какие треки бот видел вживую в какой день, в том числе пропущенные: такие дни и треки не добираются
+-- из истории Яндекса (там нет повторов, а пропущенный трек выглядит как прослушанный).
+CREATE TABLE IF NOT EXISTS live_seen (
+    user_id INTEGER NOT NULL,
+    track_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    PRIMARY KEY (user_id, track_id, day)
+);
+CREATE INDEX IF NOT EXISTS plays_user_day ON plays (user_id, day);
 CREATE INDEX IF NOT EXISTS listens_user_track ON listens (user_id, track_id);
 CREATE INDEX IF NOT EXISTS track_artists_artist ON track_artists (artist_id);
 CREATE INDEX IF NOT EXISTS users_last_seen ON users (last_seen);
@@ -468,59 +489,105 @@ class Storage:
     def save_context(self, key: str, type_: str, title: str | None) -> None:
         self._db.execute("INSERT OR REPLACE INTO contexts VALUES (?, ?, ?)", (key, type_, title))
 
+    def add_play(self, user_id: int, ts: int, day: str, track_id: str, context: str, ms: int, source: str) -> int:
+        if source == "live":  # из плеера «Медиатеки» в историю Яндекса ничего не попадает — там заменять нечего
+            self.mark_seen(user_id, track_id, day)
+        return self._db.execute(
+            "INSERT INTO plays (user_id, ts, day, track_id, context, ms, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, ts, day, track_id, context, ms, source)).lastrowid
+
+    def ongoing_play(self, user_id: int, track_id: str, since: int) -> tuple[int, int, int] | None:
+        """Последнее прослушивание трека вживую, начатое не раньше since: (id, начало, сколько слушали)."""
+        return self._one("SELECT id, ts, ms FROM plays WHERE user_id = ? AND track_id = ? AND source = 'live' "
+                         "AND ts >= ? ORDER BY ts DESC LIMIT 1", user_id, track_id, since)
+
+    def update_play_ms(self, play_id: int, ms: int) -> None:
+        self._db.execute("UPDATE plays SET ms = ? WHERE id = ?", (ms, play_id))
+
+    def mark_seen(self, user_id: int, track_id: str, day: str) -> None:
+        self._db.execute("INSERT OR IGNORE INTO live_seen VALUES (?, ?, ?)", (user_id, track_id, day))
+
+    def recent_plays(self, user_id: int, limit: int = 20) -> list[dict]:
+        rows = self._all("SELECT ts, track_id, context, ms, source FROM plays WHERE user_id = ? "
+                         "ORDER BY ts DESC, id DESC LIMIT ?", user_id, limit)
+        return [dict(zip(("ts", "track_id", "context", "ms", "source"), r, strict=True)) for r in rows]
+
     def delete_listens(self, user_id: int) -> int:
-        return self._db.execute("DELETE FROM listens WHERE user_id = ?", (user_id,)).rowcount
+        deleted = self._db.execute("DELETE FROM listens WHERE user_id = ?", (user_id,)).rowcount
+        deleted += self._db.execute("DELETE FROM plays WHERE user_id = ?", (user_id,)).rowcount
+        self._db.execute("DELETE FROM live_seen WHERE user_id = ?", (user_id,))
+        return deleted
+
+    # Все прослушивания пользователя за дни :s..:e — единый набор, по которому считается статистика:
+    # замеченные вживую (каждый повтор — отдельно, время — сколько реально слушали) плюс история Яндекса
+    # там, где бот вживую ничего не видел (бот был выключен, трек играл не через Ynison): такой трек
+    # засчитывается один раз за день, время — по длительности. Соседние дни проверяются тоже: день в истории
+    # Яндекса может быть по времени пользователя, а не по Москве.
+    _PLAYS = """
+        SELECT day, track_id, context, ms FROM plays WHERE user_id = :u AND day BETWEEN :s AND :e
+        UNION ALL
+        SELECT l.day, l.track_id, MIN(l.context), NULL FROM listens l
+        WHERE l.user_id = :u AND l.day BETWEEN :s AND :e AND NOT EXISTS (
+            SELECT 1 FROM live_seen x WHERE x.user_id = :u AND x.track_id = l.track_id
+            AND x.day BETWEEN date(l.day, '-1 day') AND date(l.day, '+1 day'))
+        GROUP BY l.day, l.track_id"""
+    _ALL_TIME = {"s": "0000-00-00", "e": "9999-99-99"}
+
+    def _q(self, sql: str, params: dict) -> list[tuple]:
+        return self._db.execute(sql, params).fetchall()
 
     def listening_since(self, user_id: int) -> str | None:
-        return self._one("SELECT MIN(day) FROM listens WHERE user_id = ?", user_id)[0]
+        return self._q(f"SELECT MIN(day) FROM ({self._PLAYS})", {"u": user_id, **self._ALL_TIME})[0][0]
 
     def listening_days(self, user_id: int) -> list[str]:
-        return [r[0] for r in self._all("SELECT DISTINCT day FROM listens WHERE user_id = ? ORDER BY day", user_id)]
+        return [r[0] for r in self._q(f"SELECT DISTINCT day FROM ({self._PLAYS}) ORDER BY day",
+                                      {"u": user_id, **self._ALL_TIME})]
 
     def listening_stats(self, user_id: int, start: str, end: str, top: int = 10) -> dict:
-        """Статистика за дни start..end включительно. Прослушивание = пара (день, трек): повтор трека в тот же
-        день история Яндекса не различает, а один трек из двух источников за день считаем один раз."""
-        args = (user_id, start, end)
-        plays = "SELECT DISTINCT day, track_id FROM listens WHERE user_id = ? AND day BETWEEN ? AND ?"
-        total, minutes = self._one(
-            f"SELECT COUNT(*), COALESCE(SUM(m.duration_ms), 0) / 60000 FROM ({plays}) p "
-            "LEFT JOIN track_meta m USING (track_id)", *args)
-        tracks, artists = self._one(
+        """Статистика за дни start..end включительно по единому набору прослушиваний (_PLAYS)."""
+        args = {"u": user_id, "s": start, "e": end, "top": top}
+        plays = self._PLAYS
+        total, ms, estimated = self._q(
+            f"SELECT COUNT(*), COALESCE(SUM(COALESCE(p.ms, m.duration_ms, 0)), 0), "
+            f"COALESCE(SUM(p.ms IS NULL), 0) FROM ({plays}) p LEFT JOIN track_meta m USING (track_id)", args)[0]
+        tracks, artists = self._q(
             f"SELECT COUNT(DISTINCT p.track_id), COUNT(DISTINCT a.artist_id) FROM ({plays}) p "
-            "LEFT JOIN track_artists a USING (track_id)", *args)
-        by_day = dict(self._all(f"SELECT day, COUNT(*) FROM ({plays}) GROUP BY day", *args))
-        top_artists = self._all(
+            "LEFT JOIN track_artists a USING (track_id)", args)[0]
+        by_day = dict(self._q(f"SELECT day, COUNT(*) FROM ({plays}) GROUP BY day", args))
+        top_artists = self._q(
             f"SELECT a.artist_id, MAX(a.name), COUNT(*) c FROM ({plays}) p JOIN track_artists a USING (track_id) "
-            "GROUP BY a.artist_id ORDER BY c DESC, MAX(a.name) LIMIT ?", *args, top)
-        top_tracks = self._all(
+            "GROUP BY a.artist_id ORDER BY c DESC, MAX(a.name) LIMIT :top", args)
+        top_tracks = self._q(
             f"SELECT p.track_id, COUNT(*) c FROM ({plays}) p GROUP BY p.track_id ORDER BY c DESC, "
-            "MAX(p.day) DESC LIMIT ?", *args, top)
-        top_albums = self._all(
-            f"SELECT m.album_id, MAX(m.album), COUNT(*) c FROM ({plays}) p JOIN track_meta m USING (track_id) "
-            "WHERE m.album_id IS NOT NULL GROUP BY m.album_id ORDER BY c DESC LIMIT ?", *args, top)
-        genres = self._all(
+            "MAX(p.day) DESC LIMIT :top", args)
+        top_albums = self._q(
+            f"SELECT m.album_id, MAX(m.album), MAX(m.cover_uri), COUNT(*) c FROM ({plays}) p "
+            "JOIN track_meta m USING (track_id) WHERE m.album_id IS NOT NULL GROUP BY m.album_id "
+            "ORDER BY c DESC LIMIT :top", args)
+        genres = self._q(
             f"SELECT m.genre, COUNT(*) c FROM ({plays}) p JOIN track_meta m USING (track_id) "
-            "WHERE m.genre IS NOT NULL AND m.genre != '' GROUP BY m.genre ORDER BY c DESC", *args)
-        sources = self._all(
-            "SELECT COALESCE(c.type, CASE WHEN l.context = 'none' THEN 'other' ELSE substr(l.context, 1, "
-            "instr(l.context, ':') - 1) END) t, COUNT(*) n FROM listens l LEFT JOIN contexts c ON c.key = l.context "
-            "WHERE l.user_id = ? AND l.day BETWEEN ? AND ? GROUP BY t ORDER BY n DESC", *args)
-        top_sources = self._all(
-            "SELECT l.context, MAX(c.type), MAX(c.title), COUNT(*) n FROM listens l LEFT JOIN contexts c "
-            "ON c.key = l.context WHERE l.user_id = ? AND l.day BETWEEN ? AND ? AND l.context != 'none' "
-            "GROUP BY l.context ORDER BY n DESC LIMIT ?", *args, 5)
-        new_tracks = self._one(
-            "SELECT COUNT(*) FROM (SELECT track_id FROM listens WHERE user_id = ? GROUP BY track_id "
-            "HAVING MIN(day) BETWEEN ? AND ?)", *args)[0]
-        new_artists = self._all(
-            "SELECT a.artist_id, MAX(a.name) FROM listens l JOIN track_artists a USING (track_id) "
-            "WHERE l.user_id = ? GROUP BY a.artist_id HAVING MIN(l.day) BETWEEN ? AND ? "
-            "ORDER BY COUNT(*) DESC", *args)
+            "WHERE m.genre IS NOT NULL AND m.genre != '' GROUP BY m.genre ORDER BY c DESC", args)
+        sources = self._q(
+            "SELECT COALESCE(c.type, CASE WHEN p.context = 'none' THEN 'other' ELSE substr(p.context, 1, "
+            f"instr(p.context, ':') - 1) END) t, COUNT(*) n FROM ({plays}) p LEFT JOIN contexts c "
+            "ON c.key = p.context GROUP BY t ORDER BY n DESC", args)
+        top_sources = self._q(
+            f"SELECT p.context, MAX(c.type), MAX(c.title), COUNT(*) n FROM ({plays}) p LEFT JOIN contexts c "
+            "ON c.key = p.context WHERE p.context != 'none' GROUP BY p.context ORDER BY n DESC LIMIT 5", args)
+        # Новое — то, что впервые прозвучало в этом периоде (за всё время наблюдений).
+        ever = {"u": user_id, **self._ALL_TIME, "ps": start, "pe": end}
+        new_tracks = self._q(
+            f"SELECT COUNT(*) FROM (SELECT track_id FROM ({plays}) GROUP BY track_id "
+            "HAVING MIN(day) BETWEEN :ps AND :pe)", ever)[0][0]
+        new_artists = self._q(
+            f"SELECT a.artist_id, MAX(a.name) FROM ({plays}) p JOIN track_artists a USING (track_id) "
+            "GROUP BY a.artist_id HAVING MIN(p.day) BETWEEN :ps AND :pe ORDER BY COUNT(*) DESC", ever)
         return {
-            "plays": total, "minutes": minutes, "tracks": tracks, "artists": artists, "by_day": by_day,
+            "plays": total, "minutes": ms // 60000, "estimated": estimated, "tracks": tracks, "artists": artists,
+            "by_day": by_day,
             "top_artists": [{"id": i, "name": n, "plays": c} for i, n, c in top_artists],
             "top_tracks": [{"id": i, "plays": c} for i, c in top_tracks],
-            "top_albums": [{"id": i, "title": t, "plays": c} for i, t, c in top_albums],
+            "top_albums": [{"id": i, "title": t, "cover_uri": cov, "plays": c} for i, t, cov, c in top_albums],
             "genres": [{"id": g, "plays": c} for g, c in genres],
             "sources": [{"type": t, "plays": n} for t, n in sources],
             "top_sources": [{"key": k, "type": t, "title": title, "plays": n} for k, t, title, n in top_sources],
@@ -528,15 +595,15 @@ class Storage:
             "new_artists": [{"id": i, "name": n} for i, n in new_artists],
         }
 
-    def track_names(self, track_ids: list[str]) -> dict[str, tuple[str, str]]:
-        """{трек: (название, «Исполнитель, Исполнитель»)} из кэша данных треков."""
-        result: dict[str, tuple[str, str]] = {}
+    def track_info(self, track_ids: list[str]) -> dict[str, tuple[str, list[tuple[str, str]]]]:
+        """{трек: (название, [(id исполнителя, имя), …])} из кэша данных треков."""
+        result: dict[str, tuple[str, list[tuple[str, str]]]] = {}
         for track_id in track_ids:
             row = self._one("SELECT title FROM track_meta WHERE track_id = ?", track_id)
             if row and row[0]:
-                names = [r[0] for r in self._all(
-                    "SELECT name FROM track_artists WHERE track_id = ? ORDER BY pos", track_id) if r[0]]
-                result[track_id] = (row[0], ", ".join(names))
+                artists = [(a, n) for a, n in self._all(
+                    "SELECT artist_id, name FROM track_artists WHERE track_id = ? ORDER BY pos", track_id) if n]
+                result[track_id] = (row[0], artists)
         return result
 
     def album_title(self, album_id: str) -> str | None:

@@ -661,6 +661,22 @@ async def test_stats_api(env):
     assert env.ym.calls.count(("music_history",)) == 1, "повторное включение не дёргает Яндекс чаще раза в минуту"
     r = await c.put("/api/stats", json={"day": True})
     assert (await r.json())["prefs"]["day"] is True
+
+    # Плеер «Медиатеки» сам сообщает о прослушиваниях: Яндекс о них не знает.
+    r = await c.post("/api/stats/played", json={"id": "1", "ms": 100_000})
+    assert (await r.json())["counted"] is True
+    r = await c.post("/api/stats/played", json={"id": "2", "ms": 100_000})
+    assert r.status == 429, "100 секунд за мгновение не прослушать"
+    for bad in ({"id": "1;x", "ms": 5000}, {"id": "1", "ms": "5000"}, {"id": "1", "ms": 10}, {}):
+        assert (await c.post("/api/stats/played", json=bad)).status == 400, bad
+    r = await c.post("/api/stats/played", json={"id": "1", "ms": 100_000}, headers=as_user(FRIEND_ID))
+    assert (await r.json())["counted"] is False, "у друга статистика выключена — не считаем"
+    data = await (await c.get("/api/stats?kind=week")).json()
+    assert data["stats"]["plays"] == 3 and data["stats"]["estimated"] == 2
+    assert {x["label"] for x in data["stats"]["sources"]} == {"Моя волна", "Плеер «Медиатеки»"}
+    assert data["live"] == {"enabled": False, "connected": False}
+    assert all("cover" in a and "cover_uri" not in a for a in data["stats"]["top_albums"])
+
     r = await c.delete("/api/stats")
-    assert (await r.json())["deleted"] == 2
+    assert (await r.json())["deleted"] == 3
     assert (await (await c.get("/api/stats")).json())["enabled"] is False
