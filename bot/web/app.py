@@ -44,6 +44,7 @@ from bot.storage import Storage
 from bot.web.auth import AuthError, MediaSigner, init_data_age, verify_init_data
 from bot.ym import (
     TrackUnavailableError,
+    UploadEndpointError,
     UploadError,
     YandexMusic,
     YandexNotReady,
@@ -702,7 +703,12 @@ async def _upload(request: web.Request, ctx: WebContext) -> web.Response:
         fallback_artist=fields.get("fallback_artist") or None, fallback_title=fields.get("fallback_title") or None,
     )
     known = await ctx.placer.before_upload(ym, kind)
-    result = await ym.upload_track(kind, name, prepared)
+    try:
+        result = await ym.upload_track(kind, name, prepared)
+    except UploadEndpointError as e:  # неофициальный API изменился — владелец узнает сразу
+        await ctx.admin.upload_failed(_user_id(request), e.details)
+        raise
+    await ctx.admin.upload_succeeded()
     ctx.admin.count(_user_id(request), "upload")
     ctx.placer.after_upload(ym, kind, known, result.ugc_track_id)  # встанет в начало, когда Яндекс обработает
     ctx.invalidate(_user_id(request))

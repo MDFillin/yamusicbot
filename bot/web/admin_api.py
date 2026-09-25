@@ -42,6 +42,7 @@ async def overview(request: web.Request) -> web.Response:
         "server": admin.server_info(),
         "settings": admin.settings_json(),
         "broadcast": admin.broadcaster.status,
+        "upload_health": admin.upload_health_json(),
     })
 
 

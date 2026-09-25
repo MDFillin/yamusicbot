@@ -116,7 +116,7 @@ async def test_error_lists_every_attempt(fake_yandex):
             await ym.upload_track(1003, "a.mp3", b"x")
     finally:
         await ym.close()
-    text = str(err.value)
+    text = err.value.details  # подробности — владельцу (в лог и уведомление), пользователю — понятный текст
     assert "/dead/loader/upload-url: HTTP 404" in text and "/also-dead/loader/upload-url: HTTP 404" in text
 
 
@@ -218,3 +218,44 @@ def test_yandex_hosts():
     assert not _is_yandex("http://api.music.yandex.net/x"), "только HTTPS"
     assert not _is_yandex("https://yandex.net.evil.com/x") and not _is_yandex("https://evilyandex.ru/x")
     assert not _is_yandex("https://evil.com/?u=https://api.music.yandex.net")
+
+
+async def _loader_answering(status: int, body: str = '{"message": "Not found"}'):
+    async def loader(request: web.Request) -> web.Response:
+        return web.Response(status=status, text=body, content_type="application/json")
+
+    server = TestServer(web.Application())
+    server.app.router.add_post("/api/loader/upload-url", loader)
+    await server.start_server()
+    return server
+
+
+@pytest.mark.parametrize(("status", "endpoint_broken"), [(404, True), (405, True), (500, True), (401, False)])
+async def test_endpoint_breakage_is_told_apart_from_user_problems(status, endpoint_broken):
+    from bot.ym import UploadEndpointError
+
+    server = await _loader_answering(status)
+    ym = make_ym([str(server.make_url("/api")).rstrip("/")])
+    try:
+        with pytest.raises(UploadError) as info:
+            await ym.upload_track(1003, "a.mp3", b"ID3")
+    finally:
+        await ym.close()
+        await server.close()
+    assert isinstance(info.value, UploadEndpointError) == endpoint_broken
+    if endpoint_broken:
+        assert "Яндекс изменил свой сайт" in str(info.value) and f"HTTP {status}" in info.value.details
+    else:
+        assert "/login" in str(info.value), "отозванный вход — это не поломка у Яндекса"
+
+
+async def test_no_connection_is_not_endpoint_breakage():
+    from bot.ym import UploadEndpointError
+
+    ym = make_ym(["http://127.0.0.1:9/api"])  # никто не слушает
+    try:
+        with pytest.raises(UploadError) as info:
+            await ym.upload_track(1003, "a.mp3", b"ID3")
+    finally:
+        await ym.close()
+    assert not isinstance(info.value, UploadEndpointError)

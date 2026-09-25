@@ -34,6 +34,7 @@ from aiogram.types import BotCommandScopeChat, FSInputFile
 from bot.accounts import Accounts
 from bot.commands import ADMIN_COMMANDS
 from bot.config import Config
+from bot.errors import spawn
 from bot.storage import Storage
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,21 @@ AUDIT_LABELS = {
 ADMIN_GRANTED = ("🛡 Вам выданы права администратора бота.\n\n"
                  "Админ-панель — щит 🛡 в «Медиатеке» или команда /admin.")
 ADMIN_REVOKED = "Права администратора бота сняты."
+
+
+UPLOAD_ALERT_STREAK = 3  # неудач подряд без единой успешной загрузки — считаем, что Яндекс всё сломал
+UPLOAD_ALERT_USERS = 2  # …или неудачи у стольких разных людей
+UPLOAD_BROKEN = (
+    "⚠️ <b>Загрузка треков в Яндекс Музыку перестала работать</b>\n\n"
+    "Похоже, Яндекс изменил свой сайт: загрузка держится на его неофициальном API. Последний ответ:\n"
+    "<code>{details}</code>\n\n"
+    "Что сделать:\n"
+    "1. Обновите бота — возможно, исправление уже есть: <code>git pull &amp;&amp; docker compose up -d --build</code>\n"
+    "2. Если не помогло, найдите новый адрес в коде сайта Яндекса:\n"
+    "<code>docker compose run --rm bot python -m bot.diag_upload</code> (отчёт — в data/upload_api.txt)\n\n"
+    "Остальное работает как обычно. Когда загрузка снова заработает, я напишу."
+)
+UPLOAD_FIXED = "✅ Загрузка треков в Яндекс Музыку снова работает."
 
 
 class Forbidden(PermissionError):
@@ -162,7 +178,7 @@ class Broadcaster:
         self.status = {"state": "running", "audience": audience, "total": len(ids), "sent": 0, "failed": 0,
                        "blocked": 0, "started_at": int(time.time()), "finished_at": None, "by": actor,
                        "preview": text[:200], "error": None}
-        self._task = asyncio.create_task(self._run(actor, ids, text))
+        self._task = spawn(self._run(actor, ids, text), "рассылка")
         return self.status
 
     def cancel(self) -> bool:
@@ -251,6 +267,10 @@ class Admin:
         self._probes: dict[int, float] = {}
         self._ffmpeg_version: str | None = None
         self._appointed = store.admin_ids() - set(config.admin_ids)
+        try:
+            self.upload_health: dict[str, Any] = json.loads(store.get_meta("upload_health") or "{}")
+        except ValueError:
+            self.upload_health = {}
 
     # ---------- доступ ----------
 
@@ -512,14 +532,54 @@ class Admin:
             size = os.path.getsize(name)
             await self.bot.send_document(
                 actor, FSInputFile(name, filename=f"yamusicbot-{today()}.db"),
-                caption="💾 Резервная копия базы бота.\n⚠️ Внутри входы пользователей в Яндекс Музыку — "
-                        "храните файл надёжно и никому не пересылайте.",
+                caption="💾 Резервная копия базы бота.\n🔐 Входы пользователей в ней зашифрованы. Чтобы "
+                        "восстановить базу, понадобится ключ: ENCRYPTION_KEY из .env или файл data/secret.key "
+                        "с сервера — храните его отдельно от копии и никому не пересылайте.",
             )
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(name)
         self.audit(actor, "backup", details=f"{size // 1024} КБ")
         return size
+
+    # ---------- здоровье загрузки в Яндекс ----------
+
+    def _save_upload_health(self) -> None:
+        self.store.set_meta("upload_health", json.dumps(self.upload_health, ensure_ascii=False))
+
+    async def upload_succeeded(self) -> None:
+        h = self.upload_health
+        was_broken = h.get("broken", False)
+        h.update(last_ok=int(time.time()), streak=0, users=[], broken=False)
+        self._save_upload_health()
+        if was_broken:
+            log.info("Загрузка в Яндекс снова работает")
+            await self._tell_owners(UPLOAD_FIXED)
+
+    async def upload_failed(self, user_id: int, details: str) -> None:
+        """Адрес загрузки ответил не так, как раньше. Если это повторяется — сообщаем владельцам (один раз)."""
+        h = self.upload_health
+        users = set(h.get("users", [])) | {user_id}
+        h.update(last_error=int(time.time()), last_error_text=details[:500], streak=h.get("streak", 0) + 1,
+                 users=sorted(users)[:10])
+        alert = not h.get("broken") and (h["streak"] >= UPLOAD_ALERT_STREAK or len(users) >= UPLOAD_ALERT_USERS)
+        if alert:
+            h["broken"], h["broken_since"] = True, int(time.time())
+        self._save_upload_health()
+        log.error("Адрес загрузки Яндекса не работает (подряд: %s): %s", h["streak"], details)
+        if alert:
+            await self._tell_owners(UPLOAD_BROKEN.format(details=html.escape(details[:400])))
+
+    async def _tell_owners(self, text: str) -> None:
+        for owner in self.config.admin_ids:
+            with contextlib.suppress(Exception):
+                await self.bot.send_message(owner, text, disable_web_page_preview=True)
+
+    def upload_health_json(self) -> dict[str, Any]:
+        h = self.upload_health
+        return {"broken": h.get("broken", False), "broken_since": h.get("broken_since"), "last_ok": h.get("last_ok"),
+                "last_error": h.get("last_error"), "last_error_text": h.get("last_error_text"),
+                "streak": h.get("streak", 0)}
 
     # ---------- статистика ----------
 

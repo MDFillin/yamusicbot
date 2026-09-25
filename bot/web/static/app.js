@@ -8,6 +8,8 @@
   const $ = (sel) => document.querySelector(sel);
   const supports = (v) => !!(tg && tg.isVersionAtLeast && tg.isVersionAtLeast(v));
   const CREDIT = 'kpenkuu4au';
+  // Правила данных трека — общие с сервером (static/meta.js ⇄ bot/audio.py).
+  const { guessFromName, decodeLatin1, mergeMeta } = window.TrackMeta;
 
   // ---------- иконки (24×24, линейные) ----------
   const ICONS = {
@@ -126,12 +128,6 @@
   }
 
   // «Исполнитель - Название.mp3» -> {artist, title}
-  function guessFromName(name) {
-    const stem = name.replace(/\.[^.]+$/, '').replace(/_/g, ' ').trim();
-    const m = stem.split(/\s+[-–—]\s+/);
-    return m.length >= 2 ? { artist: m[0].trim(), title: m.slice(1).join(' - ').trim() } : { artist: '', title: stem };
-  }
-
   function shuffled(list) {
     const a = list.slice();
     for (let i = a.length - 1; i > 0; i -= 1) {
@@ -731,9 +727,16 @@
     async function overview() {
       const data = await api('/api/admin/overview');
       if (!alive() || tab !== 'overview') return;
-      const { stats: st, server: sv, settings: cfg, broadcast: bc } = data;
+      const { stats: st, server: sv, settings: cfg, broadcast: bc, upload_health: uh } = data;
       const u = st.users;
       const banners = [];
+      if (uh.broken) {
+        banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'),
+          h('div', {}, h('b', {}, `Загрузка в Яндекс не работает с ${fmtStamp(uh.broken_since)}. `),
+            'Похоже, Яндекс изменил сайт. Обновите бота (git pull), а если не поможет — запустите на сервере ',
+            h('code', {}, 'docker compose run --rm bot python -m bot.diag_upload'), '.',
+            uh.last_error_text ? h('div', { class: 'banner-detail' }, uh.last_error_text) : null)));
+      }
       if (cfg.maintenance) banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'), 'Включены техработы — бот отвечает только вам'));
       if (cfg.closed) banners.push(h('div', { class: 'adm-banner' }, icon('lock', 'sm'), 'Регистрация закрыта — новые пользователи не допускаются'));
       if (bc.state === 'running') banners.push(h('div', { class: 'adm-banner' }, icon('megaphone', 'sm'), `Идёт рассылка: ${bc.sent} из ${bc.total}`));
@@ -765,6 +768,7 @@
         group('Больше всех скачали за неделю', topList),
         group('Сервер', h('div', { class: 'card set-card kvs' },
           kv('Работает', fmtUptime(sv.uptime)), kv('Память', sv.memory_mb ? `${sv.memory_mb} МБ` : '—'),
+          kv('Загрузка в Яндекс', uh.broken ? '❌ не работает' : uh.last_ok ? `✅ работает · ${fmtAgo(uh.last_ok)}` : 'ещё не было'),
           kv('База', fmtSize(sv.db_bytes)), kv('Свободно на диске', `${fmtSize(sv.disk_free)} из ${fmtSize(sv.disk_total)}`),
           kv('Клиентов Яндекса в памяти', fmtNum(sv.clients)), kv('ffmpeg', sv.ffmpeg || 'не установлен'),
           kv('Python / aiogram', `${sv.python} / ${sv.aiogram}`), kv('Бот', sv.bot_username ? `@${sv.bot_username}` : '—'),
@@ -1426,16 +1430,6 @@
   const be32 = (b, i) => ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
   const le32 = (b, i) => (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0;
 
-  function decodeLatin(bytes) {
-    // В русских MP3 «латиница» часто на самом деле cp1251: если все высокие байты — кириллица, читаем так.
-    const high = bytes.filter((c) => c >= 0x80);
-    if (high.length && high.every((c) => c >= 0xc0 || c === 0xa8 || c === 0xb8)) {
-      const fixed = new TextDecoder('windows-1251').decode(bytes);
-      if (!/[A-Za-z][А-яЁё]|[А-яЁё][A-Za-z]/.test(fixed)) return fixed; // «Beyoncé» — настоящий latin-1
-    }
-    return new TextDecoder('latin1').decode(bytes);
-  }
-
   function decodeText(enc, bytes) {
     let text;
     if (enc === 1 || enc === 2) {
@@ -1444,7 +1438,7 @@
       else if (bytes[0] === 0xfe && bytes[1] === 0xff) { le = false; bytes = bytes.subarray(2); }
       text = new TextDecoder(le ? 'utf-16le' : 'utf-16be').decode(bytes);
     } else {
-      text = enc === 3 ? new TextDecoder('utf-8').decode(bytes) : decodeLatin(bytes);
+      text = enc === 3 ? new TextDecoder('utf-8').decode(bytes) : decodeLatin1(bytes);
     }
     return text.split('\0')[0].trim();
   }
@@ -1583,12 +1577,12 @@
   // Что окажется в треке: правка пользователя → тег файла → догадка по имени файла.
   function effective(f) {
     const tags = f.tags || {};
-    const pick = (k) => (k in f.edit ? f.edit[k] : tags[k]) || '';
+    const m = mergeMeta(f.edit, tags, f.guess);
     return {
-      title: pick('title') || f.guess.title,
-      artist: pick('artist') || f.guess.artist,
-      album: pick('album'),
-      year: pick('year'),
+      title: m.title || '',
+      artist: m.artist || '',
+      album: m.album || '',
+      year: m.year || '',
       cover: f.removeCover ? null : (f.cover || tags.cover || null),
     };
   }
@@ -1640,7 +1634,7 @@
       const year = inputs.year.value.trim();
       if (year && !/^\d{4}$/.test(year)) { toast('Год — четыре цифры, например 2024'); inputs.year.focus(); return; }
       const base = f.tags || {};
-      const fallback = { title: f.guess.title, artist: f.guess.artist };
+      const fallback = { title: f.guess.title || '', artist: f.guess.artist || '' };
       const edit = {};
       for (const [key] of FIELDS) {
         const value = inputs[key].value.trim();
@@ -1818,8 +1812,8 @@
         if (f.removeCover && !f.cover) meta.remove_cover = true;
         form.append('kind', String(up.kind));
         form.append('meta', JSON.stringify(meta));
-        form.append('fallback_artist', f.guess.artist);
-        form.append('fallback_title', f.guess.title);
+        form.append('fallback_artist', f.guess.artist || '');
+        form.append('fallback_title', f.guess.title || '');
         if (f.cover) form.append('cover', f.cover, 'cover.jpg');
         form.append('file', f.file, f.file.name);
         const xhr = new XMLHttpRequest();

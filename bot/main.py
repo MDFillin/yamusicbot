@@ -30,6 +30,7 @@ from bot.admin import Admin, LimitReached
 from bot.audio import ffmpeg_available
 from bot.commands import ADMIN_COMMANDS, COMMANDS
 from bot.config import Config, ConfigError, load_config
+from bot.crypto import TokenCipher
 from bot.handlers import build_router
 from bot.handlers.upload import UploadQueue
 from bot.middlewares import AccessMiddleware, AccountMiddleware
@@ -194,7 +195,11 @@ async def main() -> None:
     log.info("Бот @%s запущен — пишите ему в Telegram: https://t.me/%s", me.username, me.username)
 
     # Аккаунты Яндекса у каждого свои: человек подключает его сам (/login или в приложении).
-    store = Storage(config.data_dir / "bot.db")
+    try:
+        cipher = TokenCipher.load(config.data_dir, config.encryption_key)
+    except ValueError as e:
+        sys.exit(f"Ошибка настройки: {e}")
+    store = Storage(config.data_dir / "bot.db", cipher)
     accounts = Accounts(store, max_bitrate=config.max_bitrate)
     if imported := accounts.import_legacy_token(config.legacy_ym_token, config.legacy_users):
         log.info("Токен из YANDEX_MUSIC_TOKEN привязан к пользователям %s. Переменные YANDEX_MUSIC_TOKEN и "

@@ -31,7 +31,7 @@ from yandex_music import Track
 from bot.admin import Admin
 from bot.callbacks import NoopCb
 from bot.config import Config
-from bot.errors import describe_error
+from bot.errors import describe_error, log_failure
 from bot.keyboards import fmt_duration
 from bot.links import parse_link
 from bot.sender import TrackSender, track_caption
@@ -159,7 +159,7 @@ async def on_chosen(result: ChosenInlineResult, bot: Bot, ym: YandexMusic, sende
             reply_markup=markup,
         )
     except Exception as e:
-        log.warning("Инлайн: не удалось отправить трек %s: %s", track_id, e)
+        log_failure(log, "Инлайн: не удалось отправить трек %s", track_id, exc=e)
         with contextlib.suppress(TelegramBadRequest):
             await bot.edit_message_text(
                 inline_message_id=result.inline_message_id,

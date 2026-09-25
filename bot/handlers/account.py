@@ -14,6 +14,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from bot.accounts import Accounts, LoginError, LoginSession
 from bot.callbacks import MenuCb, SettingsCb
 from bot.config import Config
+from bot.errors import spawn
 from bot.handlers.common import PUBLIC, home, plus_label
 from bot.keyboards import app_button
 from bot.middlewares import login_button
@@ -80,9 +81,7 @@ async def begin_login(message: Message, user_id: int, accounts: Accounts, config
         minutes=max(1, session.expires_in // 60), note=note,
     )
     sent = await message.answer(text, reply_markup=_login_markup(session), disable_web_page_preview=True)
-    task = asyncio.create_task(_finish_login(sent, session, config))
-    _waiters.add(task)
-    task.add_done_callback(_waiters.discard)
+    spawn(_finish_login(sent, session, config), f"вход {user_id}", _waiters)
 
 
 @router.message(Command("login"), flags=PUBLIC)

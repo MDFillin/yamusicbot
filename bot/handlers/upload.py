@@ -10,7 +10,6 @@ import logging
 import secrets
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import aiohttp
 from aiogram import Bot, F, Router
@@ -23,7 +22,9 @@ from bot.audio import (
     ConversionError,
     TrackMeta,
     clean_year,
+    guess_from_name,
     is_audio_filename,
+    merge_meta,
     normalize_cover,
     parse_caption,
     prepare_for_upload,
@@ -32,13 +33,13 @@ from bot.audio import (
 )
 from bot.callbacks import EditCb, UploadCb
 from bot.config import Config
-from bot.errors import describe_error
+from bot.errors import describe_error, spawn
 from bot.keyboards import short, track_editor, upload_card
 from bot.placer import TopPlacer
 from bot.sender import retry_telegram
 from bot.states import EditTrack, NewPlaylist
 from bot.storage import Storage
-from bot.ym import UploadError, YandexMusic
+from bot.ym import UploadEndpointError, UploadError, UploadResult, YandexMusic
 
 log = logging.getLogger(__name__)
 router = Router(name="upload")
@@ -76,27 +77,12 @@ class QueuedFile:
 
     def fallbacks(self) -> tuple[str | None, str | None]:
         """(исполнитель, название), если в файле своих тегов нет: из Telegram или имени файла."""
-        stem = Path(self.file_name).stem.replace("_", " ").strip()
-        guessed = parse_caption(stem)
-        artist = self.performer or (guessed[0] if guessed else None)
-        title = self.title or (guessed[1] if guessed else stem or None)
-        return artist, title
+        artist, title = guess_from_name(self.file_name)
+        return self.performer or artist, self.title or title
 
     def effective(self) -> TrackMeta:
-        """Что окажется в треке после загрузки (для показа в редакторе)."""
-        tags = self.tags or TrackMeta()
-        artist, title = self.fallbacks()
-
-        def pick(edited: str | None, from_file: str | None) -> str | None:
-            return from_file if edited is None else (edited or None)
-
-        return TrackMeta(
-            title=pick(self.edit.title, tags.title) or title,
-            artist=pick(self.edit.artist, tags.artist) or artist,
-            album=pick(self.edit.album, tags.album),
-            year=pick(self.edit.year, tags.year),
-            cover=None if self.edit.remove_cover else (self.edit.cover or tags.cover),
-        )
+        """Что окажется в треке после загрузки (для показа в редакторе) — то же правило, что при загрузке."""
+        return merge_meta(self.edit, self.tags or TrackMeta(), *self.fallbacks())
 
     def label(self) -> str:
         meta = self.effective()
@@ -477,6 +463,20 @@ async def on_edit_done(call: CallbackQuery, state: FSMContext, bot: Bot, ym: Yan
 
 # ---------- загрузка ----------
 
+async def _upload_to_yandex(ym: YandexMusic, kind: int, name: str, data: bytes, admin: Admin | None,
+                            user_id: int) -> UploadResult:
+    """Загрузка с учётом здоровья неофициального API: если Яндекс его изменит, владелец узнает сразу."""
+    try:
+        result = await ym.upload_track(kind, name, data)
+    except UploadEndpointError as e:
+        if admin is not None:
+            await admin.upload_failed(user_id, e.details)
+        raise
+    if admin is not None:
+        await admin.upload_succeeded()
+    return result
+
+
 async def upload_files(
     bot: Bot, chat_id: int, user_id: int, files: list[QueuedFile], kind: int,
     ym: YandexMusic, uploads: UploadQueue, placer: TopPlacer,
@@ -509,7 +509,7 @@ async def upload_files(
                 name, data, notes = await prepare_file(qf, data)
                 await update(prefix + "\n(отправляю в Яндекс…)")
                 known = await placer.before_upload(ym, kind)
-                result = await ym.upload_track(kind, name, data)
+                result = await _upload_to_yandex(ym, kind, name, data, uploads.admin, user_id)
                 placed.append(placer.after_upload(ym, kind, known, result.ugc_track_id))
                 if uploads.admin is not None:
                     uploads.admin.count(user_id, "upload")
@@ -538,9 +538,7 @@ async def upload_files(
         return
     waiting = "\n\n⏳ Яндекс обработает файлы за пару минут — потом я подниму их в начало плейлиста."
     await update((text + waiting)[:4000])
-    task = asyncio.create_task(_report_placement(status, text, title, placed))
-    _reports.add(task)
-    task.add_done_callback(_reports.discard)
+    spawn(_report_placement(status, text, title, placed), "отчёт о загрузке", _reports)
 
 
 async def _report_placement(status: Message, text: str, title: str, placed: list[asyncio.Future]) -> None:

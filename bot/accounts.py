@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from yandex_music import ClientAsync
 from yandex_music.exceptions import DeviceAuthError, NetworkError, TimedOutError, YandexMusicError
 
+from bot.errors import log_failure
 from bot.storage import Storage
 from bot.ym import YandexMusic, explain_start_error
 
@@ -139,6 +140,7 @@ class Accounts:
             await ym.start()
         except Exception as e:
             await ym.close()
+            log_failure(log, "Не удалось подключить аккаунт пользователя %s", user_id, exc=e)
             raise LoginError(explain_start_error(e)) from e
         self._store.set_account(user_id, token, ym.login)
         old = self._clients.get(user_id)

@@ -1,0 +1,209 @@
+{
+ "_comment": "Одни и те же примеры проверяются для bot/audio.py (pytest) и bot/web/static/meta.js (node).",
+ "guess": [
+  {
+   "name": "Кино - Кукушка.mp3",
+   "artist": "Кино",
+   "title": "Кукушка"
+  },
+  {
+   "name": "Кино_-_Группа_крови.flac",
+   "artist": "Кино",
+   "title": "Группа крови"
+  },
+  {
+   "name": "AC-DC — Back In Black.m4a",
+   "artist": "AC-DC",
+   "title": "Back In Black"
+  },
+  {
+   "name": "a-ha - Take On Me.mp3",
+   "artist": "a-ha",
+   "title": "Take On Me"
+  },
+  {
+   "name": "A - B — C.mp3",
+   "artist": "A",
+   "title": "B — C"
+  },
+  {
+   "name": "rec_01.mp3",
+   "artist": null,
+   "title": "rec 01"
+  },
+  {
+   "name": "track",
+   "artist": null,
+   "title": "track"
+  },
+  {
+   "name": "some.dotted.name.ogg",
+   "artist": null,
+   "title": "some.dotted.name"
+  },
+  {
+   "name": " - Название.mp3",
+   "artist": null,
+   "title": "- Название"
+  },
+  {
+   "name": ".mp3",
+   "artist": null,
+   "title": null
+  }
+ ],
+ "latin1": [
+  {
+   "hex": "cae8edee",
+   "text": "Кино"
+  },
+  {
+   "hex": "a8ebeae0",
+   "text": "Ёлка"
+  },
+  {
+   "hex": "c7e5ecf4e8f0e0209720d5eef7e5f8fc3f",
+   "text": "Земфира — Хочешь?"
+  },
+  {
+   "hex": "4265796f6e63e9",
+   "text": "Beyoncé"
+  },
+  {
+   "hex": "436166e92064656c204d6172",
+   "text": "Café del Mar"
+  },
+  {
+   "hex": "426af6726b",
+   "text": "Björk"
+  },
+  {
+   "hex": "4e697276616e61",
+   "text": "Nirvana"
+  },
+  {
+   "hex": "4272616e6499",
+   "text": "Brand"
+  }
+ ],
+ "merge": [
+  {
+   "edit": {},
+   "tags": {
+    "title": "Из файла",
+    "artist": "Автор"
+   },
+   "fallback": {
+    "artist": "Имя",
+    "title": "Файла"
+   },
+   "expect": {
+    "title": "Из файла",
+    "artist": "Автор",
+    "album": null,
+    "year": null
+   }
+  },
+  {
+   "edit": {
+    "title": "  Новое  "
+   },
+   "tags": {
+    "title": "Старое",
+    "album": "Альбом",
+    "year": "1999"
+   },
+   "fallback": {},
+   "expect": {
+    "title": "Новое",
+    "artist": null,
+    "album": "Альбом",
+    "year": "1999"
+   }
+  },
+  {
+   "edit": {
+    "album": "",
+    "year": ""
+   },
+   "tags": {
+    "album": "Старый",
+    "year": "2001"
+   },
+   "fallback": {
+    "title": "t"
+   },
+   "expect": {
+    "title": "t",
+    "artist": null,
+    "album": null,
+    "year": null
+   }
+  },
+  {
+   "edit": {
+    "title": ""
+   },
+   "tags": {
+    "title": "Из файла"
+   },
+   "fallback": {
+    "title": "Из имени"
+   },
+   "expect": {
+    "title": "Из имени",
+    "artist": null,
+    "album": null,
+    "year": null
+   }
+  },
+  {
+   "edit": {
+    "artist": "   "
+   },
+   "tags": {
+    "artist": "Из файла"
+   },
+   "fallback": {
+    "artist": "Из имени"
+   },
+   "expect": {
+    "title": null,
+    "artist": "Из имени",
+    "album": null,
+    "year": null
+   }
+  },
+  {
+   "edit": {},
+   "tags": {},
+   "fallback": {
+    "artist": null,
+    "title": "rec 01"
+   },
+   "expect": {
+    "title": "rec 01",
+    "artist": null,
+    "album": null,
+    "year": null
+   }
+  },
+  {
+   "edit": {
+    "year": "2024",
+    "artist": "Кино"
+   },
+   "tags": {
+    "year": "1999",
+    "artist": "Kino"
+   },
+   "fallback": {},
+   "expect": {
+    "title": null,
+    "artist": "Кино",
+    "album": null,
+    "year": "2024"
+   }
+  }
+ ]
+}

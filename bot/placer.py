@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from yandex_music import TrackShort
 
+from bot.errors import log_failure, spawn
 from bot.ym import YandexMusic
 
 log = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ class TopPlacer:
         try:
             return await ym.playlist_track_ids(kind)
         except Exception as e:
-            log.warning("Не удалось получить плейлист %s перед загрузкой: %r", kind, e)
+            log_failure(log, "Не удалось получить плейлист %s перед загрузкой", kind, exc=e)
             return None  # тогда узнаём трек только по его id из ответа загрузки
 
     def after_upload(self, ym: YandexMusic, kind: int, known: set[str] | None, ugc_id: str | None) -> asyncio.Future:
@@ -99,7 +100,7 @@ class TopPlacer:
         upload = _Upload(seq, watch.group, str(ugc_id) if ugc_id else None, asyncio.get_running_loop().create_future())
         watch.uploads.append(upload)
         if watch.task is None or watch.task.done():
-            watch.task = asyncio.create_task(self._run(key, watch))
+            watch.task = spawn(self._run(key, watch), f"наверх плейлиста {watch.kind}")
         return upload.done
 
     async def _run(self, key: tuple[int, int], watch: _Watch) -> None:
@@ -115,8 +116,8 @@ class TopPlacer:
                     raise
                 except Exception as e:
                     watch.failures += 1
-                    log.warning("Не удалось поднять загрузки наверх плейлиста %s (%s): %r",
-                                watch.kind, watch.failures, e)
+                    log_failure(log, "Не удалось поднять загрузки наверх плейлиста %s (попытка %s)",
+                                watch.kind, watch.failures, exc=e)
                     if watch.failures >= MAX_FAILURES:
                         break
                 if all(u.done.done() for u in watch.uploads):

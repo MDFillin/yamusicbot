@@ -9,12 +9,14 @@ import sqlite3
 import time
 from pathlib import Path
 
+from bot.crypto import KeyMismatch, TokenCipher
+
 log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     user_id INTEGER PRIMARY KEY,   -- Telegram ID
-    token TEXT NOT NULL,           -- OAuth-токен Яндекс Музыки этого пользователя
+    token TEXT NOT NULL,           -- OAuth-токен Яндекс Музыки, зашифрованный (bot/crypto.py)
     login TEXT,
     created_at INTEGER NOT NULL
 );
@@ -84,19 +86,31 @@ CREATE INDEX IF NOT EXISTS counters_day ON counters (day, key);
 
 
 class Storage:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, cipher: TokenCipher | None = None) -> None:
         self.path = path
+        self._cipher = cipher or TokenCipher.load(path.parent)
+        self._undecryptable: set[int] = set()
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(path, isolation_level=None)  # autocommit: каждая запись сразу на диске
+        self._db = sqlite3.connect(path, isolation_level=None)  # autocommit: каждая запись сразу в базе
+        # Бот — один процесс с одним потоком событий: соединение одно, пул не нужен (запросы и так идут по очереди).
+        # Дорогим было другое — fsync на каждую запись (~1,5 мс, и весь бот в это время стоит). В режиме WAL
+        # с synchronous=NORMAL запись ~0,06 мс; при внезапном отключении питания могут потеряться последние
+        # доли секунды записей, но база остаётся целой.
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("PRAGMA busy_timeout=5000")  # если базу держит кто-то ещё (sqlite3 в консоли) — подождать
+        self._db.execute("PRAGMA secure_delete=ON")  # удалённое (входы после /logout) затирается нулями
         # LOWER в SQLite понимает только латиницу, а искать людей нужно и по-русски.
         self._db.create_function("PYLOWER", 1, lambda v: v.lower() if isinstance(v, str) else v, deterministic=True)
         self._db.executescript(SCHEMA)
-        try:
-            os.chmod(path, 0o600)  # тут токены пользователей
-        except OSError:
-            pass
+        for file in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+            try:
+                os.chmod(file, 0o600)  # тут входы пользователей (журнал WAL тоже их содержит)
+            except OSError:
+                pass
         self._import_json(path.with_name("storage.json"))
         self._backfill_users()
+        self._encrypt_tokens()
 
     def close(self) -> None:
         self._db.close()
@@ -119,13 +133,24 @@ class Storage:
 
     def get_account(self, user_id: int) -> tuple[str, str | None] | None:
         """(токен, логин) или None, если пользователь не подключал Яндекс."""
-        return self._one("SELECT token, login FROM accounts WHERE user_id = ?", user_id)
+        row = self._one("SELECT token, login FROM accounts WHERE user_id = ?", user_id)
+        if row is None:
+            return None
+        try:
+            return self._cipher.decrypt(row[0]), row[1]
+        except KeyMismatch:
+            if user_id not in self._undecryptable:
+                self._undecryptable.add(user_id)
+                log.error("Вход пользователя %s зашифрован другим ключом (сменился ENCRYPTION_KEY или удалён "
+                          "data/secret.key?) — ему придётся подключить Яндекс заново", user_id)
+            return None  # для бота это «Яндекс не подключён»: человек войдёт снова, и запись перезапишется
 
     def set_account(self, user_id: int, token: str, login: str | None) -> None:
+        self._undecryptable.discard(user_id)
         self._db.execute(
             "INSERT INTO accounts (user_id, token, login, created_at) VALUES (?, ?, ?, ?) "
             "ON CONFLICT (user_id) DO UPDATE SET token = excluded.token, login = excluded.login",
-            (user_id, token, login, int(time.time())),
+            (user_id, self._cipher.encrypt(token), login, int(time.time())),
         )
         now = int(time.time())
         self._db.execute("INSERT OR IGNORE INTO users (user_id, first_seen, last_seen) VALUES (?, ?, ?)",
@@ -273,6 +298,24 @@ class Storage:
 
     def set_blocked_bot(self, user_id: int) -> None:
         self._db.execute("UPDATE users SET blocked_bot = 1 WHERE user_id = ?", (user_id,))
+
+    def _encrypt_tokens(self) -> None:
+        """Шифрует входы, сохранённые прежними версиями, и перешифровывает основным ключом после его смены."""
+        changed = 0
+        for user_id, stored in self._all("SELECT user_id, token FROM accounts"):
+            if self._cipher.is_encrypted(stored) and not self._cipher.rotating:
+                continue
+            try:
+                token = self._cipher.decrypt(stored)
+            except KeyMismatch:
+                continue  # ни один ключ не подходит — get_account объяснит в логе
+            self._db.execute("UPDATE accounts SET token = ? WHERE user_id = ?", (self._cipher.encrypt(token), user_id))
+            changed += 1
+        if changed:
+            # Старые открытые значения могли остаться в свободных страницах файла и в журнале — убираем.
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._db.execute("VACUUM")
+            log.info("Входы пользователей в базе зашифрованы: %s", changed)
 
     def _backfill_users(self) -> None:
         """Кто подключил Яндекс до появления таблицы users, тоже должен быть в списке пользователей."""

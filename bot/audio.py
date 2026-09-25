@@ -68,14 +68,26 @@ def safe_filename(name: str, default: str = "track", limit: int = 150) -> str:
     return name or default
 
 
+# Правила ниже (разбор «Исполнитель - Название», имя файла, cp1251, объединение правок с тегами) повторены
+# в bot/web/static/meta.js — там они нужны для мгновенного предпросмотра, пока файл ещё не загружен.
+# Обе реализации проверяются на одних и тех же примерах: tests/fixtures/meta_cases.json.
+
 def parse_caption(caption: str | None) -> tuple[str, str] | None:
-    """«Исполнитель - Название» -> (исполнитель, название)."""
+    """«Исполнитель - Название» -> (исполнитель, название). Делится по первому тире в окружении пробелов."""
     if not caption:
         return None
     parts = _CAPTION_SPLIT.split(caption.strip(), maxsplit=1)
     if len(parts) != 2 or not all(p.strip() for p in parts):
         return None
     return parts[0].strip(), parts[1].strip()
+
+
+def guess_from_name(file_name: str) -> tuple[str | None, str | None]:
+    """(исполнитель, название) по имени файла, когда в нём нет тегов: «Кино_-_Кукушка.mp3» -> (Кино, Кукушка)."""
+    stem = re.sub(r"\.[^.]+$", "", file_name).replace("_", " ").strip()
+    if (parsed := parse_caption(stem)) is not None:
+        return parsed
+    return None, stem or None
 
 
 def is_audio_filename(filename: str | None) -> bool:
@@ -196,23 +208,31 @@ def _first(value) -> str | None:
     return text or None
 
 
-_CP1251_HIGH = set(range(0xC0, 0x100)) | {0xA8, 0xB8}  # кириллица и Ёё в cp1251
+_CP1251_LETTERS = set(range(0xC0, 0x100)) | {0xA8, 0xB8}  # кириллица и Ёё в cp1251
+_CP1251_PUNCT = {0x85, 0x91, 0x92, 0x93, 0x94, 0x96, 0x97, 0xAB, 0xB9, 0xBB}  # … ‘ ’ “ ” – — « № »
 _MIXED_WORD = re.compile(r"[A-Za-z][А-яЁё]|[А-яЁё][A-Za-z]")
 
 
+def decode_latin1(raw: bytes) -> str:
+    """Текст, записанный как latin-1. Старые русские MP3 пишут так cp1251: если все высокие байты — кириллица
+    (и типографские знаки cp1251: тире, кавычки «», многоточие, №), читаем как cp1251 — кроме случаев
+    вроде «Beyoncé» (дал бы «Beyoncщ»), это настоящий latin-1."""
+    high = [b for b in raw if b >= 0x80]
+    if any(b in _CP1251_LETTERS for b in high) and all(b in _CP1251_LETTERS or b in _CP1251_PUNCT for b in high):
+        fixed = raw.decode("cp1251")
+        if not _MIXED_WORD.search(fixed):
+            return fixed
+    return raw.decode("latin-1")
+
+
 def _id3_text(frame) -> str | None:
-    """Текст ID3-кадра. Старые русские MP3 пишут cp1251 под видом latin-1 — такие строки перекодируем."""
+    """Текст ID3-кадра (кодировка 0 — latin-1, под которым часто прячется cp1251)."""
     text = _first(frame.text)
     if text and frame.encoding == 0:
         try:
-            raw = text.encode("latin-1")
+            return decode_latin1(text.encode("latin-1"))
         except UnicodeEncodeError:
             return text
-        high = [b for b in raw if b >= 0x80]
-        if high and all(b in _CP1251_HIGH for b in high):
-            fixed = raw.decode("cp1251")
-            if not _MIXED_WORD.search(fixed):  # «Beyoncé» дал бы «Beyoncщ» — это настоящий latin-1
-                return fixed
     return text
 
 
@@ -416,8 +436,21 @@ async def reencode_mp3(data: bytes) -> bytes:
 def _pick(edited: str | None, from_file: str | None) -> str | None:
     """Правка пользователя важнее тега из файла; пустая строка — очистить поле."""
     if edited is None:
-        return from_file
+        return from_file or None
     return edited.strip() or None
+
+
+def merge_meta(edit: TrackMeta, tags: TrackMeta, fallback_artist: str | None = None,
+               fallback_title: str | None = None) -> TrackMeta:
+    """Что окажется в треке: правка важнее тега из файла, а для названия и исполнителя, если пусто и там,
+    и там, — запасной вариант (метаданные Telegram или имя файла)."""
+    return TrackMeta(
+        title=_pick(edit.title, tags.title) or fallback_title or None,
+        artist=_pick(edit.artist, tags.artist) or fallback_artist or None,
+        album=_pick(edit.album, tags.album),
+        year=_pick(edit.year, tags.year),
+        cover=None if edit.remove_cover else (edit.cover or tags.cover),
+    )
 
 
 async def prepare_for_upload(
@@ -468,13 +501,7 @@ async def prepare_for_upload(
             album=original.album or current.album, year=original.year or current.year,
             cover=original.cover or current.cover,
         )
-    final = TrackMeta(
-        title=_pick(edit.title, original.title) or fallback_title,
-        artist=_pick(edit.artist, original.artist) or fallback_artist,
-        album=_pick(edit.album, original.album),
-        year=_pick(edit.year, original.year),
-        cover=None if edit.remove_cover else (edit.cover or original.cover),
-    )
+    final = merge_meta(edit, original, fallback_artist, fallback_title)
     if final != current:
         data = write_mp3_tags(data, final)
 

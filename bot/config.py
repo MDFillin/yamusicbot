@@ -34,6 +34,8 @@ class Config:
     legacy_users: frozenset[int] = frozenset()
     # Telegram ID владельцев: только им доступны /admin и админ-панель в мини-приложении.
     admin_ids: frozenset[int] = frozenset()
+    # Ключ шифрования входов в базе; без него ключ хранится в data/secret.key (см. bot/crypto.py).
+    encryption_key: str | None = None
 
     @property
     def max_tg_download(self) -> int:
@@ -94,6 +96,7 @@ def load_config() -> Config:
         legacy_ym_token=os.getenv("YANDEX_MUSIC_TOKEN", "").strip() or None,
         legacy_users=_parse_users(os.getenv("ALLOWED_USERS", "")),
         admin_ids=_admin_ids(os.getenv("ADMIN_IDS", "")),
+        encryption_key=os.getenv("ENCRYPTION_KEY", "").strip() or None,
     )
 
 

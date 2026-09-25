@@ -16,6 +16,7 @@ from yandex_music import Album, ClientAsync, DownloadInfo, Playlist, Search, Tra
 from yandex_music.exceptions import NetworkError, UnauthorizedError, YandexMusicError
 
 from bot.audio import ConversionError, ffmpeg_available, reencode_mp3, safe_filename, tag_mp3
+from bot.errors import log_failure
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +79,20 @@ class UploadError(RuntimeError):
 
 class UnsupportedMediaError(UploadError):
     """Яндекс не принял формат файла (HTTP 415 UNSUPPORTED_MEDIA_TYPE)."""
+
+
+class UploadEndpointError(UploadError):
+    """Адрес загрузки не отвечает как раньше — скорее всего, Яндекс изменил свой сайт (API неофициальный).
+
+    str() — понятное объяснение для пользователя, details — ответы сервера для владельца бота.
+    """
+
+    def __init__(self, details: str) -> None:
+        super().__init__(
+            "Загрузка в Яндекс Музыку сейчас не работает — похоже, Яндекс изменил свой сайт. "
+            "Владелец бота получит уведомление; попробуйте позже."
+        )
+        self.details = details
 
 
 UNSUPPORTED_MEDIA = (
@@ -196,7 +211,7 @@ class YandexMusic:
                 await self.start()
             except Exception as e:
                 self.start_error = explain_start_error(e)
-                log.error("%s (%r)", self.start_error, e)
+                log_failure(log, "%s", self.start_error, exc=e)
                 raise YandexNotReady(self.start_error) from e
             self.start_error = None
             log.info("Яндекс Музыка подключена: uid %s, Плюс: %s", self.uid, self.has_plus)
@@ -409,7 +424,8 @@ class YandexMusic:
             "path": filename,
         }
 
-        attempts = []
+        attempts: list[str] = []
+        statuses: list[int] = []
         for base in self._api_base_urls:
             url = f"{base}/loader/upload-url"
             headers = {**API_HEADERS.get(_host(base), {}), **self._auth(url)}
@@ -426,8 +442,14 @@ class YandexMusic:
             if payload is not None:
                 log.info("Адрес загрузки получен через %s", url)
                 return payload
+            statuses.append(status)
             attempts.append(f"{_host(url)}{urlsplit(url).path}: HTTP {status} {_describe_body(body)}")
-        raise UploadError("Яндекс не выдал адрес для загрузки. Ответы: " + "; ".join(attempts))
+        details = "Яндекс не выдал адрес для загрузки. Ответы: " + "; ".join(attempts)
+        if not statuses:  # ни одного ответа — это связь сервера с Яндексом, а не изменения у Яндекса
+            raise UploadError(details)
+        if all(s in (401, 403) for s in statuses):  # не принят вход именно этого пользователя
+            raise UploadError("Яндекс не принял ваш вход при загрузке — подключите аккаунт заново: /login")
+        raise UploadEndpointError(details)
 
 
     async def upload_track(self, playlist_kind: int, filename: str, data: bytes) -> UploadResult:
@@ -475,6 +497,8 @@ class YandexMusic:
             raise UploadError(f"Сетевая ошибка при отправке файла: {e}") from e
         if status == 415 or "UNSUPPORTED_MEDIA_TYPE" in reply:
             raise UnsupportedMediaError(reply[:300])
+        if status in (404, 405, 410, 501):  # адреса для файла больше нет — изменился сам способ загрузки
+            raise UploadEndpointError(f"Адрес для файла ответил HTTP {status}: {reply[:300]}")
         if status >= 300:
             raise UploadError(f"Яндекс отклонил файл (HTTP {status}): {reply[:300]}")
         log.info("Загружен %s в плейлист %s: %s", filename, playlist_kind, reply[:100])

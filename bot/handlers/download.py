@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery
 
 from bot.admin import LimitReached
 from bot.callbacks import BulkCb, CancelBulkCb, TrackCb
-from bot.errors import describe_error
+from bot.errors import describe_error, log_failure, spawn
 from bot.keyboards import cancel_bulk
 from bot.sender import TrackSender, retry_telegram
 from bot.sources import SourceNotFoundError, load_source, resolve
@@ -37,7 +37,7 @@ async def on_download(
     try:
         await sender.send(call.message.chat.id, track, ym)
     except Exception as e:
-        log.exception("Не удалось отправить трек %s", track.id)
+        log_failure(log, "Не удалось отправить трек %s", track.id, exc=e)
         title = html.escape(track_title(track))
         await call.message.answer(f"😕 Не получилось скачать «{title}»: {html.escape(describe_error(e))}")
 
@@ -60,7 +60,7 @@ def start_bulk_download(
     running = _bulk_tasks.get(user_id)
     if running and not running.done():
         return False
-    task = asyncio.create_task(_bulk_download(bot, chat_id, src, ref, ym, sender))
+    task = spawn(_bulk_download(bot, chat_id, src, ref, ym, sender), f"скачивание списка {src} для {user_id}")
     _bulk_tasks[user_id] = task
     task.add_done_callback(lambda t: _bulk_tasks.pop(user_id, None) if _bulk_tasks.get(user_id) is t else None)
     return True
@@ -100,7 +100,7 @@ async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexM
             except (asyncio.CancelledError, LimitReached):
                 raise  # лимит на сегодня исчерпан — дальше качать бессмысленно
             except Exception as e:
-                log.warning("Трек %s не скачался: %s", track.id, e)
+                log_failure(log, "Трек %s не скачался", track.id, exc=e)
                 failed.append(f"{track_title(track)} — {describe_error(e)}")
         text = f"✅ {title}\nГотово: {sent} из {total}."
     except asyncio.CancelledError:
@@ -111,7 +111,7 @@ async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexM
     except LimitReached as e:
         text = f"⛔ {html.escape(str(e))}\nОтправлено {sent} из {total}."
     except Exception as e:
-        log.exception("Ошибка массового скачивания")
+        log_failure(log, "Массовое скачивание прервалось", exc=e)
         text = f"⚠️ Скачивание прервалось: {html.escape(describe_error(e))}\nОтправлено {sent} из {total}."
 
     if failed:

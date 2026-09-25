@@ -277,3 +277,45 @@ async def test_grant_admin_validation(env):
     assert r.status == 400 and "разблокируйте" in (await r.json())["error"]
     r = await c.post(f"/api/admin/users/{FRIEND_ID}/revoke_admin")
     assert r.status == 400
+
+
+# ---------- здоровье загрузки в Яндекс ----------
+
+async def _upload(c, headers=None):
+    from aiohttp import FormData
+    form = FormData()
+    form.add_field("kind", "1003")
+    form.add_field("file", b"\xff\xfb\x90\x64" + b"\x00" * 400, filename="x.mp3")
+    return await c.post("/api/upload", data=form, headers=headers)
+
+
+async def test_owner_is_alerted_when_yandex_changes_upload(env):
+    from bot.ym import UploadEndpointError, UploadResult
+
+    fakes = {u: env.admin.accounts._factory(t) for u, t in ((ADMIN_ID, "tok-owner"), (FRIEND_ID, "tok-friend"))}
+    for ym in fakes.values():
+        async def broken(kind, filename, data):
+            raise UploadEndpointError("Яндекс не выдал адрес для загрузки. Ответы: api.music.yandex.ru: HTTP 404")
+        ym.upload_track = broken
+
+    def alerts(word):
+        return [m for m in env.tg.calls if isinstance(m, SendMessage) and m.chat_id == ADMIN_ID and word in m.text]
+
+    r = await _upload(env.client)
+    assert r.status == 422 and "Яндекс изменил свой сайт" in (await r.json())["error"]
+    assert not alerts("перестала работать"), "одна неудача — ещё не повод будить владельца"
+    await _upload(env.client, as_user(FRIEND_ID))
+    [alert] = alerts("перестала работать")
+    assert "HTTP 404" in alert.text and "diag_upload" in alert.text
+    await _upload(env.client)
+    assert len(alerts("перестала работать")) == 1, "одно уведомление, без спама"
+    health = (await (await env.client.get("/api/admin/overview")).json())["upload_health"]
+    assert health["broken"] and health["streak"] == 3
+
+    async def works(kind, filename, data):
+        return UploadResult("ugc-1", "CREATED")
+    fakes[ADMIN_ID].upload_track = works
+    assert (await _upload(env.client)).status == 200
+    assert alerts("снова работает")
+    health = (await (await env.client.get("/api/admin/overview")).json())["upload_health"]
+    assert not health["broken"] and health["last_ok"]

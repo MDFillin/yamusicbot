@@ -62,6 +62,15 @@ def _ago(ts: int | None) -> str:
     return time.strftime("%d.%m.%Y", time.localtime(ts))
 
 
+def _upload_line(admin: Admin) -> str:
+    h = admin.upload_health_json()
+    if h["broken"]:
+        return f"⬆️ Загрузка в Яндекс: ❌ <b>не работает</b> с {_ago(h['broken_since'])}"
+    if h["last_ok"]:
+        return f"⬆️ Загрузка в Яндекс: ✅ работает (последняя — {_ago(h['last_ok'])})"
+    return "⬆️ Загрузка в Яндекс: ещё не было загрузок"
+
+
 def panel(admin: Admin, viewer: int) -> tuple[str, InlineKeyboardMarkup]:
     st = admin.stats(days=1)
     u, s = st["users"], admin.settings
@@ -78,7 +87,8 @@ def panel(admin: Admin, viewer: int) -> tuple[str, InlineKeyboardMarkup]:
         f"⬇️ Скачано: сегодня {st['downloads']['today']}, всего {st['downloads']['total']}\n"
         f"⬆️ Загружено: сегодня {st['uploads']['today']}, всего {st['uploads']['total']}\n"
         f"⛔ Заблокированы: {u['banned']} · бота заблокировали: {u['blocked']}\n"
-        f"⚠️ Ошибок за сутки: {st['errors_24h']}\n\n"
+        f"⚠️ Ошибок за сутки: {st['errors_24h']}\n"
+        f"{_upload_line(admin)}\n\n"
         f"🛠 Техработы: <b>{'включены' if s.maintenance else 'выключены'}</b>\n"
         f"🚪 Регистрация: <b>{'закрыта' if s.closed_since else 'открыта'}</b>\n"
         f"📏 Лимиты: {', '.join(limits) if limits else 'нет'}"
