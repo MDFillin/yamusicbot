@@ -81,7 +81,7 @@ class FakeYM:
 
     async def ensure_started(self):
         if self.start_error:
-            raise YandexNotReady(self.start_error)
+            raise YandexNotReady(self.start_error, getattr(self, "start_network", False))
 
     async def close(self):
         pass
@@ -498,6 +498,24 @@ async def test_api_reports_yandex_problem(env):
     body = await r.json()
     assert r.status == 503 and body["code"] == "yandex_unavailable" and "вход устарел" in body["error"]
     assert (await env.client.get("/api/me", headers=as_user(FRIEND_ID))).status == 200, "у других всё работает"
+
+
+async def test_api_reports_unreachable_yandex(env):
+    from yandex_music.exceptions import TimedOutError
+
+    async def timed_out():
+        raise TimedOutError()
+
+    env.ym.get_my_playlists = timed_out
+    r = await env.client.get("/api/library")
+    body = await r.json()
+    assert r.status == 503 and body["code"] == "yandex_network" and "не может связаться" in body["error"]
+    assert "Timed out" not in body["error"]
+
+    env.ym.start_error, env.ym.start_network = "нет связи", True
+    env.accounts._clients[OWNER_ID] = env.ym
+    r = await env.client.get("/api/me")
+    assert r.status == 503 and (await r.json())["code"] == "yandex_network", "экран «Нет связи», а не «Войти заново»"
 
 
 async def test_revoked_login_resets_client(env):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 import os
 import secrets
@@ -23,7 +24,7 @@ from aiogram.types import (
 )
 from aiogram.utils.token import TokenValidationError
 from aiohttp import web
-from yandex_music.exceptions import UnauthorizedError
+from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
 from bot.accounts import Accounts
 from bot.admin import Admin, LimitReached
@@ -40,6 +41,7 @@ from bot.placer import TopPlacer
 from bot.sender import TrackSender
 from bot.storage import Storage
 from bot.web.app import create_app
+from bot.ym import YANDEX_UNREACHABLE, is_network_error
 
 log = logging.getLogger("bot")
 
@@ -109,6 +111,13 @@ def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storag
             if user is not None:
                 await dp["accounts"].reset(user.id)
             text = REVOKED
+        elif is_network_error(event.exception):
+            # Яндекс (или сеть) не ответил — это не баг бота: без трассировки и без «кода ошибки».
+            log.warning("Нет связи при обработке апдейта: %r", event.exception)
+            text = f"📡 {YANDEX_UNREACHABLE}"
+        elif isinstance(event.exception, YandexMusicError):
+            log.warning("Ошибка Яндекс Музыки при обработке апдейта: %r", event.exception)
+            text = f"⚠️ Яндекс Музыка ответила ошибкой: {html.escape(str(event.exception)[:200])}. Попробуйте ещё раз."
         else:
             # Подробности — только в лог: бот открыт всем, внутренности сервера им ни к чему. Код поможет найти запись.
             ref = secrets.token_hex(3)

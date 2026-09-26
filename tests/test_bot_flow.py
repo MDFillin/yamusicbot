@@ -142,7 +142,7 @@ class FakeYM:
 
     async def ensure_started(self):
         if self.start_error:
-            raise YandexNotReady(self.start_error)
+            raise YandexNotReady(self.start_error, getattr(self, "start_network", False))
 
     async def close(self):
         pass
@@ -333,6 +333,27 @@ async def test_broken_account_is_explained_instead_of_silence(env):
     texts = env.tg.texts()
     assert len(texts) == 2 and all("Не получается подключиться" in t and "не приняла вход" in t for t in texts)
     assert env.tg.buttons()[0].callback_data == MenuCb(action="login").pack()
+
+
+async def test_unreachable_yandex_is_explained_without_relogin(env):
+    from yandex_music.exceptions import TimedOutError
+
+    from bot.ym import YANDEX_UNREACHABLE
+
+    env.ym.start_error, env.ym.start_network = YANDEX_UNREACHABLE, True
+    await env.dp.feed_update(env.bot, message_update(text="/likes"))
+    assert "Яндекс Музыка сейчас недоступна" in env.tg.texts()[-1] and "Входить заново не нужно" in env.tg.texts()[-1]
+    assert env.tg.buttons() == [], "кнопка «Подключить заново» не поможет — её нет"
+
+    env.ym.start_error, env.ym.start_network = None, False
+
+    async def timed_out(query, type_):  # уже подключены, но запрос к Яндексу оборвался
+        raise TimedOutError()
+
+    env.ym.search = timed_out
+    await env.dp.feed_update(env.bot, message_update(text="кино"))
+    text = env.tg.texts()[-1]
+    assert text.startswith("📡") and "не может связаться" in text and "код" not in text
 
 
 async def test_revoked_login_is_explained(env):

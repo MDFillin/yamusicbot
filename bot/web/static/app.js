@@ -2401,7 +2401,8 @@
     try {
       state.me = await api('/api/me');
     } catch (e) {
-      if (e.code === 'yandex_unavailable') gate('Яндекс Музыка недоступна', e.message, 'Подключить заново', () => showLogin());
+      if (e.code === 'yandex_network') gate('Нет связи с Яндекс Музыкой', e.message, 'Проверить снова', enterApp);
+      else if (e.code === 'yandex_unavailable') gate('Яндекс Музыка недоступна', e.message, 'Подключить заново', () => showLogin());
       else if (e.code === 'banned') gate('Доступ закрыт', e.message);
       else if (e.code === 'maintenance') gate('Техническое обслуживание', e.message, 'Проверить снова', enterApp);
       else if (e.code === 'closed') gate('Бот закрыт для новых пользователей', e.message);

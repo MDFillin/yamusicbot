@@ -44,12 +44,14 @@ from bot.sources import SourceNotFoundError, TrackSource, load_source, playlist_
 from bot.storage import Storage
 from bot.web.auth import AuthError, MediaSigner, init_data_age, verify_init_data
 from bot.ym import (
+    YANDEX_UNREACHABLE,
     TrackUnavailableError,
     UploadEndpointError,
     UploadError,
     YandexMusic,
     YandexNotReady,
     cover_url,
+    is_network_error,
     tagged_filename,
     track_album,
     track_artists,
@@ -274,7 +276,7 @@ async def errors_middleware(request: web.Request, handler):
     except AuthError as e:
         return _error(str(e), e.status, e.code)
     except YandexNotReady as e:
-        return _error(str(e), 503, "yandex_unavailable")
+        return _error(str(e), 503, "yandex_network" if e.network else "yandex_unavailable")
     except LoginError as e:
         return _error(str(e), 422)
     except web.HTTPException as e:
@@ -300,6 +302,8 @@ async def errors_middleware(request: web.Request, handler):
         return _error(REVOKED, 503, "yandex_unavailable")
     except YandexMusicError as e:
         log.warning("Ошибка Яндекс Музыки на %s: %r", request.path, e)
+        if is_network_error(e):
+            return _error(YANDEX_UNREACHABLE, 503, "yandex_network")
         return _error(f"Яндекс Музыка: {str(e)[:300]}", 502)
     except Exception:
         # Подробности — только в лог сервера: пользователю незачем видеть внутренности бота.

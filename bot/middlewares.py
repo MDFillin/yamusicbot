@@ -33,6 +33,7 @@ LOGIN_NEEDED = (
     "пароль бот не видит. Это займёт минуту."
 )
 YANDEX_PROBLEM = "⚠️ <b>Не получается подключиться к вашей Яндекс Музыке</b>\n\n{reason}"
+YANDEX_DOWN = "📡 <b>Яндекс Музыка сейчас недоступна</b>\n\n{reason}"
 
 
 def login_button(text: str = "🔑 Подключить Яндекс Музыку") -> InlineKeyboardMarkup:
@@ -58,15 +59,17 @@ class AccountMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         accounts: Accounts = data["accounts"]
         public = bool(get_flag(data, "public"))
-        ym, error = None, None
+        ym, error, network = None, None, False
         if user is not None:
             try:
                 ym = await accounts.get(user.id)
             except YandexNotReady as e:
-                error = str(e)
+                error, network = str(e), e.network
 
         if ym is None and not public:
-            if error:
+            if error and network:  # связь с Яндексом, а не вход: кнопка «Подключить заново» только запутала бы
+                await _tell(event, YANDEX_DOWN.format(reason=html.escape(error)), None, alert=f"📡 {error}")
+            elif error:
                 text = YANDEX_PROBLEM.format(reason=html.escape(error))
                 await _tell(event, text, login_button("🔑 Подключить заново"), alert=f"⚠️ {error}")
             else:
@@ -78,7 +81,7 @@ class AccountMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-async def _tell(event: TelegramObject, text: str, markup: InlineKeyboardMarkup, alert: str) -> None:
+async def _tell(event: TelegramObject, text: str, markup: InlineKeyboardMarkup | None, alert: str) -> None:
     if isinstance(event, Message):
         await event.answer(text, reply_markup=markup)
     elif isinstance(event, CallbackQuery):
