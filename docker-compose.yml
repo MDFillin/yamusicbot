@@ -47,6 +47,23 @@ services:
     cap_drop: [ALL]
     restart: unless-stopped
 
+  # Прокси до Яндекса через второй сервер по SSH — если с этого сервера Яндекс не открывается или тормозит.
+  # Включается: COMPOSE_PROFILES=yandex-tunnel (через запятую с другими профилями) и YANDEX_SSH=пользователь@сервер
+  # в .env, ключ — в ./ssh (README, «Прокси для Яндекса»). SOCKS5 на :1080 доступен только контейнерам этого
+  # docker compose — наружу порт не открыт.
+  yandex-tunnel:
+    build: ./yandex-tunnel
+    profiles: ["yandex-tunnel"]
+    environment:
+      YANDEX_SSH: ${YANDEX_SSH:-}
+      YANDEX_SSH_PORT: ${YANDEX_SSH_PORT:-22}
+    volumes:
+      - ./ssh:/keys
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: unless-stopped
+
 volumes:
   caddy_data:
 

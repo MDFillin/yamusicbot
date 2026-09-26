@@ -26,6 +26,7 @@ from aiogram.utils.token import TokenValidationError
 from aiohttp import web
 from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
+from bot import net
 from bot.accounts import Accounts
 from bot.admin import Admin, LimitReached
 from bot.audio import ffmpeg_available
@@ -200,6 +201,7 @@ async def main() -> None:
     except ConfigError as e:
         sys.exit(f"Ошибка настройки: {e}")
     os.umask(0o077)  # база с токенами пользователей — только для владельца сервера
+    net.configure(config.yandex_proxy)  # до первого соединения с Яндексом
     if not ffmpeg_available():
         log.warning("ffmpeg не найден: не-MP3 файлы будут загружаться без конвертации")
 

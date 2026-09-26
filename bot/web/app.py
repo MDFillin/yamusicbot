@@ -850,7 +850,7 @@ async def index(request: web.Request) -> web.Response:
 
 
 async def _startup(app: web.Application) -> None:
-    app[CTX].http = net.session(timeout=net.timeout(None, read=60), trust_env=True)
+    app[CTX].http = net.yandex_session(timeout=net.timeout(None, read=60), trust_env=True)
 
 
 async def _cleanup(app: web.Application) -> None:

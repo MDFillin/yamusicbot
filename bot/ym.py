@@ -112,7 +112,8 @@ YANDEX_UNREACHABLE = ("Сервер бота сейчас не может свя
 
 def is_network_error(e: BaseException) -> bool:
     """Яндекс не ответил или до него нет связи (в отличие от ошибок входа и ответа Яндекса)."""
-    return isinstance(e, NetworkError | aiohttp.ClientConnectionError | TimeoutError | ConnectionError)
+    network = (NetworkError, aiohttp.ClientConnectionError, TimeoutError, ConnectionError, *net.PROXY_ERRORS)
+    return isinstance(e, network)
 
 
 # ---------- соединения с API ----------
@@ -127,7 +128,7 @@ def api_session() -> aiohttp.ClientSession:
         _api_sessions.pop(old, None)
     session = _api_sessions.get(loop)
     if session is None or session.closed:
-        session = _api_sessions[loop] = net.session(limit=100, limit_per_host=30)
+        session = _api_sessions[loop] = net.yandex_session(limit=100, limit_per_host=30)
     return session
 
 
@@ -151,6 +152,8 @@ class YandexRequest(Request):
             raise TimedOutError from e
         except aiohttp.ClientError as e:
             raise NetworkError(e) from e
+        except net.PROXY_ERRORS as e:
+            raise NetworkError(f"прокси {net.mask(net.yandex_proxy())}: {e}") from e
         if 200 <= status <= 299:
             return content
         self._handle_error_response(status, content)
@@ -291,7 +294,7 @@ class YandexMusic:
 
     def _http(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = net.session(timeout=net.timeout(15 * 60, read=120), trust_env=True)
+            self._session = net.yandex_session(timeout=net.timeout(15 * 60, read=120), trust_env=True)
         return self._session
 
     def _auth(self, url: str) -> dict[str, str]:

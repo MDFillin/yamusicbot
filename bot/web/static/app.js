@@ -788,6 +788,7 @@
           kv('Точный подсчёт (Ynison)', !lv.enabled ? 'выключен' : lv.health && lv.health.broken ? '❌ не работает' : `на связи ${fmtNum(lv.connected || 0)} из ${fmtNum(lv.connections || 0)}`),
           kv('База', fmtSize(sv.db_bytes)), kv('Свободно на диске', `${fmtSize(sv.disk_free)} из ${fmtSize(sv.disk_total)}`),
           kv('Клиентов Яндекса в памяти', fmtNum(sv.clients)), kv('ffmpeg', sv.ffmpeg || 'не установлен'),
+          kv('Яндекс', sv.yandex_proxy ? `через прокси ${sv.yandex_proxy}` : 'напрямую'),
           kv('Python / aiogram', `${sv.python} / ${sv.aiogram}`), kv('Бот', sv.bot_username ? `@${sv.bot_username}` : '—'),
           kv('Инлайн-режим', sv.inline ? 'включён' : sv.inline === false ? 'выключен в @BotFather' : '—'),
           kv('Владельцы (.env)', String(sv.owners.length)), kv('Назначенные админы', String(sv.admins.length))),

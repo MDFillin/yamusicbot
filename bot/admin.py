@@ -31,6 +31,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import BotCommandScopeChat, FSInputFile
 
+from bot import net
 from bot.accounts import Accounts
 from bot.commands import ADMIN_COMMANDS
 from bot.config import Config
@@ -689,6 +690,7 @@ class Admin:
             "bot_username": self.bot_username,
             "inline": self.inline_enabled,
             "webapp_url": self.config.webapp_url,
+            "yandex_proxy": net.mask(self.config.yandex_proxy),
             "max_bitrate": self.config.max_bitrate,
             "web_max_upload_mb": self.config.web_max_upload_mb,
             "owners": sorted(self.config.admin_ids),

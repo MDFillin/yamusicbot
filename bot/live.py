@@ -331,7 +331,7 @@ class LiveTracker:
         if self._http is None or self._http.closed:
             # Соединений столько, сколько людей со статистикой: без лимита пула и без общего таймаута
             # (живость проверяют пинги websocket).
-            self._http = net.session(limit=0, timeout=net.timeout(None))
+            self._http = net.yandex_session(limit=0, timeout=net.timeout(None))
         first = True
         keep_raw = self.admin.is_admin(conn.user_id)
         conn.tracker.reconnected()

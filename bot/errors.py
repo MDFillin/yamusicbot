@@ -23,6 +23,10 @@ def describe_error(e: BaseException) -> str:
         return f"сервер ответил HTTP {e.status}"
     if isinstance(e, aiohttp.ClientError | TimeoutError):
         return "сетевая ошибка, попробуйте ещё раз"
+    from bot.net import PROXY_ERRORS
+
+    if isinstance(e, PROXY_ERRORS):
+        return "не удалось связаться с Яндексом через прокси, попробуйте ещё раз"
     return str(e)
 
 
@@ -35,13 +39,14 @@ def _expected() -> tuple[type[BaseException], ...]:
     from bot.accounts import LoginError
     from bot.admin import LimitReached
     from bot.audio import ConversionError
+    from bot.net import PROXY_ERRORS
     from bot.sender import TrackTooLargeError
     from bot.sources import SourceNotFoundError
     from bot.ym import TrackUnavailableError, UploadError, YandexNotReady
 
     return (aiohttp.ClientError, TimeoutError, TelegramAPIError, YandexMusicError, LoginError, LimitReached,
             ConversionError, TrackTooLargeError, SourceNotFoundError, TrackUnavailableError, UploadError,
-            YandexNotReady)
+            YandexNotReady, *PROXY_ERRORS)
 
 
 def is_expected(e: BaseException) -> bool:

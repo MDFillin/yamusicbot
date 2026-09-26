@@ -10,6 +10,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 FXTUNNEL_DOMAIN_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,30}[a-z0-9]")
+PROXY_SCHEMES = ("http://", "socks5://", "socks5h://", "socks4://")
+YANDEX_TUNNEL_PROXY = "socks5://yandex-tunnel:1080"  # сервис yandex-tunnel в docker-compose.yml
 
 
 class ConfigError(RuntimeError):
@@ -36,6 +38,8 @@ class Config:
     admin_ids: frozenset[int] = frozenset()
     # Ключ шифрования входов в базе; без него ключ хранится в data/secret.key (см. bot/crypto.py).
     encryption_key: str | None = None
+    # Весь трафик к Яндексу — через этот прокси (bot/net.py); Telegram ходит как раньше.
+    yandex_proxy: str | None = None
 
     @property
     def max_tg_download(self) -> int:
@@ -78,6 +82,14 @@ def load_config() -> Config:
     if webapp_url and not webapp_url.startswith("https://"):
         raise ConfigError("WEBAPP_URL должен начинаться с https:// — мини-приложения Telegram работают только по HTTPS")
 
+    yandex_proxy = os.getenv("YANDEX_PROXY", "").strip() or None
+    if not yandex_proxy and os.getenv("YANDEX_SSH", "").strip():
+        yandex_proxy = YANDEX_TUNNEL_PROXY  # включён SSH-туннель — по умолчанию через него
+    if yandex_proxy:
+        if not yandex_proxy.startswith(PROXY_SCHEMES):
+            raise ConfigError("YANDEX_PROXY должен начинаться с socks5://, http:// или socks4://")
+        yandex_proxy = yandex_proxy.replace("socks5h://", "socks5://", 1)  # имена и так разрешает прокси
+
     telegram_proxy = os.getenv("TELEGRAM_PROXY", "").strip() or None
     if telegram_proxy and not telegram_proxy.startswith(("http://", "socks4://", "socks5://")):
         raise ConfigError("TELEGRAM_PROXY должен начинаться с http://, socks5:// или socks4://")
@@ -97,6 +109,7 @@ def load_config() -> Config:
         legacy_users=_parse_users(os.getenv("ALLOWED_USERS", "")),
         admin_ids=_admin_ids(os.getenv("ADMIN_IDS", "")),
         encryption_key=os.getenv("ENCRYPTION_KEY", "").strip() or None,
+        yandex_proxy=yandex_proxy,
     )
 
 
