@@ -41,7 +41,7 @@ from bot.placer import TopPlacer
 from bot.sender import TrackSender
 from bot.storage import Storage
 from bot.web.app import create_app
-from bot.ym import YANDEX_UNREACHABLE, is_network_error
+from bot.ym import YANDEX_UNREACHABLE, close_api_session, is_network_error
 
 log = logging.getLogger("bot")
 
@@ -249,5 +249,6 @@ async def main() -> None:
         await runner.cleanup()
         await placer.close()
         await accounts.close()
+        await close_api_session()
         store.close()
         await bot.session.close()

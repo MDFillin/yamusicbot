@@ -23,6 +23,7 @@ from aiohttp import web
 from yandex_music import Album, Artist, Playlist, Track
 from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
+from bot import net
 from bot.accounts import Accounts, LoginError, LoginSession
 from bot.admin import ADMIN_MAX_AGE, Admin, LimitReached
 from bot.audio import (
@@ -849,7 +850,7 @@ async def index(request: web.Request) -> web.Response:
 
 
 async def _startup(app: web.Application) -> None:
-    app[CTX].http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_read=60), trust_env=True)
+    app[CTX].http = net.session(timeout=net.timeout(None, read=60), trust_env=True)
 
 
 async def _cleanup(app: web.Application) -> None:

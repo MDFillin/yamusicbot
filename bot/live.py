@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
-from bot import ynison
+from bot import net, ynison
 from bot.admin import DAY_OFFSET, Admin
 from bot.errors import log_failure, spawn
 from bot.storage import Storage
@@ -331,8 +331,7 @@ class LiveTracker:
         if self._http is None or self._http.closed:
             # Соединений столько, сколько людей со статистикой: без лимита пула и без общего таймаута
             # (живость проверяют пинги websocket).
-            self._http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0),
-                                               timeout=aiohttp.ClientTimeout(total=None, sock_connect=20))
+            self._http = net.session(limit=0, timeout=net.timeout(None))
         first = True
         keep_raw = self.admin.is_admin(conn.user_id)
         conn.tracker.reconnected()

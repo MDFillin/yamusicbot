@@ -14,14 +14,18 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from yandex_music import Album, ClientAsync, DownloadInfo, Playlist, Search, Track
-from yandex_music.exceptions import NetworkError, UnauthorizedError, YandexMusicError
+from yandex_music.exceptions import NetworkError, TimedOutError, UnauthorizedError, YandexMusicError
+from yandex_music.utils.request_async import Request
 
+from bot import net
 from bot.audio import ConversionError, ffmpeg_available, reencode_mp3, safe_filename, tag_mp3
 from bot.errors import log_failure
 
 log = logging.getLogger(__name__)
 
 START_RETRY_INTERVAL = 20  # сек: не долбить Яндекс повторными попытками на каждое сообщение
+API_TOTAL_TIMEOUT = 60  # сек на запрос к API целиком (библиотека по умолчанию ждёт 5 — на плохом канале мало)
+API_READ_TIMEOUT = 30  # сек тишины при чтении ответа
 API_BASE_URLS = ("https://api.music.yandex.ru", "https://api.music.yandex.net")
 # Заголовки, с которыми к этим хостам ходят приложение (.net) и новый сайт (.ru).
 API_HEADERS = {
@@ -109,6 +113,52 @@ YANDEX_UNREACHABLE = ("Сервер бота сейчас не может свя
 def is_network_error(e: BaseException) -> bool:
     """Яндекс не ответил или до него нет связи (в отличие от ошибок входа и ответа Яндекса)."""
     return isinstance(e, NetworkError | aiohttp.ClientConnectionError | TimeoutError | ConnectionError)
+
+
+# ---------- соединения с API ----------
+# Библиотека yandex-music на каждый запрос открывает новое соединение и ждёт 5 секунд. Здесь запросы идут
+# через общий пул (bot/net.py): соединения переиспользуются, а новое устанавливается с нескольких попыток.
+_api_sessions: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
+
+
+def api_session() -> aiohttp.ClientSession:
+    loop = asyncio.get_running_loop()
+    for old in [lp for lp in _api_sessions if lp.is_closed()]:  # тесты создают новый цикл событий на каждый тест
+        _api_sessions.pop(old, None)
+    session = _api_sessions.get(loop)
+    if session is None or session.closed:
+        session = _api_sessions[loop] = net.session(limit=100, limit_per_host=30)
+    return session
+
+
+async def close_api_session() -> None:
+    session = _api_sessions.pop(asyncio.get_running_loop(), None)
+    if session is not None:
+        await session.close()
+
+
+class YandexRequest(Request):
+    """Транспорт библиотеки yandex-music поверх общего пула соединений (см. выше)."""
+
+    async def _request_wrapper(self, *args: Any, **kwargs: Any) -> bytes:
+        kwargs = self._prepare_kwargs(kwargs)
+        asked = kwargs["timeout"].total or 0  # кто-то внутри библиотеки мог попросить ждать дольше
+        kwargs["timeout"] = net.timeout(max(asked, API_TOTAL_TIMEOUT), read=API_READ_TIMEOUT)
+        try:
+            async with api_session().request(*args, **kwargs) as resp:
+                status, content = resp.status, await resp.content.read()
+        except TimeoutError as e:
+            raise TimedOutError from e
+        except aiohttp.ClientError as e:
+            raise NetworkError(e) from e
+        if 200 <= status <= 299:
+            return content
+        self._handle_error_response(status, content)
+        return b""
+
+
+def make_client(token: str | None = None) -> ClientAsync:
+    return ClientAsync(token, request=YandexRequest())
 
 
 class YandexNotReady(RuntimeError):
@@ -202,7 +252,7 @@ class YandexMusic:
         return self._client is not None
 
     async def start(self) -> None:
-        client = await ClientAsync(self._token).init()
+        client = await make_client(self._token).init()
         me = client.me
         if me is None or me.account is None or me.account.uid is None:
             raise YandexMusicError("Яндекс не вернул данные аккаунта")
@@ -241,7 +291,7 @@ class YandexMusic:
 
     def _http(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15 * 60), trust_env=True)
+            self._session = net.session(timeout=net.timeout(15 * 60, read=120), trust_env=True)
         return self._session
 
     def _auth(self, url: str) -> dict[str, str]:

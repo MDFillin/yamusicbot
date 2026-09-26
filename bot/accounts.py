@@ -14,12 +14,11 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from yandex_music import ClientAsync
 from yandex_music.exceptions import DeviceAuthError, NetworkError, TimedOutError, YandexMusicError
 
 from bot.errors import log_failure
 from bot.storage import Storage
-from bot.ym import YandexMusic, explain_start_error
+from bot.ym import YandexMusic, explain_start_error, make_client
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +190,7 @@ class Accounts:
             if time.monotonic() - self._code_times.get(user_id, -MIN_LOGIN_INTERVAL) < MIN_LOGIN_INTERVAL:
                 raise LoginError("Подождите несколько секунд и попробуйте снова")
             self._code_times[user_id] = time.monotonic()
-            oauth = self._oauth or ClientAsync()
+            oauth = self._oauth or make_client()
             try:
                 code = await oauth.request_device_code(device_name=DEVICE_NAME)
             except YandexMusicError as e:
