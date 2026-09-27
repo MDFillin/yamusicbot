@@ -81,7 +81,8 @@ class FakeYM:
 
     async def ensure_started(self):
         if self.start_error:
-            raise YandexNotReady(self.start_error, getattr(self, "start_network", False))
+            raise YandexNotReady(self.start_error, getattr(self, "start_network", False),
+                                 getattr(self, "start_busy", False))
 
     async def close(self):
         pass
@@ -516,6 +517,31 @@ async def test_api_reports_unreachable_yandex(env):
     env.accounts._clients[OWNER_ID] = env.ym
     r = await env.client.get("/api/me")
     assert r.status == 503 and (await r.json())["code"] == "yandex_network", "экран «Нет связи», а не «Войти заново»"
+
+
+async def test_api_reports_busy_yandex(env):
+    from bot import net
+    from bot.ym import YandexBusyError
+
+    async def busy():
+        raise YandexBusyError("очередь")
+
+    env.ym.get_my_playlists = busy
+    r = await env.client.get("/api/library")
+    body = await r.json()
+    assert r.status == 503 and body["code"] == "yandex_busy" and "бережёт связь" in body["error"]
+
+    async def busy_raw():  # скачивание, плеер, загрузка — мимо библиотеки
+        raise net.YandexBusy("очередь")
+
+    env.ym.get_my_playlists = busy_raw
+    r = await env.client.get("/api/library")
+    assert r.status == 503 and (await r.json())["code"] == "yandex_busy"
+
+    env.ym.start_error, env.ym.start_busy = "подождите", True
+    env.accounts._clients[OWNER_ID] = env.ym
+    r = await env.client.get("/api/me")
+    assert r.status == 503 and (await r.json())["code"] == "yandex_busy"
 
 
 async def test_revoked_login_resets_client(env):

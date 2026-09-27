@@ -4,7 +4,17 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
+from bot import net
+
 FAKE_MP3 = b"\xff\xfb\x90\x64" + bytes(range(256)) * 40
+
+
+@pytest.fixture(autouse=True)
+def yandex_guard(monkeypatch):
+    """Свой регулятор запросов к Яндексу на каждый тест — просторный, чтобы не тормозить остальные тесты."""
+    guard = net.Guard(rate=1000, burst=1000)
+    monkeypatch.setattr(net, "guard", guard)
+    return guard
 
 
 @pytest.fixture

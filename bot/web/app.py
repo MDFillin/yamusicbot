@@ -45,6 +45,7 @@ from bot.sources import SourceNotFoundError, TrackSource, load_source, playlist_
 from bot.storage import Storage
 from bot.web.auth import AuthError, MediaSigner, init_data_age, verify_init_data
 from bot.ym import (
+    YANDEX_BUSY,
     YANDEX_UNREACHABLE,
     TrackUnavailableError,
     UploadEndpointError,
@@ -52,6 +53,7 @@ from bot.ym import (
     YandexMusic,
     YandexNotReady,
     cover_url,
+    is_busy,
     is_network_error,
     tagged_filename,
     track_album,
@@ -277,7 +279,9 @@ async def errors_middleware(request: web.Request, handler):
     except AuthError as e:
         return _error(str(e), e.status, e.code)
     except YandexNotReady as e:
-        return _error(str(e), 503, "yandex_network" if e.network else "yandex_unavailable")
+        return _error(str(e), 503, "yandex_busy" if e.busy else "yandex_network" if e.network else "yandex_unavailable")
+    except net.YandexBusy:  # скачивание, плеер, загрузка — не через библиотеку
+        return _error(YANDEX_BUSY, 503, "yandex_busy")
     except LoginError as e:
         return _error(str(e), 422)
     except web.HTTPException as e:
@@ -302,6 +306,8 @@ async def errors_middleware(request: web.Request, handler):
             await request.app[CTX].accounts.reset(user.id)
         return _error(REVOKED, 503, "yandex_unavailable")
     except YandexMusicError as e:
+        if is_busy(e):
+            return _error(YANDEX_BUSY, 503, "yandex_busy")
         log.warning("Ошибка Яндекс Музыки на %s: %r", request.path, e)
         if is_network_error(e):
             return _error(YANDEX_UNREACHABLE, 503, "yandex_network")

@@ -39,14 +39,14 @@ def _expected() -> tuple[type[BaseException], ...]:
     from bot.accounts import LoginError
     from bot.admin import LimitReached
     from bot.audio import ConversionError
-    from bot.net import PROXY_ERRORS
+    from bot.net import PROXY_ERRORS, YandexBusy
     from bot.sender import TrackTooLargeError
     from bot.sources import SourceNotFoundError
     from bot.ym import TrackUnavailableError, UploadError, YandexNotReady
 
     return (aiohttp.ClientError, TimeoutError, TelegramAPIError, YandexMusicError, LoginError, LimitReached,
             ConversionError, TrackTooLargeError, SourceNotFoundError, TrackUnavailableError, UploadError,
-            YandexNotReady, *PROXY_ERRORS)
+            YandexNotReady, YandexBusy, *PROXY_ERRORS)
 
 
 def is_expected(e: BaseException) -> bool:

@@ -42,7 +42,7 @@ from bot.placer import TopPlacer
 from bot.sender import TrackSender
 from bot.storage import Storage
 from bot.web.app import create_app
-from bot.ym import YANDEX_UNREACHABLE, close_api_session, is_network_error
+from bot.ym import YANDEX_BUSY, YANDEX_UNREACHABLE, close_api_session, is_busy, is_network_error
 
 log = logging.getLogger("bot")
 
@@ -112,6 +112,9 @@ def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storag
             if user is not None:
                 await dp["accounts"].reset(user.id)
             text = REVOKED
+        elif is_busy(event.exception):
+            log.info("Запрос к Яндексу не дождался очереди: %r", event.exception)
+            text = f"⏳ {YANDEX_BUSY}"
         elif is_network_error(event.exception):
             # Яндекс (или сеть) не ответил — это не баг бота: без трассировки и без «кода ошибки».
             log.warning("Нет связи при обработке апдейта: %r", event.exception)
@@ -202,6 +205,7 @@ async def main() -> None:
         sys.exit(f"Ошибка настройки: {e}")
     os.umask(0o077)  # база с токенами пользователей — только для владельца сервера
     net.configure(config.yandex_proxy)  # до первого соединения с Яндексом
+    net.guard.configure(config.yandex_rps)
     if not ffmpeg_available():
         log.warning("ffmpeg не найден: не-MP3 файлы будут загружаться без конвертации")
 
@@ -227,6 +231,7 @@ async def main() -> None:
 
     placer = TopPlacer()  # общий для бота и приложения: загрузки встают в начало плейлиста
     admin = Admin(config, store, accounts, bot)  # один на бота и приложение: настройки, рассылка, журнал
+    net.guard.on_trip = admin.yandex_slowed  # Яндекс начал отказывать — бот сбавил темп и говорит владельцам
     logging.getLogger().addHandler(admin.errors)
     admin.bot_username, admin.inline_enabled = me.username, bool(me.supports_inline_queries)
     if not config.admin_ids:

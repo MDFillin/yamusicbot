@@ -13,6 +13,7 @@ from typing import Any
 from aiogram.exceptions import TelegramBadRequest
 from aiohttp import web
 
+from bot import net
 from bot.admin import AUDIENCES, Admin, Forbidden
 from bot.web.app import CTX, USER, _json_body
 
@@ -44,6 +45,7 @@ async def overview(request: web.Request) -> web.Response:
         "settings": admin.settings_json(),
         "broadcast": admin.broadcaster.status,
         "upload_health": admin.upload_health_json(),
+        "yandex": net.guard.stats(),
         "listening": {"users": len(admin.store.stats_users()), "health": admin.history_health.json(),
                       "live": _live_status(request)},
     })

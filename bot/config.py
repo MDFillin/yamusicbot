@@ -40,6 +40,8 @@ class Config:
     encryption_key: str | None = None
     # Весь трафик к Яндексу — через этот прокси (bot/net.py); Telegram ходит как раньше.
     yandex_proxy: str | None = None
+    # Сколько запросов в секунду в среднем бот позволяет себе к Яндексу — всем вместе (bot/net.py, Guard).
+    yandex_rps: float = 3.0
 
     @property
     def max_tg_download(self) -> int:
@@ -90,6 +92,13 @@ def load_config() -> Config:
             raise ConfigError("YANDEX_PROXY должен начинаться с socks5://, http:// или socks4://")
         yandex_proxy = yandex_proxy.replace("socks5h://", "socks5://", 1)  # имена и так разрешает прокси
 
+    try:
+        yandex_rps = float(os.getenv("YANDEX_RPS", "").strip().replace(",", ".") or 3)
+    except ValueError:
+        raise ConfigError("YANDEX_RPS — число запросов в секунду, например 3 или 1.5") from None
+    if not 0.2 <= yandex_rps <= 20:
+        raise ConfigError("YANDEX_RPS должен быть от 0.2 до 20 (по умолчанию 3)")
+
     telegram_proxy = os.getenv("TELEGRAM_PROXY", "").strip() or None
     if telegram_proxy and not telegram_proxy.startswith(("http://", "socks4://", "socks5://")):
         raise ConfigError("TELEGRAM_PROXY должен начинаться с http://, socks5:// или socks4://")
@@ -110,6 +119,7 @@ def load_config() -> Config:
         admin_ids=_admin_ids(os.getenv("ADMIN_IDS", "")),
         encryption_key=os.getenv("ENCRYPTION_KEY", "").strip() or None,
         yandex_proxy=yandex_proxy,
+        yandex_rps=yandex_rps,
     )
 
 

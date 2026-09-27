@@ -142,7 +142,8 @@ class FakeYM:
 
     async def ensure_started(self):
         if self.start_error:
-            raise YandexNotReady(self.start_error, getattr(self, "start_network", False))
+            raise YandexNotReady(self.start_error, getattr(self, "start_network", False),
+                                 getattr(self, "start_busy", False))
 
     async def close(self):
         pass
@@ -354,6 +355,30 @@ async def test_unreachable_yandex_is_explained_without_relogin(env):
     await env.dp.feed_update(env.bot, message_update(text="кино"))
     text = env.tg.texts()[-1]
     assert text.startswith("📡") and "не может связаться" in text and "код" not in text
+
+
+async def test_busy_yandex_is_explained(env):
+    """Бот сам придержал запрос (бережёт лимиты Яндекса): «минутку», без «входите заново» и без кода ошибки."""
+    from bot import net
+    from bot.ym import YANDEX_BUSY, YandexBusyError
+
+    async def busy(query, type_):
+        raise YandexBusyError("очередь")
+
+    env.ym.search = busy
+    await env.dp.feed_update(env.bot, message_update(text="кино"))
+    assert env.tg.texts()[-1] == f"⏳ {YANDEX_BUSY}"
+
+    async def busy_download(*args, **kwargs):  # скачивание идёт мимо библиотеки — там своя ошибка
+        raise net.YandexBusy("очередь")
+
+    env.ym.search = busy_download
+    await env.dp.feed_update(env.bot, message_update(text="кино"))
+    assert env.tg.texts()[-1] == f"⏳ {YANDEX_BUSY}"
+
+    env.ym.start_error, env.ym.start_busy = YANDEX_BUSY, True
+    await env.dp.feed_update(env.bot, message_update(text="/likes"))
+    assert env.tg.texts()[-1].startswith("⏳ <b>Минутку</b>") and env.tg.buttons() == []
 
 
 async def test_revoked_login_is_explained(env):

@@ -89,6 +89,16 @@ LIVE_BROKEN = (
     "Выключить точный подсчёт можно в админ-панели → «Режимы». Когда он снова заработает, я напишу."
 )
 LIVE_FIXED = "✅ Точный подсчёт прослушиваний снова работает."
+YANDEX_SLOWED = (
+    "🐢 <b>Яндекс начал отказывать — бот сбавил темп</b>\n\n"
+    "Причина: {reason}. Ближайшие {minutes} мин бот обращается к Яндексу реже: фоновые задачи (статистика, "
+    "точный подсчёт) ждут, запросы людей идут по очереди. Так сервер не попадёт под ограничение Яндекса.\n\n"
+    "Если это повторяется, уменьшите YANDEX_RPS в .env (сейчас {rps}) и перезапустите бота:\n"
+    "<code>cd ~/yamusicbot &amp;&amp; docker compose up -d</code>\n"
+    "Проверить связь с Яндексом: <code>docker compose run --rm bot python -m bot.diag_net</code>\n"
+    "Подробности — в админ-панели, «Обзор» → «Запросы к Яндексу»."
+)
+YANDEX_SLOWED_EVERY = 6 * 3600  # сек: чаще об этом не пишем
 
 
 class ApiHealth:
@@ -331,6 +341,7 @@ class Admin:
         self._touched: dict[int, float] = {}
         self._denied: dict[int, float] = {}
         self._probes: dict[int, float] = {}
+        self._slowed_told = -float(YANDEX_SLOWED_EVERY)
         self._ffmpeg_version: str | None = None
         self._appointed = store.admin_ids() - set(config.admin_ids)
         self.upload_health = ApiHealth(self, "upload_health", UPLOAD_BROKEN, UPLOAD_FIXED)
@@ -620,6 +631,17 @@ class Admin:
         """Адрес загрузки ответил не так, как раньше. Если это повторяется — сообщаем владельцам (один раз)."""
         await self.upload_health.failed(user_id, details)
 
+    def yandex_slowed(self, reason: str, seconds: int, serious: bool) -> None:
+        """net.Guard сбавил темп запросов к Яндексу (net.guard.on_trip). Владельцам — только о серьёзном
+        и не чаще раза в YANDEX_SLOWED_EVERY."""
+        now = time.monotonic()
+        if not serious or now - self._slowed_told < YANDEX_SLOWED_EVERY:
+            return
+        self._slowed_told = now
+        text = YANDEX_SLOWED.format(reason=html.escape(reason), minutes=max(1, round(seconds / 60)),
+                                    rps=f"{self.config.yandex_rps:g}")
+        spawn(self.tell_owners(text), "владельцам: Яндекс отказывает")
+
     async def tell_owners(self, text: str) -> None:
         for owner in self.config.admin_ids:
             with contextlib.suppress(Exception):
@@ -691,6 +713,7 @@ class Admin:
             "inline": self.inline_enabled,
             "webapp_url": self.config.webapp_url,
             "yandex_proxy": net.mask(self.config.yandex_proxy),
+            "yandex_rps": self.config.yandex_rps,
             "max_bitrate": self.config.max_bitrate,
             "web_max_upload_mb": self.config.web_max_upload_mb,
             "owners": sorted(self.config.admin_ids),

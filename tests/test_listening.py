@@ -202,6 +202,33 @@ async def test_revoked_login_is_retried_hourly_not_every_tick(listening):
     assert listening.admin.history_health.failures == []  # отозванный вход — не поломка API
 
 
+async def test_history_is_polled_rarely_while_live_tracking_works(listening):
+    """Прослушивания и так видны вживую (Ynison) — история лишь подстраховка: раз в 6 часов, а не каждый час."""
+    from bot import listening as module
+
+    calls = []
+
+    class Counting(FakeYM):
+        async def music_history(self):
+            calls.append(1)
+            return []
+
+    async def get(user_id):
+        return Counting({})
+
+    listening.accounts = NS(get=get)
+    listening.live = NS(conns={1: NS(connected=True)}, wake=lambda uid: None, forget=lambda uid: None)
+    listening.enable(1)
+    now = datetime(2026, 9, 23, 12, 0)
+    await listening.tick(now)
+    listening._synced[1] -= module.SYNC_INTERVAL + 1  # прошёл час
+    await listening.tick(now)
+    assert calls == [1], "час прошёл, но точный подсчёт на связи — историю не трогаем"
+    listening.live.conns[1].connected = False
+    await listening.tick(now)
+    assert calls == [1, 1], "связи с Ynison нет — история снова каждый час"
+
+
 async def test_missing_track_is_not_refetched(listening):
     ym = FakeYM({"2026-09-21": [(WAVE, ["999"])]})
     await listening.sync(1, ym)

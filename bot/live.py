@@ -41,7 +41,7 @@ RESTART_NEAR_START_MS = 15_000  # трек начался заново, если
 RESTART_AFTER_MS = 15_000  # …после того как его слушали хотя бы столько (иначе это перемотка)
 LOOP_INTERVAL = 30  # сек: проверка подключений, засчитывание идущих треков, данные новых треков
 AUTH_COOLDOWN = 3600  # вход отозван — повторить не раньше чем через час
-RETRY_MIN, RETRY_MAX = 5, 300
+RETRY_MIN, RETRY_MAX = 15, 600  # сек между переподключениями: не чаще, чтобы не тревожить Яндекс
 STABLE_SESSION = 120  # соединение прожило столько — ошибки до него забываем, пауза снова минимальная
 RAW_KEEP = 60_000  # символов последнего кадра — для проверки владельцем
 
@@ -224,14 +224,15 @@ class LiveTracker:
             await self._http.close()
 
     async def _run(self) -> None:
-        while True:
-            try:
-                await self.tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log_failure(log, "Ynison: сбой фонового цикла", exc=e)
-            await asyncio.sleep(LOOP_INTERVAL)
+        with net.background():  # запросы к Яндексу отсюда уступают людям
+            while True:
+                try:
+                    await self.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log_failure(log, "Ynison: сбой фонового цикла", exc=e)
+                await asyncio.sleep(LOOP_INTERVAL)
 
     def wanted(self) -> dict[int, str]:
         """{пользователь: токен} — у кого должно быть соединение прямо сейчас."""
@@ -298,6 +299,10 @@ class LiveTracker:
     # ---------- одно соединение ----------
 
     async def _keep(self, conn: Connection) -> None:
+        with net.background():  # подключение могли начать и из запроса человека (wake) — всё равно это фон
+            await self._keep_connected(conn)
+
+    async def _keep_connected(self, conn: Connection) -> None:
         delay = RETRY_MIN
         while True:
             started = time.monotonic()

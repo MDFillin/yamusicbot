@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from yandex_music import TrackShort
 
+from bot import net
 from bot.errors import log_failure, spawn
 from bot.ym import YandexMusic
 
@@ -25,6 +26,7 @@ log = logging.getLogger(__name__)
 
 FIRST_CHECK = 5  # сек после загрузки до первой проверки плейлиста
 POLL_INTERVAL = 10
+SLOW_POLL_AFTER, SLOW_POLL_INTERVAL = 120, 30  # сек: не появился за 2 минуты — проверяем реже
 GIVE_UP_AFTER = 15 * 60  # сек после последней загрузки: дольше Яндекс не обрабатывает
 GROUP_GAP = 120  # загрузки чаще, чем раз в две минуты, считаем одной пачкой
 MAX_FAILURES = 5
@@ -104,6 +106,10 @@ class TopPlacer:
         return upload.done
 
     async def _run(self, key: tuple[int, int], watch: _Watch) -> None:
+        with net.background():  # опрос плейлиста — фон: уступает запросам людей
+            await self._watch(key, watch)
+
+    async def _watch(self, key: tuple[int, int], watch: _Watch) -> None:
         try:
             await asyncio.sleep(FIRST_CHECK)
             while any(not u.done.done() for u in watch.uploads):
@@ -122,7 +128,8 @@ class TopPlacer:
                         break
                 if all(u.done.done() for u in watch.uploads):
                     break
-                await asyncio.sleep(POLL_INTERVAL)
+                slow = time.monotonic() - watch.last_added > SLOW_POLL_AFTER
+                await asyncio.sleep(SLOW_POLL_INTERVAL if slow else POLL_INTERVAL)
         finally:
             for upload in watch.uploads:
                 if not upload.done.done():

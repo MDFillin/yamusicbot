@@ -29,6 +29,7 @@ def flaky(monkeypatch):
 
     monkeypatch.setattr(aiohttp.TCPConnector, "_create_connection", create)
     monkeypatch.setattr(net, "CONNECT_TIMEOUT", 1)
+    monkeypatch.setattr(net, "RETRY_PAUSE", 0.01)
     return state
 
 
@@ -66,10 +67,10 @@ def client(server, token="good"):
 
 async def test_connection_is_retried_until_a_working_path(flaky, yandex):
     server, _ = yandex
-    flaky["fail"] = 4  # 4 из 5 попыток теряются — как у хостера с частично сломанным маршрутом
+    flaky["fail"] = 2  # 2 из 3 попыток теряются — как у хостера с частично сломанным маршрутом
     c = await client(server).init()
     assert c.me.account.login == "me"
-    assert flaky["calls"] == 5, "пятая попытка соединиться прошла"
+    assert flaky["calls"] == 3, "третья попытка соединиться прошла"
 
 
 async def test_working_connection_is_reused(flaky, yandex):

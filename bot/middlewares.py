@@ -34,6 +34,7 @@ LOGIN_NEEDED = (
 )
 YANDEX_PROBLEM = "⚠️ <b>Не получается подключиться к вашей Яндекс Музыке</b>\n\n{reason}"
 YANDEX_DOWN = "📡 <b>Яндекс Музыка сейчас недоступна</b>\n\n{reason}"
+YANDEX_WAIT = "⏳ <b>Минутку</b>\n\n{reason}"
 
 
 def login_button(text: str = "🔑 Подключить Яндекс Музыку") -> InlineKeyboardMarkup:
@@ -59,15 +60,17 @@ class AccountMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         accounts: Accounts = data["accounts"]
         public = bool(get_flag(data, "public"))
-        ym, error, network = None, None, False
+        ym, error, network, busy = None, None, False, False
         if user is not None:
             try:
                 ym = await accounts.get(user.id)
             except YandexNotReady as e:
-                error, network = str(e), e.network
+                error, network, busy = str(e), e.network, e.busy
 
         if ym is None and not public:
-            if error and network:  # связь с Яндексом, а не вход: кнопка «Подключить заново» только запутала бы
+            if error and busy:
+                await _tell(event, YANDEX_WAIT.format(reason=html.escape(error)), None, alert=f"⏳ {error}")
+            elif error and network:  # связь с Яндексом, а не вход: кнопка «Подключить заново» только запутала бы
                 await _tell(event, YANDEX_DOWN.format(reason=html.escape(error)), None, alert=f"📡 {error}")
             elif error:
                 text = YANDEX_PROBLEM.format(reason=html.escape(error))

@@ -752,6 +752,13 @@
             'Похоже, Яндекс изменил протокол плеера (Ynison). Статистика пока собирается по истории — без повторов. Обновите бота (git pull) или выключите точный подсчёт в «Режимах».',
             lv.health.last_error_text ? h('div', { class: 'banner-detail' }, lv.health.last_error_text) : null)));
       }
+      const ya = data.yandex;
+      if (ya && ya.cooling > 0) {
+        banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'),
+          h('div', {}, h('b', {}, `Яндекс начал отказывать — бот сбавил темп ещё на ${fmtUptime(Math.max(ya.cooling, 60))}. `),
+            'Фоновые задачи ждут, запросы людей идут медленнее — так сервер не попадёт под ограничение Яндекса. Если это повторяется, уменьшите YANDEX_RPS в .env.',
+            ya.last_trip ? h('div', { class: 'banner-detail' }, ya.last_trip.reason) : null)));
+      }
       if (cfg.maintenance) banners.push(h('div', { class: 'adm-banner warn' }, icon('alert', 'sm'), 'Включены техработы — бот отвечает только вам'));
       if (cfg.closed) banners.push(h('div', { class: 'adm-banner' }, icon('lock', 'sm'), 'Регистрация закрыта — новые пользователи не допускаются'));
       if (bc.state === 'running') banners.push(h('div', { class: 'adm-banner' }, icon('megaphone', 'sm'), `Идёт рассылка: ${bc.sent} из ${bc.total}`));
@@ -781,6 +788,14 @@
         group('Динамика за 14 дней', h('div', { class: 'card set-card' },
           segmented(metrics.map(([k, label]) => [k, label]), metric, (v) => { metric = v; drawChart(); }), chartBox)),
         group('Больше всех скачали за неделю', topList),
+        ya ? group('Запросы к Яндексу', h('div', { class: 'card set-card kvs' },
+          kv('Темп', `${fmtNum(ya.per_min)} в минуту · предел ${ya.rate} в секунду`),
+          kv('За час', fmtNum(ya.last_hour)),
+          kv('Сейчас', ya.cooling > 0 ? `🐢 сбавлен ещё ${fmtUptime(Math.max(ya.cooling, 60))}` : '✅ обычный'),
+          kv('С запуска', `${fmtNum(ya.requests)} · фоновых ${fmtNum(ya.background)}`),
+          kv('Ждали очереди', `${fmtNum(ya.waited)} · не дождались ${fmtNum(ya.busy)}`),
+          kv('Отказы Яндекса', `«слишком много» (429): ${fmtNum(ya.throttled)} · сбои связи: ${fmtNum(ya.failed)}`),
+          kv('Последний раз сбавлял', ya.last_trip ? `${fmtAgo(ya.last_trip.at)} — ${ya.last_trip.reason}` : 'не было'))) : null,
         group('Сервер', h('div', { class: 'card set-card kvs' },
           kv('Работает', fmtUptime(sv.uptime)), kv('Память', sv.memory_mb ? `${sv.memory_mb} МБ` : '—'),
           kv('Загрузка в Яндекс', uh.broken ? '❌ не работает' : uh.last_ok ? `✅ работает · ${fmtAgo(uh.last_ok)}` : 'ещё не было'),
@@ -2403,6 +2418,7 @@
       state.me = await api('/api/me');
     } catch (e) {
       if (e.code === 'yandex_network') gate('Нет связи с Яндекс Музыкой', e.message, 'Проверить снова', enterApp);
+      else if (e.code === 'yandex_busy') gate('Минутку', e.message, 'Проверить снова', enterApp);
       else if (e.code === 'yandex_unavailable') gate('Яндекс Музыка недоступна', e.message, 'Подключить заново', () => showLogin());
       else if (e.code === 'banned') gate('Доступ закрыт', e.message);
       else if (e.code === 'maintenance') gate('Техническое обслуживание', e.message, 'Проверить снова', enterApp);

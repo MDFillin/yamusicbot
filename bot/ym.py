@@ -110,6 +110,18 @@ YANDEX_UNREACHABLE = ("Сервер бота сейчас не может свя
                       "Входить заново не нужно: как только связь вернётся, всё заработает само.")
 
 
+YANDEX_BUSY = ("Бот сейчас бережёт связь с Яндекс Музыкой: запросов слишком много сразу, и, чтобы Яндекс не ограничил "
+               "сервер, часть из них ждёт очереди. Попробуйте через минуту.")
+
+
+class YandexBusyError(NetworkError):
+    """Запрос библиотеки не дождался очереди к Яндексу (net.YandexBusy)."""
+
+
+def is_busy(e: BaseException) -> bool:
+    return isinstance(e, (net.YandexBusy, YandexBusyError))
+
+
 def is_network_error(e: BaseException) -> bool:
     """Яндекс не ответил или до него нет связи (в отличие от ошибок входа и ответа Яндекса)."""
     network = (NetworkError, aiohttp.ClientConnectionError, TimeoutError, ConnectionError, *net.PROXY_ERRORS)
@@ -128,7 +140,8 @@ def api_session() -> aiohttp.ClientSession:
         _api_sessions.pop(old, None)
     session = _api_sessions.get(loop)
     if session is None or session.closed:
-        session = _api_sessions[loop] = net.yandex_session(limit=100, limit_per_host=30)
+        # Немного постоянных соединений вместо множества новых: поток новых соединений Яндекс принимает за атаку.
+        session = _api_sessions[loop] = net.yandex_session(limit=100, limit_per_host=8, keepalive_timeout=120)
     return session
 
 
@@ -148,6 +161,8 @@ class YandexRequest(Request):
         try:
             async with api_session().request(*args, **kwargs) as resp:
                 status, content = resp.status, await resp.content.read()
+        except net.YandexBusy as e:
+            raise YandexBusyError(str(e)) from e
         except TimeoutError as e:
             raise TimedOutError from e
         except aiohttp.ClientError as e:
@@ -167,12 +182,13 @@ def make_client(token: str | None = None) -> ClientAsync:
 class YandexNotReady(RuntimeError):
     """Подключиться к Яндекс Музыке не удалось; текст — объяснение для человека.
 
-    network — дело в связи с Яндексом, а не во входе: подключаться заново бесполезно, надо подождать.
+    network — дело в связи с Яндексом, а не во входе: подключаться заново бесполезно, надо подождать;
+    busy — связь есть, но бот сейчас сам придерживает запросы (net.Guard).
     """
 
-    def __init__(self, text: str, network: bool = False) -> None:
+    def __init__(self, text: str, network: bool = False, busy: bool = False) -> None:
         super().__init__(text)
-        self.network = network
+        self.network, self.busy = network or busy, busy
 
 
 def explain_start_error(e: Exception) -> str:
@@ -182,6 +198,8 @@ def explain_start_error(e: Exception) -> str:
             "Яндекс Музыка не приняла вход: он устарел или был отозван в настройках Яндекс ID "
             "(реже — Яндекс не пускает запросы с сервера бота). Подключите аккаунт заново."
         )
+    if is_busy(e):
+        return YANDEX_BUSY
     if is_network_error(e):
         return YANDEX_UNREACHABLE
     return f"Не удалось подключиться к Яндекс Музыке: {type(e).__name__}: {e}"
@@ -241,6 +259,7 @@ class YandexMusic:
         self.has_plus = False
         self.start_error: str | None = None
         self.start_network = False  # прошлая неудача — из-за связи, а не входа
+        self.start_busy = False  # …или бот сам придержал запрос (net.Guard)
         self._start_lock = asyncio.Lock()
         self._last_attempt = 0.0
 
@@ -276,15 +295,16 @@ class YandexMusic:
             if self.ready:
                 return
             if self.start_error and time.monotonic() - self._last_attempt < START_RETRY_INTERVAL:
-                raise YandexNotReady(self.start_error, self.start_network)
+                raise YandexNotReady(self.start_error, self.start_network, self.start_busy)
             self._last_attempt = time.monotonic()
             try:
                 await self.start()
             except Exception as e:
                 self.start_error, self.start_network = explain_start_error(e), is_network_error(e)
+                self.start_busy = is_busy(e)
                 log_failure(log, "%s", self.start_error, exc=e)
-                raise YandexNotReady(self.start_error, self.start_network) from e
-            self.start_error, self.start_network = None, False
+                raise YandexNotReady(self.start_error, self.start_network, self.start_busy) from e
+            self.start_error, self.start_network, self.start_busy = None, False, False
             log.info("Яндекс Музыка подключена: uid %s, Плюс: %s", self.uid, self.has_plus)
 
     async def close(self) -> None:

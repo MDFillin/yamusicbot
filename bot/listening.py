@@ -28,6 +28,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from yandex_music.exceptions import NetworkError, TimedOutError, UnauthorizedError
 
+from bot import net
 from bot.accounts import Accounts
 from bot.admin import DAY_OFFSET, Admin
 from bot.callbacks import StatsCb, StatsSetCb
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 SYNC_INTERVAL = 3600  # сек: как часто забирать историю у каждого, кто включил статистику
+LIVE_SYNC_INTERVAL = 6 * 3600  # …а если прослушивания и так видны вживую (Ynison) — реже: история лишь подстраховка
 LOOP_INTERVAL = 300
 MANUAL_SYNC_INTERVAL = 60  # «Обновить сейчас» — не чаще раза в минуту
 # Когда присылать итоги (по Москве) и сколько после этого ещё можно прислать, если бот был выключен.
@@ -296,7 +298,11 @@ class Listening:
 
     def sync_soon(self, user_id: int) -> None:
         """Первая выгрузка сразу после включения — в фоне."""
-        spawn(self.sync(user_id), f"статистика {user_id}", self._jobs)
+        spawn(self._sync_in_background(user_id), f"статистика {user_id}", self._jobs)
+
+    async def _sync_in_background(self, user_id: int) -> None:
+        with net.background():
+            await self.sync(user_id)
 
     # ---------- сбор ----------
 
@@ -529,21 +535,26 @@ class Listening:
                     await task
 
     async def _run(self) -> None:
-        while True:
-            try:
-                await self.tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log_failure(log, "Статистика: сбой фонового цикла", exc=e)
-            await asyncio.sleep(LOOP_INTERVAL)
+        with net.background():  # запросы к Яндексу отсюда уступают людям
+            while True:
+                try:
+                    await self.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log_failure(log, "Статистика: сбой фонового цикла", exc=e)
+                await asyncio.sleep(LOOP_INTERVAL)
+
+    def _sync_interval(self, user_id: int) -> float:
+        conn = self.live.conns.get(user_id) if self.live is not None else None
+        return LIVE_SYNC_INTERVAL if conn is not None and conn.connected else SYNC_INTERVAL
 
     async def tick(self, now: datetime | None = None) -> None:
         now = now or msk_now()
         for user_id in self.store.stats_users():
             if self.admin.check(user_id) is not None:  # заблокирован или техработы
                 continue
-            if time.monotonic() - self._synced.get(user_id, -1e9) >= SYNC_INTERVAL:
+            if time.monotonic() - self._synced.get(user_id, -1e9) >= self._sync_interval(user_id):
                 await self.sync(user_id)
                 await asyncio.sleep(0.2)
             await self.send_due_reports(user_id, now)

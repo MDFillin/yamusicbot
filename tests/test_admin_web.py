@@ -358,3 +358,18 @@ async def test_user_search_resists_sql_injection(env):
     r = await c.get("/api/admin/users", params={"status": "all' OR 1=1 --"})
     assert r.status == 400
     assert env.store.get_account(OWNER_ID) == ("tok-owner", "me"), "таблицы и входы целы"
+
+
+async def test_yandex_slowdown_is_told_to_owners_once(env):
+    import asyncio
+
+    env.admin.yandex_slowed("4 из 10 последних запросов — таймауты и обрывы", 60, serious=False)
+    env.admin.yandex_slowed("Яндекс ответил «слишком много запросов» (429)", 120, serious=True)
+    env.admin.yandex_slowed("Яндекс ответил «слишком много запросов» (429)", 240, serious=True)
+    await asyncio.sleep(0.05)
+    alerts = [m for m in env.tg.calls if isinstance(m, SendMessage) and "сбавил темп" in m.text]
+    assert len(alerts) == 1 and alerts[0].chat_id == ADMIN_ID, "одна короткая заминка — не повод, повтор — не чаще"
+    assert "(429)" in alerts[0].text and "2 мин" in alerts[0].text and "YANDEX_RPS" in alerts[0].text
+
+    data = await (await env.client.get("/api/admin/overview")).json()
+    assert data["server"]["yandex_rps"] == 3.0 and {"per_min", "cooling", "last_trip"} <= data["yandex"].keys()
