@@ -723,7 +723,8 @@ async def _upload(request: web.Request, ctx: WebContext) -> web.Response:
         raise
     await ctx.admin.upload_succeeded()
     ctx.admin.count(_user_id(request), "upload")
-    ctx.placer.after_upload(ym, kind, known, result.ugc_track_id)  # встанет в начало, когда Яндекс обработает
+    # Встанет в начало, когда Яндекс обработает; не появится — бот отправит файл ещё раз.
+    ctx.placer.after_upload(ym, kind, known, result.ugc_track_id, resend=(name, prepared))
     ctx.invalidate(_user_id(request))
     if result.note:
         notes.append(result.note)

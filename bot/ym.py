@@ -40,6 +40,7 @@ API_HEADERS = {
     },
 }
 TOO_MANY_FILES = "TOO_MANY_FILES"
+TOO_MANY_FILES_TEXT = "Яндекс не принимает больше файлов: достигнут лимит загруженных треков в аккаунте"
 # Токен уходит только на эти домены (и на адреса API из настроек): post-target приходит в ответе сервера,
 # и чужой адрес в нём не должен получить вход в аккаунт.
 YANDEX_DOMAINS = ("yandex.ru", "yandex.net", "yandex.com")
@@ -69,6 +70,11 @@ def _parse_upload_target(body: str) -> dict | str | None:
     if isinstance(result, str) and result.upper().replace("-", "_") == TOO_MANY_FILES:
         return TOO_MANY_FILES
     return payload if payload.get("post-target") else None
+
+
+def _cookie_names(http: aiohttp.ClientSession) -> str:
+    """Какие cookies есть у сессии — только имена (значения — не для логов)."""
+    return ", ".join(sorted({c.key for c in http.cookie_jar})) or "нет"
 
 
 def _describe_body(body: str) -> str:
@@ -262,6 +268,7 @@ class YandexMusic:
         self.start_busy = False  # …или бот сам придержал запрос (net.Guard)
         self._start_lock = asyncio.Lock()
         self._last_attempt = 0.0
+        self._warmed = False  # сессия загрузки уже получила cookies Яндекса (_warm_up)
 
     @property
     def client(self) -> ClientAsync:
@@ -315,7 +322,30 @@ class YandexMusic:
     def _http(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = net.yandex_session(timeout=net.timeout(15 * 60, read=120), trust_env=True)
+            self._warmed = False
         return self._session
+
+    async def _warm_up(self) -> None:
+        """Перед первой загрузкой — лёгкий запрос к API, чтобы сессия получила cookies Яндекса, как браузер.
+
+        Сессия загрузки у каждого аккаунта своя и после перезапуска бота (и у нового пользователя) начинается
+        пустой. Первая загрузка после перезапуска Яндексом принималась, но в плейлисте так и не появлялась, а вторая
+        того же файла проходила; единственное, чем они отличались со стороны бота, — cookies из ответов Яндекса
+        на первую. Если не поможет и это, трек отправит ещё раз bot/placer.py."""
+        if self._warmed:
+            return
+        self._warmed = True
+        base = self._api_base_urls[0]
+        url = f"{base}/account/status"
+        http = self._http()
+        try:
+            async with http.get(url, headers={**API_HEADERS.get(_host(base), {}), **self._auth(url)}) as resp:
+                await resp.read()
+                status = resp.status
+        except (aiohttp.ClientError, TimeoutError) as e:
+            log.info("Не удалось подготовить сессию загрузки (%s): %r", _host(url), e)
+            return
+        log.info("Сессия загрузки: %s ответил HTTP %s, cookies: %s", _host(url), status, _cookie_names(http))
 
     def _auth(self, url: str) -> dict[str, str]:
         """Заголовок с токеном — только для Яндекса по HTTPS и для адресов API из настроек."""
@@ -523,26 +553,35 @@ class YandexMusic:
             "path": filename,
         }
 
+        await self._warm_up()
+        http = self._http()
         attempts: list[str] = []
         statuses: list[int] = []
-        for base in self._api_base_urls:
+        for n, base in enumerate(self._api_base_urls):
             url = f"{base}/loader/upload-url"
             headers = {**API_HEADERS.get(_host(base), {}), **self._auth(url)}
-            try:
-                async with self._http().post(url, params=params, data=params, headers=headers) as resp:
-                    body = await resp.text()
-                    status = resp.status
-            except aiohttp.ClientError as e:
-                attempts.append(f"{_host(url)}: сетевая ошибка {e}")
-                continue
-            payload = _parse_upload_target(body)
-            if payload == TOO_MANY_FILES:
-                raise UploadError("Яндекс не принимает больше файлов: достигнут лимит загруженных треков в аккаунте")
-            if payload is not None:
-                log.info("Адрес загрузки получен через %s", url)
-                return payload
-            statuses.append(status)
-            attempts.append(f"{_host(url)}{urlsplit(url).path}: HTTP {status} {_describe_body(body)}")
+            for attempt in (1, 2):
+                cookies = len(http.cookie_jar)
+                try:
+                    async with http.post(url, params=params, data=params, headers=headers) as resp:
+                        body = await resp.text()
+                        status = resp.status
+                except aiohttp.ClientError as e:
+                    attempts.append(f"{_host(url)}: сетевая ошибка {e}")
+                    break
+                payload = _parse_upload_target(body)
+                if payload == TOO_MANY_FILES:
+                    raise UploadError(TOO_MANY_FILES_TEXT)
+                if payload is not None:
+                    log.log(logging.WARNING if n else logging.INFO, "Адрес загрузки получен через %s%s: %s",
+                            url, " (запасной адрес API)" if n else "", _host(str(payload["post-target"])))
+                    return payload
+                if attempt == 1 and len(http.cookie_jar) > cookies:  # Яндекс сначала выдал cookies — ещё раз с ними
+                    log.info("%s ответил HTTP %s и выдал cookies — повторяю с ними", url, status)
+                    continue
+                statuses.append(status)
+                attempts.append(f"{_host(url)}{urlsplit(url).path}: HTTP {status} {_describe_body(body)}")
+                break
         details = "Яндекс не выдал адрес для загрузки. Ответы: " + "; ".join(attempts)
         if not statuses:  # ни одного ответа — это связь сервера с Яндексом, а не изменения у Яндекса
             raise UploadError(details)
@@ -600,5 +639,6 @@ class YandexMusic:
             raise UploadEndpointError(f"Адрес для файла ответил HTTP {status}: {reply[:300]}")
         if status >= 300:
             raise UploadError(f"Яндекс отклонил файл (HTTP {status}): {reply[:300]}")
-        log.info("Загружен %s в плейлист %s: %s", filename, playlist_kind, reply[:100])
+        log.info("Загружен %s в плейлист %s (%s, ugc %s): %s", filename, playlist_kind, _host(target),
+                 payload.get("ugc-track-id"), reply[:100])
         return UploadResult(ugc_track_id=payload.get("ugc-track-id"), server_reply=reply)

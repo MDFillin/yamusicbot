@@ -147,8 +147,77 @@ async def test_gives_up_quietly(monkeypatch):
     ym = FakePlaylistYM([short("1", "10")])
     placer = TopPlacer()
     done = placer.after_upload(ym, 1003, await placer.before_upload(ym, 1003), "never")
-    assert await asyncio.wait_for(done, 2) is False
+    assert await asyncio.wait_for(done, 2) is None, "None — Яндекс так и не добавил трек"
     assert ids(ym) == ["1"] and not ym.changes
+
+
+# ---------- Яндекс принял файл, но трек так и не появился ----------
+
+class ResendYM(FakePlaylistYM):
+    """Первая загрузка «теряется» (как бывало с первой после перезапуска бота), повторная — проходит."""
+
+    def __init__(self, tracks, second: object | None) -> None:
+        super().__init__(tracks)
+        self.second = second
+        self.resent: list[tuple[int, str, bytes]] = []
+
+    async def upload_track(self, kind, name, data):
+        from bot.ym import UploadResult
+
+        self.resent.append((kind, name, data))
+        if self.second is not None:
+            self.upload(self.second, delay=1)
+        return UploadResult("ugc-2", "CREATED")
+
+
+async def test_lost_upload_is_sent_again(monkeypatch):
+    monkeypatch.setattr(placer_module, "RESEND_AFTER", 0.05)
+    ym = ResendYM([short("1", "10")], second=short("ugc-2"))
+    placer = TopPlacer()
+    known = await placer.before_upload(ym, 1003)
+    done = placer.after_upload(ym, 1003, known, "ugc-1", resend=("Кино - Кукушка.mp3", b"mp3"))
+    assert placer._held == 3
+    assert await asyncio.wait_for(done, 2) is True
+    assert ym.resent == [(1003, "Кино - Кукушка.mp3", b"mp3")], "отправлен ещё раз — один раз"
+    assert ids(ym) == ["ugc-2", "1"] and placer._held == 0, "трек наверху, файл из памяти убран"
+
+
+async def test_upload_that_shows_up_is_not_sent_again(monkeypatch):
+    monkeypatch.setattr(placer_module, "RESEND_AFTER", 0.05)
+    ym = ResendYM([short("1", "10")], second=short("dup"))
+    placer = TopPlacer()
+    known = await placer.before_upload(ym, 1003)
+    ym.upload(short("ugc-1"), delay=0)
+    assert await asyncio.wait_for(placer.after_upload(ym, 1003, known, "ugc-1", resend=("a.mp3", b"x")), 2)
+    await asyncio.sleep(0.1)
+    assert ym.resent == [] and placer._held == 0 and ids(ym) == ["ugc-1", "1"]
+
+
+async def test_resent_once_then_reported_as_lost(monkeypatch):
+    monkeypatch.setattr(placer_module, "RESEND_AFTER", 0.02)
+    monkeypatch.setattr(placer_module, "GIVE_UP_AFTER", 0.2)
+    ym = ResendYM([short("1", "10")], second=None)
+    placer = TopPlacer()
+    done = placer.after_upload(ym, 1003, await placer.before_upload(ym, 1003), "ugc-1", resend=("a.mp3", b"x"))
+    assert await asyncio.wait_for(done, 3) is None
+    assert len(ym.resent) == 1 and placer._held == 0
+
+
+async def test_big_files_are_not_kept_for_resend(monkeypatch):
+    monkeypatch.setattr(placer_module, "RESEND_AFTER", 0.02)
+    monkeypatch.setattr(placer_module, "GIVE_UP_AFTER", 0.1)
+    monkeypatch.setattr(placer_module, "MAX_HELD_BYTES", 10)
+    ym = ResendYM([short("1", "10")], second=short("ugc-2"))
+    placer = TopPlacer()
+    done = placer.after_upload(ym, 1003, await placer.before_upload(ym, 1003), "ugc-1", resend=("a.mp3", b"x" * 11))
+    assert placer._held == 0
+    assert await asyncio.wait_for(done, 3) is None and ym.resent == [], "памяти жалко — не держим и не шлём"
+
+
+def test_bigger_files_get_more_time():
+    assert placer_module._resend_after(0) == placer_module.RESEND_AFTER
+    assert placer_module._resend_after(20 * 1024 * 1024) == placer_module.RESEND_AFTER + 120
+    assert placer_module._resend_after(10**10) == placer_module.RESEND_MAX_WAIT
 
 
 async def test_rejected_move_is_retried_then_reported(monkeypatch):
@@ -158,5 +227,6 @@ async def test_rejected_move_is_retried_then_reported(monkeypatch):
     placer = TopPlacer()
     known = await placer.before_upload(ym, 1003)
     ym.upload(short("u"), delay=0)
-    assert await asyncio.wait_for(placer.after_upload(ym, 1003, known, "u"), 2) is False
+    # 10 с: сбой пишется в журнал, а он при первом вызове подгружает aiogram — одиночный прогон ждёт это дольше
+    assert await asyncio.wait_for(placer.after_upload(ym, 1003, known, "u"), 10) is False
     assert len(ym.changes) == 2 and ids(ym) == ["1", "u"], "трек остался в конце, но на месте"

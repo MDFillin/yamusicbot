@@ -259,3 +259,64 @@ async def test_no_connection_is_not_endpoint_breakage():
     finally:
         await ym.close()
     assert not isinstance(info.value, UploadEndpointError)
+
+
+# ---------- первая загрузка из новой сессии ----------
+
+@pytest.fixture
+async def cookie_yandex():
+    """Яндекс, которому для загрузки нужны его cookies: без них адрес загрузки не выдаёт."""
+    seen = {"loader_cookies": [], "warm": 0, "warm_sets_cookie": True}
+
+    async def status(request):
+        seen["warm"] += 1
+        resp = web.json_response({"result": {}})
+        if seen["warm_sets_cookie"]:
+            resp.set_cookie("yandexuid", "1")
+        return resp
+
+    async def loader(request):
+        await request.post()
+        seen["loader_cookies"].append(sorted(request.cookies))
+        if not request.cookies:
+            resp = web.Response(status=403, text="no cookies")
+            resp.set_cookie("_yasc", "x")
+            return resp
+        return web.json_response({"post-target": str(request.url.with_path("/upload/abc").with_query({})),
+                                  "ugc-track-id": "ugc-1"})
+
+    async def upload(request):
+        await request.post()
+        return web.Response(text="CREATED")
+
+    app = web.Application()
+    app.router.add_get("/api/account/status", status)
+    app.router.add_post("/api/loader/upload-url", loader)
+    app.router.add_post("/upload/abc", upload)
+    server = TestServer(app, host="localhost")  # cookies aiohttp хранит только для имён, не для IP
+    await server.start_server()
+    yield f"http://localhost:{server.port}", seen
+    await server.close()
+
+
+async def test_new_session_gets_cookies_before_first_upload(cookie_yandex):
+    base, seen = cookie_yandex
+    ym = make_ym([f"{base}/api", f"{base}/other"])
+    try:
+        assert (await ym.upload_track(1003, "a.mp3", b"x")).ugc_track_id == "ugc-1"
+        assert (await ym.upload_track(1003, "b.mp3", b"y")).ugc_track_id == "ugc-1"
+    finally:
+        await ym.close()
+    assert seen["warm"] == 1, "один раз на сессию"
+    assert seen["loader_cookies"] == [["yandexuid"], ["yandexuid"]], "уже первый запрос адреса — с cookies"
+
+
+async def test_cookies_from_refusal_are_used_on_the_same_host(cookie_yandex):
+    base, seen = cookie_yandex
+    seen["warm_sets_cookie"] = False
+    ym = make_ym([f"{base}/api", f"{base}/other"])
+    try:
+        assert (await ym.upload_track(1003, "a.mp3", b"x")).ugc_track_id == "ugc-1"
+    finally:
+        await ym.close()
+    assert seen["loader_cookies"] == [[], ["_yasc"]], "повтор на том же адресе, а не запасной адрес API"

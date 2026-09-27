@@ -162,7 +162,7 @@ class FakePlacer:
         self.calls.append(("before", ym.login, kind))
         return {"known"}
 
-    def after_upload(self, ym, kind, known, ugc_id):
+    def after_upload(self, ym, kind, known, ugc_id, resend=None):
         self.calls.append(("after", ym.login, kind, known, ugc_id))
 
 

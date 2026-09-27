@@ -6,6 +6,13 @@
 
 Загрузки, сделанные подряд (одна «пачка»), встают наверх в том порядке, в каком их загружали,
 а более поздняя пачка — над более ранней.
+
+Бывает, что Яндекс принимает файл, но в плейлисте трек так и не появляется (так было с первой загрузкой после
+перезапуска бота), а повторная загрузка того же файла проходит. Поэтому файл какое-то время хранится в памяти,
+и если трек не появился за RESEND_AFTER, бот один раз отправляет его ещё раз сам.
+
+Итог каждой загрузки (future из after_upload): True — трек наверху; False — трек в плейлисте, но переставить
+не вышло; None — Яндекс так и не добавил его в плейлист.
 """
 
 from __future__ import annotations
@@ -31,14 +38,26 @@ GIVE_UP_AFTER = 15 * 60  # сек после последней загрузки
 GROUP_GAP = 120  # загрузки чаще, чем раз в две минуты, считаем одной пачкой
 MAX_FAILURES = 5
 OWN_SOURCES = {"OWN", "OWN_REPLACED_TO_UGC"}
+# Трек так и не появился в плейлисте — через столько секунд отправить файл ещё раз (большим — позже, до 10 минут).
+RESEND_AFTER = 4 * 60
+RESEND_MAX_WAIT = 10 * 60
+MAX_HELD_BYTES = 200 * 1024 * 1024  # сколько байт файлов держим в памяти ради повторной отправки (на всех)
+
+
+def _resend_after(size: int) -> float:
+    """Большие файлы Яндекс обрабатывает дольше: +1 минута на каждые 10 МБ."""
+    return min(RESEND_AFTER + size / (10 * 1024 * 1024) * 60, RESEND_MAX_WAIT)
 
 
 @dataclass
 class _Upload:
     seq: int
     group: int
-    ugc_id: str | None
+    ugc_ids: list[str]  # id из ответа загрузки (и повторной, если была)
     done: asyncio.Future
+    started: float = 0.0
+    resend: tuple[str, bytes] | None = None  # (имя, файл) — отправить ещё раз, если трек не появится
+    resent: bool = False
     track: str | None = None  # id трека в плейлисте, когда он там появился
     placed: bool = False
 
@@ -71,6 +90,7 @@ class TopPlacer:
     def __init__(self) -> None:
         self._watches: dict[tuple[int, int], _Watch] = {}
         self._seq = itertools.count(1)
+        self._held = 0  # байт файлов в памяти ради повторной отправки
 
     @staticmethod
     def _key(ym: YandexMusic, kind: int) -> tuple[int, int]:
@@ -87,8 +107,15 @@ class TopPlacer:
             log_failure(log, "Не удалось получить плейлист %s перед загрузкой", kind, exc=e)
             return None  # тогда узнаём трек только по его id из ответа загрузки
 
-    def after_upload(self, ym: YandexMusic, kind: int, known: set[str] | None, ugc_id: str | None) -> asyncio.Future:
-        """Трек загружен — поставить его наверх, когда появится. Результат: True, если получилось."""
+    def after_upload(self, ym: YandexMusic, kind: int, known: set[str] | None, ugc_id: str | None,
+                     resend: tuple[str, bytes] | None = None) -> asyncio.Future:
+        """Трек загружен — поставить его наверх, когда появится (итог — см. описание модуля).
+
+        resend — (имя, файл): если трек так и не появится в плейлисте, бот отправит его ещё раз сам."""
+        if resend is not None and self._held + len(resend[1]) > MAX_HELD_BYTES:
+            resend = None  # памяти жалко: такие файлы при сбое человек пришлёт ещё раз сам
+        if resend is not None:
+            self._held += len(resend[1])
         key = self._key(ym, kind)
         now = time.monotonic()
         seq = next(self._seq)
@@ -99,7 +126,8 @@ class TopPlacer:
             watch.group = seq
         watch.ym = ym
         watch.last_added = now
-        upload = _Upload(seq, watch.group, str(ugc_id) if ugc_id else None, asyncio.get_running_loop().create_future())
+        upload = _Upload(seq, watch.group, [str(ugc_id)] if ugc_id else [], asyncio.get_running_loop().create_future(),
+                         started=now, resend=resend)
         watch.uploads.append(upload)
         if watch.task is None or watch.task.done():
             watch.task = spawn(self._run(key, watch), f"наверх плейлиста {watch.kind}")
@@ -114,8 +142,7 @@ class TopPlacer:
             await asyncio.sleep(FIRST_CHECK)
             while any(not u.done.done() for u in watch.uploads):
                 if time.monotonic() - watch.last_added > GIVE_UP_AFTER:
-                    log.warning("Яндекс так и не показал загруженные треки в плейлисте %s", watch.kind)
-                    break
+                    break  # что не появилось — в лог ниже
                 try:
                     await self._step(watch)
                 except asyncio.CancelledError:
@@ -132,10 +159,38 @@ class TopPlacer:
                 await asyncio.sleep(SLOW_POLL_INTERVAL if slow else POLL_INTERVAL)
         finally:
             for upload in watch.uploads:
+                self._release(upload)
                 if not upload.done.done():
-                    upload.done.set_result(False)
+                    upload.done.set_result(None if upload.track is None else False)
+                if upload.track is None:
+                    log.warning("Яндекс так и не добавил загруженный трек в плейлист %s (ugc %s%s)", watch.kind,
+                                ", ".join(upload.ugc_ids) or "?", ", файл отправлялся дважды" if upload.resent else "")
             if self._watches.get(key) is watch:
                 del self._watches[key]
+
+    def _release(self, upload: _Upload) -> None:
+        if upload.resend is not None:
+            self._held -= len(upload.resend[1])
+            upload.resend = None
+
+    async def _resend_missing(self, watch: _Watch) -> None:
+        """Трек так и не появился в плейлисте — отправить файл ещё раз (один раз на загрузку)."""
+        now = time.monotonic()
+        for upload in watch.uploads:
+            if upload.track is not None or upload.resend is None:
+                continue
+            name, data = upload.resend
+            if now - upload.started < _resend_after(len(data)):
+                continue
+            self._release(upload)
+            upload.resent = True
+            log.warning("Яндекс за %s мин так и не показал в плейлисте %s загруженный трек «%s» (ugc %s) — "
+                        "отправляю файл ещё раз", int((now - upload.started) // 60), watch.kind, name,
+                        ", ".join(upload.ugc_ids) or "?")
+            result = await watch.ym.upload_track(watch.kind, name, data)
+            if result.ugc_track_id:
+                upload.ugc_ids.append(str(result.ugc_track_id))
+            upload.started = watch.last_added = time.monotonic()  # новое окно ожидания
 
     async def _step(self, watch: _Watch) -> None:
         playlist = await watch.ym.get_playlist(watch.kind)
@@ -146,8 +201,9 @@ class TopPlacer:
         claimed = {u.track for u in watch.uploads if u.track}
 
         for upload in watch.uploads:  # по id из ответа загрузки
-            if upload.track is None and upload.ugc_id:
-                match = next((s for s in shorts if str(s.id) not in claimed and _matches(s, upload.ugc_id)), None)
+            if upload.track is None and upload.ugc_ids:
+                match = next((s for s in shorts if str(s.id) not in claimed
+                              and any(_matches(s, ugc_id) for ugc_id in upload.ugc_ids)), None)
                 if match is not None:
                     upload.track = str(match.id)
                     claimed.add(upload.track)
@@ -158,8 +214,12 @@ class TopPlacer:
             for upload, track_id in zip(waiting, fresh, strict=False):
                 upload.track = track_id
 
+        for upload in watch.uploads:
+            if upload.track is not None:
+                self._release(upload)  # появился — файл больше не нужен
         found = [u for u in watch.uploads if u.track and not u.placed]
         if not found:
+            await self._resend_missing(watch)
             return
         order = sorted((u for u in watch.uploads if u.track in present), key=lambda u: (-u.group, u.seq))
         await watch.ym.move_to_top(watch.kind, [u.track for u in order], playlist)

@@ -510,7 +510,7 @@ async def upload_files(
                 await update(prefix + "\n(отправляю в Яндекс…)")
                 known = await placer.before_upload(ym, kind)
                 result = await _upload_to_yandex(ym, kind, name, data, uploads.admin, user_id)
-                placed.append(placer.after_upload(ym, kind, known, result.ugc_track_id))
+                placed.append(placer.after_upload(ym, kind, known, result.ugc_track_id, resend=(name, data)))
                 if uploads.admin is not None:
                     uploads.admin.count(user_id, "upload")
                 if result.note:
@@ -542,9 +542,16 @@ async def upload_files(
 
 
 async def _report_placement(status: Message, text: str, title: str, placed: list[asyncio.Future]) -> None:
-    results = await asyncio.gather(*placed)
-    if all(results):
+    results = await asyncio.gather(*placed)  # True — наверху, False — в конце, None — Яндекс так и не добавил
+    lost = results.count(None)
+    if all(r is True for r in results):
         note = f"\n\n📌 Готово: треки уже в начале плейлиста «{title}»."
+    elif lost == len(results):
+        note = ("\n\n⚠️ Яндекс принял файлы, но в плейлист их так и не добавил (бот отправлял их дважды). "
+                "Пришлите их ещё раз чуть позже.")
+    elif lost:
+        note = (f"\n\n⚠️ Не появилось в плейлисте: {lost} из {len(results)} — Яндекс принял файлы, но так и не "
+                "добавил их. Пришлите их ещё раз чуть позже. Остальные — в плейлисте.")
     elif any(results):
         note = "\n\n📌 Часть треков поднята в начало плейлиста, остальные Яндекс оставил в конце."
     else:

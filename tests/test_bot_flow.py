@@ -202,14 +202,17 @@ class FakePlacer:
 
     def __init__(self) -> None:
         self.placed: list[tuple[int, int, str | None]] = []
+        self.results: list[bool | None] = []  # итог для каждой загрузки по очереди; пусто — «наверху»
+        self.resend: list[tuple[str, bytes] | None] = []
 
     async def before_upload(self, ym, kind):
         return set()
 
-    def after_upload(self, ym, kind, known, ugc_id):
+    def after_upload(self, ym, kind, known, ugc_id, resend=None):
         self.placed.append((ym.uid, kind, ugc_id))
+        self.resend.append(resend)
         future = asyncio.get_running_loop().create_future()
-        future.set_result(True)
+        future.set_result(self.results.pop(0) if self.results else True)
         return future
 
 
@@ -427,6 +430,19 @@ async def test_upload_asks_playlist_then_uploads_all_files(env):
     assert [(uid, kind) for uid, kind, _ in env.placer.placed] == [(42, 1003), (42, 1003)]
     status = env.tg.texts()[-1]
     assert "✅ Загружено в «Мои записи»: 2 из 2" in status and "треки уже в начале плейлиста" in status
+
+
+async def test_upload_that_yandex_never_added_is_reported(env):
+    """Яндекс принял файл, но в плейлист так и не добавил (даже после повторной отправки) — честно так и пишем."""
+    env.placer.results = [True, None]
+    await env.dp.feed_update(env.bot, audio_update("F1", caption="Кино - Кукушка"))
+    await env.dp.feed_update(env.bot, audio_update("F2"))
+    await env.dp.feed_update(env.bot, callback_update(UploadCb(action="to", kind=1003).pack()))
+    await settle()
+    status = env.tg.texts()[-1]
+    assert "Не появилось в плейлисте: 1 из 2" in status and "Пришлите их ещё раз" in status
+    assert [name for name, _ in env.placer.resend] == ["Кино - Кукушка.mp3", "rec.mp3"], "файл — для повтора"
+    assert env.placer.resend[0][1] == env.ym.uploads[0][2]
 
 
 async def test_default_playlist_is_one_tap_away(env):
