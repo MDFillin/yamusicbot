@@ -394,6 +394,8 @@ docker compose up -d --build --force-recreate
 | остановить бота | `docker compose down` |
 | запустить снова | `docker compose up -d` |
 | обновить бота до новой версии | `git pull`, затем `docker compose up -d --build` |
+| резервная копия (придёт тебе в Telegram) | `bash scripts/backup.sh` |
+| восстановить на новом сервере | `bash scripts/restore.sh` и код из сообщения бота |
 
 Бот сам запускается после перезагрузки сервера. Окно терминала можно спокойно закрывать, бот продолжит работать.
 
