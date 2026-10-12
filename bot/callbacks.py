@@ -95,3 +95,12 @@ class MergeCb(CallbackData, prefix="mg"):
     action: str
     kind: int = 0
     ref: str = ""  # likes | pl:<kind>
+
+
+class SharedCb(CallbackData, prefix="sh"):
+    """Общие плейлисты: action — list | open | create | create_new | create_from | sync | invite | leave | leave_ok |
+    join_new | join_pick | join_to | join_no; sid — общий плейлист, kind — свой плейлист."""
+
+    action: str
+    sid: int = 0
+    kind: int = 0

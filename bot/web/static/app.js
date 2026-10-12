@@ -1263,11 +1263,16 @@
       h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Моя статистика'),
         h('div', { class: 'sub' }, 'Итоги дня, недели и месяца по истории Яндекса')), icon('chevron', 'sm'));
 
+    const sharedTile = h('button', { class: 'row stats-tile', onclick: () => { haptic.tap(); sharedSheet(); } },
+      h('span', { class: 'set-icon' }, icon('user', 'sm')),
+      h('div', { class: 'meta' }, h('div', { class: 'title' }, 'Общие плейлисты'),
+        h('div', { class: 'sub' }, 'Один плейлист на двоих: каждый добавляет у себя в Яндекс Музыке')), icon('chevron', 'sm'));
+
     root.append(
       h('div', { class: 'lib-head' },
         h('div', {}, h('div', { class: 'hello' }, name ? `Привет, ${name} 👋` : 'Привет 👋'), h('h1', { class: 'page-title' }, 'Медиатека')),
         h('div', { class: 'head-btns' }, shield, gear)),
-      chip, likes, statsTile,
+      chip, likes, statsTile, sharedTile,
       h('div', { class: 'section-head' }, h('h2', {}, 'Мои плейлисты'),
         h('button', { class: 'link-btn', onclick: () => createPlaylistSheet() }, icon('plus', 'sm'), 'Создать')),
       grid);
@@ -1296,6 +1301,77 @@
     };
     if (state.libraryLoaded) draw();
     refresh();
+  }
+
+  // ---------- общие плейлисты (bot/shared.py) ----------
+  const SHARED_HOW = 'Добавляйте и удаляйте треки прямо в приложении Яндекс Музыки — у остальных изменения появятся в течение нескольких минут, и наоборот.';
+
+  function syncedAgo(ts) { return ts ? `синхронизирован ${fmtAgo(ts)}` : 'ещё не синхронизирован'; }
+
+  async function sharedSheet() {
+    openSheet([h('div', { class: 'sheet-title' }, 'Общие плейлисты'), h('div', { class: 'empty' }, spinner())]);
+    let data;
+    try { data = await api('/api/shared'); } catch (e) { fail(e); closeSheet(); return; }
+    openSheet([
+      h('div', { class: 'sheet-title' }, 'Общие плейлисты'),
+      h('div', { class: 'sheet-note' }, `Один плейлист на нескольких человек: у каждого он в своём аккаунте, а бот держит их одинаковыми. ${SHARED_HOW} Друзья присоединяются по ссылке-приглашению.`),
+      data.items.length ? h('div', { class: 'card list' }, data.items.map((x) => h('button', { class: 'row', onclick: () => sharedCard(x) },
+        icon('list'), h('div', { class: 'meta' }, h('div', { class: 'title' }, x.title),
+          h('div', { class: 'sub' }, `${x.members.length} ${plural(x.members.length, 'участник', 'участника', 'участников')} · ${tracksWord(x.tracks)}`)),
+        x.error || x.members.some((m) => m.error) ? icon('alert', 'sm') : icon('chevron', 'sm')))) : null,
+      h('button', { class: 'btn block', onclick: sharedCreateSheet }, icon('plus', 'sm'), 'Создать общий плейлист'),
+    ]);
+  }
+
+  async function sharedCreateSheet() {
+    if (!state.libraryLoaded) await loadLibrary().catch(fail);
+    const create = async (body) => {
+      try {
+        const info = await api('/api/shared', { method: 'POST', body });
+        haptic.ok();
+        loadLibrary().catch(() => {});
+        sharedCard(info, true);
+      } catch (e) { fail(e); }
+    };
+    openSheet([
+      h('div', { class: 'sheet-title' }, 'Какой плейлист сделать общим?'),
+      h('div', { class: 'sheet-note' }, 'Можно новый или один из ваших — тогда его треки сразу окажутся у всех участников.'),
+      h('div', { class: 'card list' },
+        menuRow('plus', 'Новый плейлист', () => promptSheet('Общий плейлист', 'Название', '', 'Создать', (title) => create({ title }))),
+        state.playlists.map((p) => menuRow('list', `${p.title} · ${tracksWord(p.count)}`, () => create({ kind: p.kind })))),
+    ]);
+  }
+
+  function sharedCard(x, fresh = false) {
+    const invite = () => openTelegram(`https://t.me/share/url?url=${encodeURIComponent(x.invite)}&text=${encodeURIComponent(`Присоединяйся к общему плейлисту «${x.title}»`)}`);
+    const syncBtn = h('button', { class: 'btn secondary block' }, icon('refresh', 'sm'), 'Синхронизировать сейчас');
+    syncBtn.addEventListener('click', async () => {
+      syncBtn.disabled = true;
+      try {
+        const r = await api(`/api/shared/${x.id}/sync`, { method: 'POST' });
+        haptic.ok();
+        toast(r.added || r.removed ? `Добавлено ${r.added}, удалено ${r.removed}` : 'Всё уже одинаково');
+        sharedCard(r);
+      } catch (e) { fail(e); } finally { syncBtn.disabled = false; }
+    });
+    openSheet([
+      h('div', { class: 'sheet-title' }, x.title),
+      h('div', { class: 'sheet-note' }, fresh ? `Общий плейлист готов. Отправьте другу ссылку-приглашение — по ней он присоединится в чате с ботом. ${SHARED_HOW}` : SHARED_HOW),
+      h('div', { class: 'card list' },
+        x.members.map((m) => h('div', { class: 'row' }, icon(m.error ? 'alert' : 'user'),
+          h('div', { class: 'meta' }, h('div', { class: 'title' }, m.name + (m.me ? ' (вы)' : '')),
+            m.error ? h('div', { class: 'sub' }, m.error) : null)))),
+      h('div', { class: 'set-note' }, `${tracksWord(x.tracks)} · ${syncedAgo(x.synced_at)}`),
+      h('div', { class: 'card list' },
+        menuRow('send', 'Пригласить друга', invite),
+        menuRow('copy', 'Скопировать ссылку-приглашение', () => copyText(x.invite).then(() => toast('Ссылка скопирована'))),
+        menuRow('list', 'Открыть плейлист', () => push(sourceView('pl', x.ref))),
+        menuRow('logout', 'Выйти из общего плейлиста', async () => {
+          if (!(await confirmAsk(`Выйти из «${x.title}»? Ваш плейлист останется, просто перестанет обновляться. У остальных ничего не удалится.`))) return;
+          try { await api(`/api/shared/${x.id}`, { method: 'DELETE' }); toast('Вы вышли из общего плейлиста'); } catch (e) { fail(e); }
+        }, 'danger')),
+      syncBtn,
+    ]);
   }
 
   // ---------- экран: статистика прослушиваний ----------

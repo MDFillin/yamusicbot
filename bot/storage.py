@@ -160,6 +160,41 @@ CREATE TABLE IF NOT EXISTS live_seen (
     day TEXT NOT NULL,
     PRIMARY KEY (user_id, track_id, day)
 );
+-- Общие плейлисты (bot/shared.py): у каждого участника свой плейлист в своём аккаунте, бот держит их одинаковыми.
+CREATE TABLE IF NOT EXISTS shared (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    owner INTEGER NOT NULL,        -- кто создал (Telegram ID)
+    code TEXT NOT NULL UNIQUE,     -- приглашение: t.me/<бот>?start=join_<code>
+    created_at INTEGER NOT NULL,
+    synced_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS shared_members (
+    shared_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    kind INTEGER NOT NULL,         -- плейлист участника в его аккаунте Яндекса
+    joined_at INTEGER NOT NULL,
+    synced INTEGER NOT NULL DEFAULT 0,  -- 1 — снимок shared_seen уже есть
+    error TEXT,                    -- почему не получилось в прошлый раз
+    PRIMARY KEY (shared_id, user_id)
+);
+-- Общий список: что сейчас в общем плейлисте, в каком порядке и кто добавил.
+CREATE TABLE IF NOT EXISTS shared_tracks (
+    shared_id INTEGER NOT NULL,
+    pos INTEGER NOT NULL,
+    track_id TEXT NOT NULL,
+    album_id TEXT,                 -- NULL у загруженных файлов: добавить такой может только его владелец
+    added_by INTEGER NOT NULL,
+    PRIMARY KEY (shared_id, track_id)
+);
+-- Что было в плейлисте участника после прошлой синхронизации: по разнице видно, что он сам добавил и удалил.
+CREATE TABLE IF NOT EXISTS shared_seen (
+    shared_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    track_id TEXT NOT NULL,
+    PRIMARY KEY (shared_id, user_id, track_id)
+);
+CREATE INDEX IF NOT EXISTS shared_members_user ON shared_members (user_id);
 CREATE INDEX IF NOT EXISTS plays_user_day ON plays (user_id, day);
 CREATE INDEX IF NOT EXISTS listens_user_track ON listens (user_id, track_id);
 CREATE INDEX IF NOT EXISTS track_artists_artist ON track_artists (artist_id);
@@ -661,6 +696,98 @@ class Storage:
 
     def stats_users(self) -> list[int]:
         return [r[0] for r in self._all("SELECT user_id FROM user_settings WHERE key = 'stats' AND value = '1'")]
+
+    # ---------- общие плейлисты (bot/shared.py) ----------
+
+    def create_shared(self, title: str, owner: int, code: str) -> int:
+        cur = self._db.execute("INSERT INTO shared (title, owner, code, created_at) VALUES (?, ?, ?, ?)",
+                               (title, owner, code, int(time.time())))
+        return int(cur.lastrowid)
+
+    def _shared_row(self, row: tuple | None) -> dict | None:
+        if row is None:
+            return None
+        return dict(zip(("id", "title", "owner", "code", "created_at", "synced_at"), row, strict=True))
+
+    def get_shared(self, shared_id: int) -> dict | None:
+        return self._shared_row(self._one(
+            "SELECT id, title, owner, code, created_at, synced_at FROM shared WHERE id = ?", shared_id))
+
+    def shared_by_code(self, code: str) -> dict | None:
+        return self._shared_row(self._one(
+            "SELECT id, title, owner, code, created_at, synced_at FROM shared WHERE code = ?", code))
+
+    def shared_ids(self) -> list[int]:
+        return [r[0] for r in self._all("SELECT id FROM shared ORDER BY id")]
+
+    def shared_for_user(self, user_id: int) -> list[dict]:
+        rows = self._all("SELECT s.id, s.title, s.owner, s.code, s.created_at, s.synced_at FROM shared s "
+                         "JOIN shared_members m ON m.shared_id = s.id WHERE m.user_id = ? ORDER BY s.id", user_id)
+        return [self._shared_row(r) for r in rows]
+
+    def set_shared_synced(self, shared_id: int) -> None:
+        self._db.execute("UPDATE shared SET synced_at = ? WHERE id = ?", (int(time.time()), shared_id))
+
+    def set_shared_owner(self, shared_id: int, owner: int) -> None:
+        self._db.execute("UPDATE shared SET owner = ? WHERE id = ?", (owner, shared_id))
+
+    def delete_shared(self, shared_id: int) -> None:
+        self._db.execute("DELETE FROM shared_seen WHERE shared_id = ?", (shared_id,))
+        self._db.execute("DELETE FROM shared_tracks WHERE shared_id = ?", (shared_id,))
+        self._db.execute("DELETE FROM shared_members WHERE shared_id = ?", (shared_id,))
+        self._db.execute("DELETE FROM shared WHERE id = ?", (shared_id,))
+
+    def add_shared_member(self, shared_id: int, user_id: int, kind: int) -> None:
+        self._db.execute("INSERT OR REPLACE INTO shared_members (shared_id, user_id, kind, joined_at) "
+                         "VALUES (?, ?, ?, ?)", (shared_id, user_id, kind, int(time.time())))
+        self._db.execute("DELETE FROM shared_seen WHERE shared_id = ? AND user_id = ?", (shared_id, user_id))
+
+    def remove_shared_member(self, shared_id: int, user_id: int) -> None:
+        self._db.execute("DELETE FROM shared_members WHERE shared_id = ? AND user_id = ?", (shared_id, user_id))
+        self._db.execute("DELETE FROM shared_seen WHERE shared_id = ? AND user_id = ?", (shared_id, user_id))
+
+    def shared_members(self, shared_id: int) -> list[dict]:
+        rows = self._all("SELECT user_id, kind, joined_at, synced, error FROM shared_members WHERE shared_id = ? "
+                         "ORDER BY joined_at, user_id", shared_id)
+        return [dict(zip(("user_id", "kind", "joined_at", "synced", "error"), r, strict=True)) for r in rows]
+
+    def set_shared_member_error(self, shared_id: int, user_id: int, error: str | None) -> None:
+        self._db.execute("UPDATE shared_members SET error = ? WHERE shared_id = ? AND user_id = ?",
+                         (error, shared_id, user_id))
+
+    def shared_tracks(self, shared_id: int) -> list[tuple[str, str | None, int]]:
+        """[(трек, альбом или None, кто добавил)] в порядке общего плейлиста."""
+        return [(r[0], r[1], r[2]) for r in self._all(
+            "SELECT track_id, album_id, added_by FROM shared_tracks WHERE shared_id = ? ORDER BY pos", shared_id)]
+
+    def set_shared_tracks(self, shared_id: int, tracks: list[tuple[str, str | None, int]]) -> None:
+        self._db.execute("BEGIN")
+        try:
+            self._db.execute("DELETE FROM shared_tracks WHERE shared_id = ?", (shared_id,))
+            self._db.executemany(
+                "INSERT INTO shared_tracks (shared_id, pos, track_id, album_id, added_by) VALUES (?, ?, ?, ?, ?)",
+                [(shared_id, i, t, a, by) for i, (t, a, by) in enumerate(tracks)])
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def shared_seen(self, shared_id: int, user_id: int) -> set[str]:
+        return {r[0] for r in self._all(
+            "SELECT track_id FROM shared_seen WHERE shared_id = ? AND user_id = ?", shared_id, user_id)}
+
+    def set_shared_seen(self, shared_id: int, user_id: int, track_ids: set[str]) -> None:
+        self._db.execute("BEGIN")
+        try:
+            self._db.execute("DELETE FROM shared_seen WHERE shared_id = ? AND user_id = ?", (shared_id, user_id))
+            self._db.executemany("INSERT INTO shared_seen (shared_id, user_id, track_id) VALUES (?, ?, ?)",
+                                 [(shared_id, user_id, t) for t in track_ids])
+            self._db.execute("UPDATE shared_members SET synced = 1, error = NULL WHERE shared_id = ? AND user_id = ?",
+                             (shared_id, user_id))
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
 
     # ---------- журнал действий админа ----------
 

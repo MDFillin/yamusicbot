@@ -20,3 +20,7 @@ class MergeStates(StatesGroup):
     # В данных состояния: target (kind), target_title, sources — список Source.json(), card — id карточки.
     name = State()  # ждём название нового плейлиста
     sources = State()  # ждём ссылки на плейлисты и альбомы (и нажатия кнопок)
+
+
+class SharedStates(StatesGroup):
+    name = State()  # ждём название нового общего плейлиста

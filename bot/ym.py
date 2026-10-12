@@ -7,7 +7,7 @@ import json
 import logging
 import mimetypes
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -438,15 +438,34 @@ class YandexMusic:
     async def append_tracks(self, kind: int, items: Sequence[tuple[str, str | None]], playlist: Playlist,
                             chunk: int = 100) -> Playlist:
         """Дописывает треки (id, id альбома или None у загруженных) в конец своего плейлиста, пачками."""
-        at, revision = len(playlist.tracks or []), playlist.revision or 1
-        for i in range(0, len(items), chunk):
-            tracks = [{"id": t, **({"albumId": a} if a else {})} for t, a in items[i:i + chunk]]
-            ops = [{"op": "insert", "at": at, "tracks": tracks}]
-            playlist = await self.client.users_playlists_change(kind, json.dumps(ops), revision=revision)
-            if playlist is None:
-                raise YandexMusicError("Яндекс не вернул плейлист после добавления треков")
-            at += len(tracks)
-            revision = playlist.revision or revision + 1
+        return await self.edit_playlist(kind, playlist, add=items, chunk=chunk)
+
+    async def edit_playlist(self, kind: int, playlist: Playlist, remove: Collection[str] = (),
+                            add: Sequence[tuple[str, str | None]] = (), chunk: int = 100) -> Playlist:
+        """Удаляет из своего плейлиста треки remove (все вхождения) и дописывает в конец add.
+
+        Удаление — первым запросом, с конца плейлиста к началу (позиции не съезжают), вместе с первой пачкой
+        добавления; остальное — следующими пачками. Каждый запрос — с ревизией плейлиста, которую видели: если
+        его успели изменить, Яндекс откажет, и ничего не сломается."""
+        shorts = list(playlist.tracks or [])
+        positions = [i for i, s in enumerate(shorts) if str(s.id) in remove]
+        at, revision = len(shorts) - len(positions), playlist.revision or 1
+        ops: list[dict[str, object]] = [{"op": "delete", "from": i, "to": i + 1} for i in reversed(positions)]
+        items = list(add)
+        first = True
+        while first or items:
+            first = False
+            batch, items = items[:chunk], items[chunk:]
+            if batch:
+                ops.append({"op": "insert", "at": at, "tracks": [{"id": t, **({"albumId": a} if a else {})}
+                                                                 for t, a in batch]})
+                at += len(batch)
+            if not ops:
+                break
+            result = await self.client.users_playlists_change(kind, json.dumps(ops), revision=revision)
+            if result is None:
+                raise YandexMusicError("Яндекс не вернул плейлист после изменения")
+            playlist, revision, ops = result, result.revision or revision + 1, []
         return playlist
 
     async def playlist_track_ids(self, kind: int) -> set[str]:

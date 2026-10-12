@@ -755,3 +755,27 @@ async def test_api_merge(env, monkeypatch):
     for body in ({"target": 1003, "sources": []}, {"target": 1003, "sources": [{"src": "pl", "ref": "../x"}]},
                  {"target": 1003, "sources": [{"src": "art", "ref": "1"}]}, {"sources": [{"src": "likes"}]}):
         assert (await env.client.post("/api/merge", json=body)).status == 400, body
+
+
+async def test_api_shared_playlists(env, monkeypatch):
+    from bot.shared import SharedPlaylists
+    from bot.web.app import CTX
+
+    monkeypatch.setattr(SharedPlaylists, "sync_soon", lambda self, sid: None)
+    env.client.server.app[CTX].admin.bot_username = "yamusic_test_bot"  # бот узнаёт своё имя при запуске
+    r = await env.client.post("/api/shared", json={"kind": 1003})
+    info = await r.json()
+    assert r.status == 200 and info["title"] and info["invite"].startswith("https://t.me/")
+    assert "start=join_" in info["invite"] and "code" not in info and info["members"][0]["me"]
+
+    items = (await (await env.client.get("/api/shared")).json())["items"]
+    assert [x["id"] for x in items] == [info["id"]]
+    other = await env.client.get("/api/shared", headers=as_user(FRIEND_ID))
+    assert (await other.json())["items"] == [], "чужие общие плейлисты не видны"
+    assert (await env.client.delete(f"/api/shared/{info['id']}", headers=as_user(FRIEND_ID))).status == 404
+    assert (await env.client.post(f"/api/shared/{info['id']}/sync", headers=as_user(FRIEND_ID))).status == 404
+
+    r = await env.client.post("/api/shared", json={"title": "Мы с Федей"})
+    assert r.status == 200 and (await r.json())["title"] == "Мы с Федей"
+    assert (await env.client.delete(f"/api/shared/{info['id']}")).status == 200
+    assert len((await (await env.client.get("/api/shared")).json())["items"]) == 1

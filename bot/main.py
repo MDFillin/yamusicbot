@@ -40,6 +40,7 @@ from bot.live import LiveTracker
 from bot.middlewares import AccessMiddleware, AccountMiddleware
 from bot.placer import TopPlacer
 from bot.sender import TrackSender
+from bot.shared import SharedPlaylists
 from bot.storage import Storage
 from bot.web.app import create_app
 from bot.ym import YANDEX_BUSY, YANDEX_UNREACHABLE, close_api_session, is_busy, is_network_error
@@ -70,11 +71,12 @@ def build_bot(config: Config) -> Bot:
 
 def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Storage,
                        placer: TopPlacer | None = None, admin: Admin | None = None,
-                       listening: Listening | None = None) -> dict[str, Any]:
+                       listening: Listening | None = None, shared: SharedPlaylists | None = None) -> dict[str, Any]:
     """Объекты, которые aiogram подставляет в обработчики по имени аргумента (ym — AccountMiddleware)."""
     admin = admin or Admin(config, store, accounts, bot)
     listening = listening or Listening(store, accounts, admin, bot, config)
     return {
+        "shared": shared or SharedPlaylists(store, accounts, bot),
         "config": config,
         "accounts": accounts,
         "store": store,
@@ -88,9 +90,9 @@ def build_dependencies(config: Config, bot: Bot, accounts: Accounts, store: Stor
 
 def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storage,
                      placer: TopPlacer | None = None, admin: Admin | None = None,
-                     listening: Listening | None = None) -> Dispatcher:
+                     listening: Listening | None = None, shared: SharedPlaylists | None = None) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage(),
-                    **build_dependencies(config, bot, accounts, store, placer, admin, listening))
+                    **build_dependencies(config, bot, accounts, store, placer, admin, listening, shared))
 
     # Кто пользуется ботом; заблокированных, а в техработы — всех, кроме админов, дальше не пускаем.
     dp.update.outer_middleware(AccessMiddleware())
@@ -141,8 +143,9 @@ def build_dispatcher(config: Config, bot: Bot, accounts: Accounts, store: Storag
 
 
 async def start_web(config: Config, bot: Bot, accounts: Accounts, store: Storage,
-                    sender: TrackSender, placer: TopPlacer, admin: Admin, listening: Listening) -> web.AppRunner:
-    app = create_app(config, bot, accounts, store, sender, placer, admin, listening)
+                    sender: TrackSender, placer: TopPlacer, admin: Admin, listening: Listening,
+                    shared: SharedPlaylists) -> web.AppRunner:
+    app = create_app(config, bot, accounts, store, sender, placer, admin, listening, shared)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, config.web_host, config.web_port).start()
@@ -240,10 +243,12 @@ async def main() -> None:
         log.info("Инлайн-режим выключен: включите его в @BotFather (/setinline и /setinlinefeedback)")
     listening = Listening(store, accounts, admin, bot, config)  # статистика прослушиваний: сбор и итоги
     listening.live = LiveTracker(store, accounts, admin, listening)  # каждое прослушивание вживую (Ynison)
-    dp = build_dispatcher(config, bot, accounts, store, placer, admin, listening)
-    runner = await start_web(config, bot, accounts, store, dp["sender"], placer, admin, listening)
+    shared = SharedPlaylists(store, accounts, bot)  # общие плейлисты: бот держит плейлисты участников одинаковыми
+    dp = build_dispatcher(config, bot, accounts, store, placer, admin, listening, shared)
+    runner = await start_web(config, bot, accounts, store, dp["sender"], placer, admin, listening, shared)
     listening.start()
     listening.live.start()
+    shared.start()
     try:
         await bot.set_my_commands(COMMANDS)
         await setup_admin_commands(bot, admin)
@@ -251,6 +256,7 @@ async def main() -> None:
         await setup_description(bot)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        await shared.close()
         await listening.live.close()
         await listening.close()
         await runner.cleanup()

@@ -44,6 +44,7 @@ from bot.merge import Source, merge_into, source_from_link
 from bot.placer import TopPlacer
 from bot.sender import PARALLEL_DOWNLOADS, TrackSender, TrackTooLargeError
 from bot.settings import QUALITY_LABELS, available_qualities, get_quality, set_quality
+from bot.shared import SharedError, SharedPlaylists
 from bot.sources import SourceNotFoundError, TrackSource, load_source, playlist_cover, playlist_ref, resolve
 from bot.storage import Storage
 from bot.web.auth import AuthError, MediaSigner, init_data_age, verify_init_data
@@ -136,6 +137,7 @@ class WebContext:
     placer: TopPlacer = field(default_factory=TopPlacer)
     admin: Admin | None = None  # задаётся в create_app
     listening: Listening | None = None
+    shared: SharedPlaylists | None = None
     http: aiohttp.ClientSession | None = None
     sources: TTLCache = field(default_factory=lambda: TTLCache(SOURCE_TTL, 300))
     links: TTLCache = field(default_factory=lambda: TTLCache(LINK_TTL, 2000))
@@ -640,6 +642,68 @@ async def api_merge(request: web.Request) -> web.Response:
     return web.json_response({**result.json(), "kind": kind})
 
 
+# ---------- общие плейлисты (bot/shared.py) ----------
+
+async def _shared_json(request: web.Request, shared_id: int) -> dict[str, Any]:
+    ctx = _ctx(request)
+    info = ctx.shared.describe(shared_id, _user_id(request))
+    if info is None:
+        raise web.HTTPNotFound(text="Общий плейлист не найден или вы из него вышли")
+    username = ctx.admin.bot_username or (await ctx.bot.me()).username
+    info["invite"] = f"https://t.me/{username}?start=join_{info.pop('code')}"
+    info["ref"] = f"{request[YM].uid}.{info['kind']}"
+    return info
+
+
+@routes.get("/api/shared")
+async def api_shared_list(request: web.Request) -> web.Response:
+    ctx = _ctx(request)
+    items = [await _shared_json(request, s["id"]) for s in ctx.store.shared_for_user(_user_id(request))]
+    return web.json_response({"items": items})
+
+
+@routes.post("/api/shared")
+async def api_shared_create(request: web.Request) -> web.Response:
+    """Сделать общим свой плейлист (kind) или новый (title)."""
+    ctx, ym = _ctx(request), request[YM]
+    body = await _json_body(request)
+    if body.get("kind") is not None:
+        playlist = await ym.get_playlist(int(body["kind"]))
+        if playlist is None:
+            raise web.HTTPNotFound(text="Плейлист не найден")
+    else:
+        playlist = await ym.create_playlist(_title(body))
+    try:
+        shared_id = ctx.shared.create(_user_id(request), playlist.title, playlist.kind)
+    except SharedError as e:
+        raise web.HTTPConflict(text=str(e)) from e
+    ctx.shared.sync_soon(shared_id)
+    ctx.invalidate(_user_id(request))
+    return web.json_response(await _shared_json(request, shared_id))
+
+
+@routes.post(r"/api/shared/{shared_id:\d+}/sync")
+async def api_shared_sync(request: web.Request) -> web.Response:
+    ctx = _ctx(request)
+    shared_id = int(request.match_info["shared_id"])
+    await _shared_json(request, shared_id)  # участник ли
+    if not ctx.shared.can_sync_now(shared_id):
+        raise web.HTTPTooManyRequests(text="Только что синхронизировал — подождите немного")
+    report = await ctx.shared.sync(shared_id)
+    ctx.invalidate(_user_id(request))
+    info = await _shared_json(request, shared_id)
+    info.update(added=report.added if report else 0, removed=report.removed if report else 0)
+    return web.json_response(info)
+
+
+@routes.delete(r"/api/shared/{shared_id:\d+}")
+async def api_shared_leave(request: web.Request) -> web.Response:
+    shared_id = int(request.match_info["shared_id"])
+    await _shared_json(request, shared_id)
+    _ctx(request).shared.leave(shared_id, _user_id(request))
+    return web.json_response({"ok": True})
+
+
 @routes.put("/api/target")
 async def api_set_target(request: web.Request) -> web.Response:
     ctx = _ctx(request)
@@ -899,7 +963,7 @@ async def _cleanup(app: web.Application) -> None:
 
 def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sender: TrackSender,
                placer: TopPlacer | None = None, admin: Admin | None = None,
-               listening: Listening | None = None) -> web.Application:
+               listening: Listening | None = None, shared: SharedPlaylists | None = None) -> web.Application:
     from bot.web import admin_api, stats_api  # модули берут CTX и USER отсюда
     app = web.Application(
         client_max_size=config.web_max_upload_mb * 1024 * 1024,
@@ -907,7 +971,8 @@ def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sen
     )
     admin = admin or Admin(config, store, accounts, bot)
     app[CTX] = WebContext(config, bot, accounts, store, sender, MediaSigner(config.bot_token), StaticFiles(STATIC_DIR),
-                          placer or TopPlacer(), admin, listening or Listening(store, accounts, admin, bot, config))
+                          placer or TopPlacer(), admin, listening or Listening(store, accounts, admin, bot, config),
+                          shared=shared or SharedPlaylists(store, accounts, bot))
     app.add_routes(routes)
     app.add_routes(admin_api.routes)
     app.add_routes(stats_api.routes)

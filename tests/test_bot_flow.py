@@ -974,3 +974,50 @@ async def test_merge_playlists_in_chat(env, monkeypatch):
 
     await env.dp.feed_update(env.bot, message_update(text="кино"))  # после объединения — снова обычный поиск
     assert env.ym.searches == ["кино"]
+
+
+# ---------- общие плейлисты ----------
+
+async def test_shared_playlist_invite_and_join(env, monkeypatch):
+    import re
+
+    from bot.callbacks import SharedCb
+    from bot.shared import SharedPlaylists
+
+    synced = []
+    monkeypatch.setattr(SharedPlaylists, "sync_soon", lambda self, sid: synced.append(sid))
+
+    async def create_playlist(title):
+        return NS(kind=2000, title=title, track_count=0)
+
+    env.friend.create_playlist = create_playlist
+
+    await env.dp.feed_update(env.bot, message_update(text="/shared"))
+    assert "Общие плейлисты" in env.tg.texts()[-1]
+    await env.dp.feed_update(env.bot, callback_update(SharedCb(action="create").pack()))
+    await env.dp.feed_update(env.bot, callback_update(SharedCb(action="create_from", kind=1003).pack()))
+    created = env.tg.texts()[-1]
+    link = re.search(r"https://t\.me/\w+\?start=join_([\w-]+)", created)
+    assert "Общий плейлист «Мои записи» готов" in created and link
+    [sid] = synced
+
+    # Кнопку «вступить» без приглашения не нажать — номер плейлиста не подобрать
+    await env.dp.feed_update(env.bot, callback_update(SharedCb(action="join_new", sid=sid).pack(), user=FRIEND))
+    assert env.store.shared_members(sid)[-1]["user_id"] == OWNER.id
+
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text=f"/start join_{link.group(1)}"))
+    invite = env.tg.texts()[-1]
+    assert "Общий плейлист «Мои записи»" in invite and "Создать у меня" in str(env.tg.buttons())
+    await env.dp.feed_update(env.bot, callback_update(SharedCb(action="join_new", sid=sid).pack(), user=FRIEND))
+    assert [(m["user_id"], m["kind"]) for m in env.store.shared_members(sid)] == [(OWNER.id, 1003), (FRIEND.id, 2000)]
+    assert synced == [sid, sid]
+    assert any("присоединился к общему плейлисту" in t for t in env.tg.texts()), "остальным — сообщение"
+
+    await env.dp.feed_update(env.bot, callback_update(SharedCb(action="open", sid=sid).pack(), user=FRIEND))
+    card = env.tg.texts()[-1]
+    assert "Участники:" in card and "(вы)" in card
+    await env.dp.feed_update(env.bot, callback_update(SharedCb(action="leave_ok", sid=sid).pack(), user=FRIEND))
+    assert [m["user_id"] for m in env.store.shared_members(sid)] == [OWNER.id]
+
+    await env.dp.feed_update(env.bot, message_update(FRIEND, text="/start join_nonexistent1"))
+    assert "недействительно" in env.tg.texts()[-1]

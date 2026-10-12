@@ -10,6 +10,7 @@ COMMANDS = [
     BotCommand(command="target", description="📌 Плейлист по умолчанию для загрузки"),
     BotCommand(command="newplaylist", description="➕ Создать плейлист"),
     BotCommand(command="merge", description="🔀 Объединить или скопировать плейлисты"),
+    BotCommand(command="shared", description="🤝 Общие плейлисты с друзьями"),
     BotCommand(command="menu", description="🏠 Главное меню"),
     BotCommand(command="settings", description="⚙️ Настройки: качество, аккаунт"),
     BotCommand(command="login", description="🔑 Подключить Яндекс Музыку"),
