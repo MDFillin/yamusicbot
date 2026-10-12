@@ -1,17 +1,19 @@
 """Скачивает клиент fxTunnel (https://github.com/mephistofox/fxtun.dev) и сверяет контрольную сумму.
 
-Суммы зашиты здесь, а не берутся из релиза: так подменённый файл не пройдёт проверку.
+Суммы зашиты здесь, а не берутся из релиза: так подменённый файл не пройдёт проверку (сверены с checksums.txt
+релиза). Автор удаляет старые релизы — если сборка падает с 404, нужно обновить VERSION и суммы.
 """
 
 import hashlib
 import os
 import sys
+import urllib.error
 import urllib.request
 
-VERSION = "v3.9.2"
+VERSION = "v3.16.1"
 SHA256 = {
-    "amd64": "2a7255dbf21741dbd4393dac9cd3468d4e8782ade2bce28386d864616650d71f",
-    "arm64": "6a8cf8ed824cc73ae464893575f5b92eda955241d3e812141a794efb71487c71",
+    "amd64": "232449c9a04ea5db4d40482ed506d9f878515e437658265d387cdda4d054774c",
+    "arm64": "46ec98894033340be6d0d44e39210a5b3f288f14a32b7391ee8bd29c686d4823",
 }
 TARGET = os.environ.get("FXTUNNEL_TARGET", "/usr/local/bin/fxtunnel")
 
@@ -22,8 +24,14 @@ def main() -> None:
         sys.exit(f"fxTunnel: архитектура «{arch}» не поддерживается (есть: {', '.join(SHA256)})")
     url = f"https://github.com/mephistofox/fxtun.dev/releases/download/{VERSION}/fxtunnel-linux-{arch}"
     print(f"Скачиваю {url}")
-    with urllib.request.urlopen(url, timeout=300) as resp:
-        data = resp.read()
+    try:
+        with urllib.request.urlopen(url, timeout=300) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            sys.exit(f"fxTunnel {VERSION}: релиза больше нет на GitHub (автор удаляет старые). "
+                     "Обновите бота: git pull — или, если туннель не нужен, уберите tunnel из COMPOSE_PROFILES")
+        raise
     digest = hashlib.sha256(data).hexdigest()
     if digest != SHA256[arch]:
         sys.exit(f"fxTunnel: контрольная сумма не совпала ({digest}), файл не устанавливаю")
