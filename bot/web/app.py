@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from collections import defaultdict
@@ -38,6 +39,8 @@ from bot.audio import (
 from bot.config import Config
 from bot.handlers.download import start_bulk_download
 from bot.listening import Listening
+from bot.merge import MAX_SOURCES as MERGE_MAX_SOURCES
+from bot.merge import Source, merge_into, source_from_link
 from bot.placer import TopPlacer
 from bot.sender import PARALLEL_DOWNLOADS, TrackSender, TrackTooLargeError
 from bot.settings import QUALITY_LABELS, available_qualities, get_quality, set_quality
@@ -390,8 +393,8 @@ async def _json_body(request: web.Request) -> dict[str, Any]:
     return body
 
 
-def _title(body: dict[str, Any]) -> str:
-    title = str(body.get("title") or "").strip()[:100]
+def _title(body: dict[str, Any], key: str = "title") -> str:
+    title = str(body.get(key) or "").strip()[:100]
     if not title:
         raise web.HTTPBadRequest(text="Название не может быть пустым")
     return title
@@ -606,6 +609,35 @@ async def api_remove_track(request: web.Request) -> web.Response:
     await request[YM].remove_from_playlist(int(request.match_info["kind"]), int(request.match_info["index"]), track_id)
     _ctx(request).invalidate(_user_id(request))
     return web.json_response({"ok": True})
+
+
+_MERGE_REFS = {"likes": re.compile(r"^$"), "pl": re.compile(r"^\d{1,20}\.\d{1,10}$"), "alb": re.compile(r"^\d{1,20}$")}
+
+
+@routes.post("/api/merge")
+async def api_merge(request: web.Request) -> web.Response:
+    """Объединение и копирование плейлистов (bot/merge.py): target — свой плейлист или new_title — новый."""
+    ym = request[YM]
+    body = await _json_body(request)
+    sources: list[Source] = []
+    for item in body.get("sources") or []:
+        src, ref = str((item or {}).get("src", "")), str((item or {}).get("ref", ""))
+        if src not in _MERGE_REFS or not _MERGE_REFS[src].match(ref):
+            raise web.HTTPBadRequest(text="Некорректный источник")
+        sources.append(Source(src, ref, str(item.get("title", ""))[:100]))
+    for link in body.get("links") or []:
+        sources.append(await source_from_link(ym, str(link)[:500]))
+    if not sources:
+        raise web.HTTPBadRequest(text="Выберите, откуда брать треки")
+    if len(sources) > MERGE_MAX_SOURCES:
+        raise web.HTTPBadRequest(text=f"Не больше {MERGE_MAX_SOURCES} источников за раз")
+    if body.get("target") is not None:
+        kind = int(body["target"])
+    else:
+        kind = (await ym.create_playlist(_title(body, "new_title"))).kind
+    result = await merge_into(ym, kind, sources)
+    _ctx(request).invalidate(_user_id(request))
+    return web.json_response({**result.json(), "kind": kind})
 
 
 @routes.put("/api/target")

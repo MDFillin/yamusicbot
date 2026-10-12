@@ -1514,6 +1514,15 @@
         if (!done && alive() && sentinel.isConnected && sentinel.getBoundingClientRect().top < window.innerHeight + 400) more();
       }
 
+      function reload() {
+        tracks.length = 0;
+        info = null;
+        done = false;
+        if (!list.isConnected) { const empty = root.querySelector('.empty'); if (empty) empty.replaceWith(list); }
+        put(list, skRows(6));
+        more();
+      }
+
       async function sendAll() {
         try {
           const r = await api(`/api/source/${src}/send?${new URLSearchParams({ ref: info.ref || ref })}`, { method: 'POST' });
@@ -1530,6 +1539,9 @@
           h('div', { class: 'sheet-title' }, info.title),
           h('div', { class: 'card list' },
             menuRow('send', `Отправить ${tracksWord(info.total)} в чат`, sendAll),
+            own && menuRow('plus', 'Добавить треки из других плейлистов', () => mergeIntoSheet(kind, info.title, reload)),
+            !own && src !== 'art' && menuRow('copy', src === 'likes' ? 'Скопировать в плейлист' : 'Скопировать в свой плейлист',
+              () => copyToSheet({ src, ref: info.ref || ref, title: info.title })),
             own && menuRow('pin', isTarget ? 'Не загружать сюда файлы из чата' : 'Загружать сюда файлы из чата', () => setTarget(isTarget ? null : kind)),
             own && menuRow('edit', 'Переименовать', () => promptSheet('Переименовать плейлист', 'Название', info.title, 'Сохранить', async (title) => {
               await api(`/api/playlists/${kind}`, { method: 'PATCH', body: { title } });
@@ -1558,6 +1570,72 @@
       }, { rootMargin: '400px' }).observe(sentinel);
       more();
     };
+  }
+
+  // ---------- объединение и копирование плейлистов (bot/merge.py) ----------
+  function mergeSummary(r) {
+    if (!r.added) return `В «${r.title}» уже есть все эти треки`;
+    const extra = [r.skipped && `пропущено чужих загрузок: ${r.skipped}`, r.over_limit && `не поместилось: ${r.over_limit}`];
+    return [`Добавлено в «${r.title}»: ${tracksWord(r.added)}`, ...extra].filter(Boolean).join(' · ');
+  }
+
+  async function runMerge(body, btn) {
+    btn.disabled = true;
+    put(btn, spinner(), 'Собираю треки…');
+    try {
+      const r = await api('/api/merge', { method: 'POST', body });
+      haptic.ok();
+      toast(mergeSummary(r), 5000);
+      closeSheet();
+      loadLibrary().catch(() => {});
+      return r;
+    } catch (e) { fail(e); return null; } finally { btn.disabled = false; }
+  }
+
+  // В свой плейлист kind — треки из «Мне нравится», других своих плейлистов и по ссылкам (например, плейлист друга).
+  async function mergeIntoSheet(kind, title, onDone) {
+    if (!state.libraryLoaded) await loadLibrary().catch(fail);
+    const picked = new Map();
+    const choice = (src, ref, name, count, ic) => toggleRow(ic, name, tracksWord(count), false, (on) => {
+      if (on) picked.set(`${src}:${ref}`, { src, ref, title: name }); else picked.delete(`${src}:${ref}`);
+    });
+    const links = h('textarea', { class: 'text area', rows: 3, maxLength: 3000,
+      placeholder: 'Ссылки на плейлисты или альбомы — по одной в строке' });
+    const btn = h('button', { class: 'btn block' }, 'Добавить треки');
+    btn.addEventListener('click', async () => {
+      const urls = links.value.split(/\s+/).filter((x) => x.includes('music.yandex'));
+      if (!picked.size && !urls.length) { toast('Отметьте плейлисты или вставьте ссылку'); return; }
+      const label = btn.textContent;
+      if (await runMerge({ target: kind, sources: [...picked.values()], links: urls }, btn)) onDone();
+      else put(btn, label);
+    });
+    openSheet([
+      h('div', { class: 'sheet-title' }, `Добавить в «${title}»`),
+      h('div', { class: 'sheet-note' }, 'Треки допишутся в конец, без повторов — объединять можно снова, добавятся только новые. Плейлист друга — по ссылке, если он открытый.'),
+      h('div', { class: 'card list' },
+        choice('likes', '', 'Мне нравится', state.liked.size, 'heart'),
+        state.playlists.filter((p) => p.kind !== kind).map((p) => choice('pl', p.ref, p.title, p.count, 'list'))),
+      links, btn,
+    ]);
+  }
+
+  // Чужой плейлист, альбом или «Мне нравится» — в свой плейлист или в новый (копия).
+  async function copyToSheet(source) {
+    if (!state.libraryLoaded) await loadLibrary().catch(fail);
+    const sources = [{ src: source.src, ref: source.src === 'likes' ? '' : source.ref, title: source.title }];
+    const pick = (body) => async () => {
+      const btn = h('button', { class: 'btn block' });
+      openSheet([h('div', { class: 'sheet-title' }, `«${source.title}»`), btn]);
+      await runMerge({ ...body, sources }, btn);
+    };
+    openSheet([
+      h('div', { class: 'sheet-title' }, 'Скопировать в плейлист'),
+      h('div', { class: 'sheet-note' }, 'Треки допишутся в конец, без повторов.'),
+      h('div', { class: 'card list' },
+        menuRow('plus', 'Новый плейлист', () => promptSheet('Новый плейлист', 'Название', source.title, 'Скопировать',
+          async (title) => { const btn = h('button', { class: 'btn block' }); await runMerge({ new_title: title, sources }, btn); })),
+        state.playlists.map((p) => menuRow('list', `${p.title} · ${tracksWord(p.count)}`, pick({ target: p.kind })))),
+    ]);
   }
 
   async function setTarget(kind) {

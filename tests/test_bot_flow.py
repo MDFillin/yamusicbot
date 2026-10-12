@@ -933,3 +933,44 @@ async def test_stats_delete_history(env):
     await env.dp.feed_update(env.bot, callback_update(StatsSetCb(key="delete_ok").pack()))
     assert env.store.listening_since(OWNER.id) is None and not env.dp["listening"].enabled(OWNER.id)
     assert "Статистика прослушиваний" in env.tg.texts()[-1], "снова предложение включить"
+
+
+# ---------- объединение плейлистов ----------
+
+async def test_merge_playlists_in_chat(env, monkeypatch):
+    from bot.callbacks import MergeCb
+    from bot.handlers import merge as merge_handlers
+    from bot.merge import MergeResult, Source
+
+    calls = []
+
+    async def fake_link(ym, text):
+        assert "playlists/abc" in text
+        return Source("pl", "77.7", "Федин плейлист (Федя)")
+
+    async def fake_merge(ym, kind, sources):
+        calls.append((kind, sources))
+        return MergeResult("Мои записи", added=12, already=3, skipped=1)
+
+    monkeypatch.setattr(merge_handlers, "source_from_link", fake_link)
+    monkeypatch.setattr(merge_handlers, "merge_into", fake_merge)
+
+    await env.dp.feed_update(env.bot, message_update(text="/merge"))
+    assert "Куда добавить треки?" in env.tg.texts()[-1]
+    assert env.tg.button("➕ В новый плейлист (копия)")
+    await env.dp.feed_update(env.bot, callback_update(MergeCb(action="to", kind=1003).pack()))
+    assert "пока ничего не выбрано" in env.tg.texts()[-1]
+
+    await env.dp.feed_update(env.bot, callback_update(MergeCb(action="src", ref="likes").pack()))
+    await env.dp.feed_update(env.bot, message_update(text="https://music.yandex.ru/playlists/abc"))
+    card = env.tg.texts()[-1]
+    assert "• Мне нравится" in card and "• Федин плейлист (Федя)" in card
+    assert env.tg.button("✅ ❤️ Мне нравится")
+
+    await env.dp.feed_update(env.bot, callback_update(MergeCb(action="run").pack()))
+    assert calls == [(1003, [Source("likes", "", "Мне нравится"), Source("pl", "77.7", "Федин плейлист (Федя)")])]
+    result = env.tg.texts()[-1]
+    assert "добавлено треков: <b>12</b>" in result and "чужих загруженных треков: 1" in result
+
+    await env.dp.feed_update(env.bot, message_update(text="кино"))  # после объединения — снова обычный поиск
+    assert env.ym.searches == ["кино"]

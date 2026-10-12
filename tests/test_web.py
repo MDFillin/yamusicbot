@@ -724,3 +724,34 @@ async def test_stats_api(env):
     r = await c.delete("/api/stats")
     assert (await r.json())["deleted"] == 3
     assert (await (await c.get("/api/stats")).json())["enabled"] is False
+
+
+async def test_api_merge(env, monkeypatch):
+    from bot.merge import MergeResult, Source
+    from bot.web import app as web_app
+
+    calls = []
+
+    async def fake_link(ym, text):
+        return Source("alb", "50", "Кино — Группа крови")
+
+    async def fake_merge(ym, kind, sources):
+        calls.append((kind, sources))
+        return MergeResult("Копия", added=5)
+
+    monkeypatch.setattr(web_app, "source_from_link", fake_link)
+    monkeypatch.setattr(web_app, "merge_into", fake_merge)
+    r = await env.client.post("/api/merge", json={"target": 1003, "sources": [{"src": "likes"},
+                                                  {"src": "pl", "ref": "77.7", "title": "Федин"}],
+                                                  "links": ["https://music.yandex.ru/album/50"]})
+    assert r.status == 200 and (await r.json()) == {"title": "Копия", "added": 5, "already": 0, "skipped": 0,
+                                                     "over_limit": 0, "kind": 1003}
+    assert calls[-1] == (1003, [Source("likes", "", ""), Source("pl", "77.7", "Федин"),
+                                Source("alb", "50", "Кино — Группа крови")])
+
+    r = await env.client.post("/api/merge", json={"new_title": "Копия", "sources": [{"src": "pl", "ref": "77.7"}]})
+    assert r.status == 200 and calls[-1][0] == (await r.json())["kind"], "копия — в новый плейлист"
+
+    for body in ({"target": 1003, "sources": []}, {"target": 1003, "sources": [{"src": "pl", "ref": "../x"}]},
+                 {"target": 1003, "sources": [{"src": "art", "ref": "1"}]}, {"sources": [{"src": "likes"}]}):
+        assert (await env.client.post("/api/merge", json=body)).status == 400, body

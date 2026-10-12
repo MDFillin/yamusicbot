@@ -435,6 +435,20 @@ class YandexMusic:
             kind, track.id, album.id, at=playlist.track_count or 0, revision=playlist.revision or 1,
         )
 
+    async def append_tracks(self, kind: int, items: Sequence[tuple[str, str | None]], playlist: Playlist,
+                            chunk: int = 100) -> Playlist:
+        """Дописывает треки (id, id альбома или None у загруженных) в конец своего плейлиста, пачками."""
+        at, revision = len(playlist.tracks or []), playlist.revision or 1
+        for i in range(0, len(items), chunk):
+            tracks = [{"id": t, **({"albumId": a} if a else {})} for t, a in items[i:i + chunk]]
+            ops = [{"op": "insert", "at": at, "tracks": tracks}]
+            playlist = await self.client.users_playlists_change(kind, json.dumps(ops), revision=revision)
+            if playlist is None:
+                raise YandexMusicError("Яндекс не вернул плейлист после добавления треков")
+            at += len(tracks)
+            revision = playlist.revision or revision + 1
+        return playlist
+
     async def playlist_track_ids(self, kind: int) -> set[str]:
         playlist = await self.get_playlist(kind)
         return {str(s.id) for s in playlist.tracks or []} if playlist is not None else set()

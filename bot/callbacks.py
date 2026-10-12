@@ -87,3 +87,11 @@ class StatsSetCb(CallbackData, prefix="sts"):
     """Настройки статистики: key — on | off | delete | daily | weekly | monthly | menu."""
 
     key: str
+
+
+class MergeCb(CallbackData, prefix="mg"):
+    """Объединение плейлистов: action — to | new | src | run | cancel; kind — плейлист, ref — источник."""
+
+    action: str
+    kind: int = 0
+    ref: str = ""  # likes | pl:<kind>
