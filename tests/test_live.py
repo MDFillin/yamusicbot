@@ -534,3 +534,13 @@ async def test_tracker_waits_as_yandex_asks(tracker, monkeypatch):
     await settle()
     assert calls.count("tok1") == 1
     await tracker.close()
+
+
+async def test_diag_ynison_tells_waiting_from_working(fake_ynison):
+    from bot import diag_ynison
+
+    assert (await diag_ynison.probe("good", "dev1"))[0] == "ok"
+    fake_ynison.frames[:] = [GO_AWAY]
+    kind, text = await diag_ynison.probe("good", "dev1")
+    assert kind == "wait" and "temporary unavailable" in text and "60 мин" in text
+    assert (await diag_ynison.probe("bad", "dev1"))[0] == "auth"
