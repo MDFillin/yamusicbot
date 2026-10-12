@@ -1,7 +1,9 @@
 """Ynison — через него приложения Яндекс Музыки (телефон, компьютер, сайт, колонки) синхронизируют плеер.
 
-Бот подключается к Ynison аккаунта как пассивное устройство: не плеер и не пульт, ничего не меняет и не
-перехватывает, только получает состояние плеера при каждом изменении — смена трека, пауза, перемотка, повтор.
+Бот подключается к Ynison аккаунта как пульт (так же, как модуль ynison библиотеки yandex-music): ничего не
+меняет и не перехватывает, только получает состояние плеера при каждом изменении — смена трека, пауза, перемотка,
+повтор. Устройство, которое не плеер и не пульт, Яндекс в октябре 2026 перестал принимать: соединение закрывалось
+сразу после подключения, без единого кадра.
 По этим кадрам bot/live.py считает каждое прослушивание, включая повторы, и сколько на самом деле слушали.
 
 Протокол неофициальный: JSON-представление protobuf, как у официальных клиентов (сверено с модулем ynison
@@ -178,6 +180,7 @@ def full_state_request(device_id: str) -> dict:
 
     Версия и время нашего (пустого) состояния — нули: сервер считает его старше любого настоящего и оставляет
     очередь пользователя как есть. is_currently_active=false — мы не становимся играющим устройством.
+    canBeRemoteController — как у библиотеки yandex-music: команд бот не шлёт, но иначе сервер не принимает.
     """
     version = {"deviceId": device_id, "version": "0", "timestampMs": "0"}
     return {
@@ -192,7 +195,7 @@ def full_state_request(device_id: str) -> dict:
                            "version": version},
             },
             "device": {
-                "capabilities": {"canBePlayer": False, "canBeRemoteController": False, "volumeGranularity": 0},
+                "capabilities": {"canBePlayer": False, "canBeRemoteController": True, "volumeGranularity": 0},
                 "info": {"deviceId": device_id, "type": "WEB", "title": "yamusicbot", "appName": "yamusicbot"},
                 "volumeInfo": {"volume": 0},
             },
@@ -272,18 +275,33 @@ async def listen(http: aiohttp.ClientSession, token: str, device_id: str, on_fra
                                    timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=MAX_FRAME)
     except aiohttp.WSServerHandshakeError as e:
         raise _handshake_error(e) from e
+    frames, close_reason = 0, ""
     async with ws:
         await ws.send_str(json.dumps(full_state_request(device_id)))
-        async for msg in ws:
+        while True:
+            msg = await ws.receive()
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     frame = json.loads(msg.data)
                 except ValueError as e:
                     raise YnisonProtocolError(f"кадр не JSON: {msg.data[:200]}") from e
+                frames += 1
                 await on_frame(frame, msg.data)
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 raise ws.exception() or ConnectionError("ошибка websocket")
-        if ws.close_code and ws.close_code not in (1000, 1001, 1006):
-            reason = f"сервер закрыл соединение: код {ws.close_code}"
-            if ws.close_code in (4001, 4003, 4401, 4403):
-                raise YnisonAuthError(reason)
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                close_reason = str(msg.extra or "") if msg.type == aiohttp.WSMsgType.CLOSE else ""
+                break
+    raise_for_close(ws.close_code, close_reason, frames)
+
+
+def raise_for_close(code: int | None, reason: str, frames: int) -> None:
+    """Сервер закрыл соединение. Обычное закрытие после работы — не ошибка (переподключится вызывающий);
+    код ошибки или закрытие сразу, без единого кадра, — ошибка с кодом и причиной от сервера."""
+    text = f"сервер закрыл соединение: код {code}" + (f", причина: {reason[:200]}" if reason else "")
+    if code in (4001, 4003, 4401, 4403) or "unauth" in reason.lower():
+        raise YnisonAuthError(text)
+    if code not in (None, 1000, 1001, 1006):
+        raise YnisonProtocolError(text)
+    if not frames:  # даже состояние плеера не прислал — подключение не принято
+        raise YnisonProtocolError(text + " сразу после подключения, без единого кадра")

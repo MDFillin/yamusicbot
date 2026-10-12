@@ -295,7 +295,7 @@ def test_stats_counts_repeats_in_report(store):
 @pytest.fixture
 async def fake_ynison(monkeypatch):
     """Поддельный Ynison: редиректор и сервис состояния на локальном сервере."""
-    seen = NS(redirect=None, state=None, first=None)
+    seen = NS(redirect=None, state=None, first=None, close=(1000, b""))
     frames: list = [frame(track="5", progress=0)]
 
     def device(request):
@@ -320,7 +320,7 @@ async def fake_ynison(monkeypatch):
         seen.first = json.loads((await ws.receive()).data)
         for f in frames:
             await ws.send_str(json.dumps(f))
-        await ws.close()
+        await ws.close(code=seen.close[0], message=seen.close[1])
         return ws
 
     app = web.Application()
@@ -351,10 +351,33 @@ async def test_listen_handshake_and_frames(fake_ynison):
     assert state_info["Ynison-Redirect-Ticket"] == "TICKET" and state_info["Ynison-Session-Id"] == "55"
     full = seen.first["updateFullState"]
     assert full["isCurrentlyActive"] is False, "бот не становится играющим устройством"
-    assert full["device"]["capabilities"] == {"canBePlayer": False, "canBeRemoteController": False,
-                                              "volumeGranularity": 0}
+    assert full["device"]["capabilities"] == {"canBePlayer": False, "canBeRemoteController": True,
+                                              "volumeGranularity": 0}, "пульт, как у yandex-music: иначе не пускают"
     assert full["playerState"]["playerQueue"]["version"]["timestampMs"] == "0", "не перебивает очередь пользователя"
     assert got == ["5"]
+
+
+@pytest.mark.parametrize(("frames", "close", "error", "text"), [
+    ([], (1000, b""), YnisonProtocolError, "без единого кадра"),
+    ([], (1008, b"device not supported"), YnisonProtocolError, "код 1008, причина: device not supported"),
+    (["state"], (4403, b"forbidden"), YnisonAuthError, "код 4403"),
+    (["state"], (1000, b""), None, None),
+])
+async def test_server_close_is_explained(fake_ynison, frames, close, error, text):
+    """Раньше любое закрытие выглядело как «соединение закрыто сервером» — без кода и причины, и бот два дня
+    молча переподключался. Теперь код и причина видны в админ-панели и доходят до владельца."""
+    fake_ynison.frames[:] = [frame(track="5", progress=0) for _ in frames]
+    fake_ynison.seen.close = close
+
+    async def on_frame(f, raw):
+        pass
+
+    async with aiohttp.ClientSession() as http:
+        if error is None:
+            await ynison.listen(http, "good", "dev1", on_frame)
+            return
+        with pytest.raises(error, match=text):
+            await ynison.listen(http, "good", "dev1", on_frame)
 
 
 async def test_listen_rejects_bad_token_and_foreign_host(fake_ynison, monkeypatch):
