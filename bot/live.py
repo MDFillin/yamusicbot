@@ -27,7 +27,7 @@ from bot import net, ynison
 from bot.admin import DAY_OFFSET, Admin
 from bot.errors import log_failure, spawn
 from bot.storage import Storage
-from bot.ynison import Snapshot, YnisonAuthError, YnisonProtocolError
+from bot.ynison import Snapshot, YnisonAuthError, YnisonGoAway, YnisonProtocolError
 
 if TYPE_CHECKING:
     from bot.accounts import Accounts
@@ -41,6 +41,7 @@ RESTART_NEAR_START_MS = 15_000  # трек начался заново, если
 RESTART_AFTER_MS = 15_000  # …после того как его слушали хотя бы столько (иначе это перемотка)
 LOOP_INTERVAL = 30  # сек: проверка подключений, засчитывание идущих треков, данные новых треков
 AUTH_COOLDOWN = 3600  # вход отозван — повторить не раньше чем через час
+MAX_GO_AWAY = 6 * 3600  # сек: дольше просьбы Яндекса «не подключаться» не ждём, даже если попросит
 RETRY_MIN, RETRY_MAX = 15, 600  # сек между переподключениями: не чаще, чтобы не тревожить Яндекс
 STABLE_SESSION = 120  # соединение прожило столько — ошибки до него забываем, пауза снова минимальная
 RAW_KEEP = 60_000  # символов последнего кадра — для проверки владельцем
@@ -195,6 +196,7 @@ class LiveTracker:
         self.store, self.accounts, self.admin, self.listening = store, accounts, admin, listening
         self.conns: dict[int, Connection] = {}
         self._cooldown: dict[int, float] = {}
+        self._go_away: dict[int, tuple[float, str]] = {}  # Яндекс просит не подключаться до… (monotonic, причина)
         self._http: aiohttp.ClientSession | None = None
         self._task: asyncio.Task | None = None
         self._jobs: set[asyncio.Task] = set()
@@ -241,7 +243,8 @@ class LiveTracker:
         result = {}
         now = time.monotonic()
         for user_id in self.store.stats_users():
-            if self._cooldown.get(user_id, 0) > now or self.admin.check(user_id) is not None:
+            if self._cooldown.get(user_id, 0) > now or self._go_away.get(user_id, (0, ""))[0] > now \
+                    or self.admin.check(user_id) is not None:
                 continue
             account = self.store.get_account(user_id)
             if account is not None:
@@ -278,6 +281,8 @@ class LiveTracker:
         """Статистику только что включили — подключиться сразу, не дожидаясь цикла."""
         if not self.enabled or user_id in self.conns or self.admin.check(user_id) is not None:
             return
+        if self._go_away.get(user_id, (0, ""))[0] > time.monotonic():
+            return  # Яндекс просил подождать — подключимся в цикле, когда срок выйдет
         account = self.store.get_account(user_id)
         if account is not None:
             self._cooldown.pop(user_id, None)
@@ -316,6 +321,12 @@ class LiveTracker:
                 log.warning("Ynison %s: Яндекс не принял вход (%s) — повторю через час", conn.user_id, e)
                 self._cooldown[conn.user_id] = time.monotonic() + AUTH_COOLDOWN
                 return
+            except YnisonGoAway as e:
+                wait = min(max(e.seconds, 60), MAX_GO_AWAY)
+                conn.last_error = f"Яндекс: {e} — просит не подключаться {wait // 60} мин"
+                log.warning("Ynison %s: %s — Яндекс просит не подключаться %s с, жду", conn.user_id, e, wait)
+                self._go_away[conn.user_id] = (time.monotonic() + wait, str(e))
+                return  # не поломка протокола: тревогу не поднимаем, раньше срока не стучимся
             except YnisonProtocolError as e:
                 conn.last_error = str(e)[:500]
                 await self.admin.live_health.failed(conn.user_id, str(e)[:400])
@@ -382,7 +393,9 @@ class LiveTracker:
 
     def status(self) -> dict[str, Any]:
         connected = sum(1 for c in self.conns.values() if c.connected)
-        return {"enabled": self.enabled, "connections": len(self.conns), "connected": connected,
+        now = time.monotonic()
+        waiting = sum(1 for until, _ in self._go_away.values() if until > now)
+        return {"enabled": self.enabled, "connections": len(self.conns), "connected": connected, "go_away": waiting,
                 "health": self.admin.live_health.json()}
 
     def user_status(self, user_id: int) -> dict[str, Any]:
@@ -398,6 +411,8 @@ class LiveTracker:
             "last_frame": conn.last_frame if conn else None,
             "last_error": conn.last_error if conn else None,
             "cooldown": max(0, int(self._cooldown.get(user_id, 0) - time.monotonic())) or None,
+            "go_away": max(0, int(self._go_away.get(user_id, (0, ""))[0] - time.monotonic())) or None,
+            "go_away_reason": self._go_away.get(user_id, (0, ""))[1] or None,
             "now": {"track_id": cur.track_id, "context": cur.context, "pos_ms": int(cur.pos_ms),
                     "duration_ms": cur.duration_ms, "playing": cur.playing, "listened_ms": int(cur.listened_ms),
                     "needed_ms": needed_ms(cur.duration_ms), "counted": cur.play_id is not None} if cur else None,

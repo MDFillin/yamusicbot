@@ -800,7 +800,7 @@
           kv('Работает', fmtUptime(sv.uptime)), kv('Память', sv.memory_mb ? `${sv.memory_mb} МБ` : '—'),
           kv('Загрузка в Яндекс', uh.broken ? '❌ не работает' : uh.last_ok ? `✅ работает · ${fmtAgo(uh.last_ok)}` : 'ещё не было'),
           kv('Статистика прослушиваний', `${fmtNum(ls.users)} чел. · ${ls.health.broken ? '❌ не обновляется' : ls.health.last_ok ? `✅ ${fmtAgo(ls.health.last_ok)}` : 'ещё не собиралась'}`),
-          kv('Точный подсчёт (Ynison)', !lv.enabled ? 'выключен' : lv.health && lv.health.broken ? '❌ не работает' : `на связи ${fmtNum(lv.connected || 0)} из ${fmtNum(lv.connections || 0)}`),
+          kv('Точный подсчёт (Ynison)', !lv.enabled ? 'выключен' : lv.health && lv.health.broken ? '❌ не работает' : `на связи ${fmtNum(lv.connected || 0)} из ${fmtNum(lv.connections || 0)}${lv.go_away ? ` · ждут по просьбе Яндекса: ${fmtNum(lv.go_away)}` : ''}`),
           kv('База', fmtSize(sv.db_bytes)), kv('Свободно на диске', `${fmtSize(sv.disk_free)} из ${fmtSize(sv.disk_total)}`),
           kv('Клиентов Яндекса в памяти', fmtNum(sv.clients)), kv('ffmpeg', sv.ffmpeg || 'не установлен'),
           kv('Яндекс', sv.yandex_proxy ? `через прокси ${sv.yandex_proxy}` : 'напрямую'),
@@ -823,6 +823,7 @@
       const conn = !data.enabled ? 'точный подсчёт выключен в «Режимах»'
         : !me.stats_enabled ? 'включите себе статистику (/stats)'
           : me.connected ? `✅ на связи с ${fmtAgo(me.since)}`
+            : me.go_away ? `⏸ Яндекс просит подождать (${me.go_away_reason || 'сервис временно недоступен'}), подключусь через ${Math.ceil(me.go_away / 60)} мин`
             : me.cooldown ? `⏸ вход не принят, повтор через ${Math.ceil(me.cooldown / 60)} мин`
               : me.last_error ? `⏳ переподключаюсь: ${me.last_error}` : '⏳ подключаюсь…';
       openSheet([

@@ -52,6 +52,19 @@ class YnisonProtocolError(Exception):
     """Ответ не такой, как ожидали: скорее всего, Яндекс изменил протокол."""
 
 
+class YnisonGoAway(Exception):
+    """Сервис временно недоступен, и Яндекс просит не подключаться seconds секунд (ynison-go-away-for-seconds).
+
+    Это не поломка протокола: переподключаться раньше нельзя — только продлит паузу."""
+
+    def __init__(self, text: str, seconds: int) -> None:
+        super().__init__(text)
+        self.seconds = seconds
+
+
+UNAVAILABLE_WAIT = 300  # сек: «временно недоступен» без срока — подождать столько
+
+
 def _get(obj: Any, name: str, default: Any = None) -> Any:
     """Поле по имени в snake_case, если нет — в camelCase."""
     if not isinstance(obj, dict):
@@ -142,6 +155,14 @@ def parse_state(frame: Any) -> Snapshot | None:
     error = frame.get("error")
     if error:
         text = json.dumps(error, ensure_ascii=False)[:300]
+        details = error.get("details") if isinstance(error, dict) else None
+        details = details if isinstance(details, dict) else {}
+        go_away = _int(details.get("ynison-go-away-for-seconds"))
+        unavailable = isinstance(error, dict) and (_int(error.get("grpc_code")) == 14
+                                                   or _int(error.get("http_code")) == 503)
+        if go_away > 0 or unavailable:
+            message = str(error.get("message") or "сервис временно недоступен") if isinstance(error, dict) else text
+            raise YnisonGoAway(message[:200], go_away if go_away > 0 else UNAVAILABLE_WAIT)
         if any(w in text.lower() for w in ("unauthorized", "unauthenticated", "401", "403", "forbidden")):
             raise YnisonAuthError(text)
         raise YnisonProtocolError(f"ошибка от сервера: {text}")

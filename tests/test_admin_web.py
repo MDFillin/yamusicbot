@@ -343,7 +343,7 @@ async def test_live_tracking_switch_and_self_check(env):
     data = await (await c.get("/api/admin/live")).json()
     assert data["enabled"] is True and data["me"]["connected"] is False and data["me"]["stats_enabled"] is False
     overview = await (await c.get("/api/admin/overview")).json()
-    assert overview["listening"]["live"] == {"enabled": True, "connections": 0, "connected": 0,
+    assert overview["listening"]["live"] == {"enabled": True, "connections": 0, "connected": 0, "go_away": 0,
                                              "health": env.admin.live_health.json()}
     assert (await c.get("/api/admin/live", headers=as_user(FRIEND_ID))).status == 404
 

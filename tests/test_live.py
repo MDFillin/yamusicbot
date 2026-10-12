@@ -497,3 +497,40 @@ async def test_tracker_auth_error_waits_and_token_change_reconnects(tracker, mon
     await tracker.tick()
     assert tracker.conns == {}
     await tracker.close()
+
+
+GO_AWAY = {"error": {"details": {"ynison-error-code": "500140000", "ynison-go-away-for-seconds": "3600"},
+                     "grpc_code": 14, "http_code": 503, "http_status": "Service Unavailable",
+                     "message": "Ynison service is temporary unavailable."}}
+
+
+def test_go_away_is_not_a_protocol_change():
+    """Ответ Яндекса 12.10.2026: «временно недоступен, не подключайтесь час» — это пауза, а не новый протокол."""
+    with pytest.raises(ynison.YnisonGoAway) as e:
+        parse_state(GO_AWAY)
+    assert e.value.seconds == 3600 and "temporary unavailable" in str(e.value)
+    with pytest.raises(ynison.YnisonGoAway) as e:  # без срока — короткая пауза
+        parse_state({"error": {"grpc_code": 14, "message": "unavailable"}})
+    assert e.value.seconds == ynison.UNAVAILABLE_WAIT
+
+
+async def test_tracker_waits_as_yandex_asks(tracker, monkeypatch):
+    calls = []
+
+    async def fake_listen(http, token, device_id, on_frame):
+        calls.append(token)
+        parse_state(GO_AWAY)
+
+    monkeypatch.setattr(ynison, "listen", fake_listen)
+    for _ in range(3):
+        await tracker.tick()
+        await settle()
+    assert sorted(calls) == ["tok1", "tok2"], "раньше срока не стучимся"
+    assert tracker.admin.live_health.failures == [], "владельцу не пишем «Яндекс изменил протокол»"
+    status = tracker.user_status(1)
+    assert 3500 < status["go_away"] <= 3600 and "temporary unavailable" in status["go_away_reason"]
+    assert tracker.status()["go_away"] == 2
+    tracker.wake(1)  # включил статистику заново — просьбу Яндекса всё равно соблюдаем
+    await settle()
+    assert calls.count("tok1") == 1
+    await tracker.close()
