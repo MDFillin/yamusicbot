@@ -14,8 +14,10 @@ from bot.ym import YandexMusic
 ME, FRIEND = 42, 77
 
 
-def short(track_id, album_id=None):
-    return NS(id=track_id, album_id=album_id, track_id=f"{track_id}:{album_id}" if album_id else str(track_id))
+def short(track_id, album_id=None, *, bare=False):
+    """Как в плейлисте Яндекса: albumId нет, альбом — в полном треке; bare — трек пришёл совсем без данных."""
+    track = None if bare else NS(albums=[NS(id=album_id)] if album_id else [])
+    return NS(id=track_id, album_id=None, track=track, track_id=str(track_id))
 
 
 class Client:
@@ -44,6 +46,9 @@ class Client:
 
     async def users_likes_tracks(self):
         return NS(tracks=self.likes)
+
+    async def tracks(self, ids):
+        return [NS(id=i, albums=[NS(id="99")]) for i in ids]
 
     async def albums_with_tracks(self, album_id):
         return self.albums.get(str(album_id))
@@ -137,3 +142,11 @@ async def test_merging_into_itself_or_missing_target(ym):
     assert r.added == 0 and not ym._client.changes
     with pytest.raises(SourceNotFoundError):
         await merge_into(ym, 999, [LIKES])
+
+
+async def test_friends_playlist_tracks_are_not_mistaken_for_uploads(ym):
+    """Яндекс не присылает albumId в плейлисте — альбом берётся из трека, а трек без данных догружается."""
+    ym._client.add(FRIEND, 9, "Без данных", [short("61", "60"), short("62", bare=True), short("ugc-x")])
+    r = await merge_into(ym, 3, [Source("pl", f"{FRIEND}.9")])
+    assert (r.added, r.skipped) == (2, 1) and ids(ym) == ["1", "61", "62"]
+    assert ym._client.changes[-1][0]["tracks"] == [{"id": "61", "albumId": "60"}, {"id": "62", "albumId": "99"}]

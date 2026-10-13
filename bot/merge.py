@@ -80,17 +80,16 @@ async def source_tracks(ym: YandexMusic, source: Source) -> tuple[list[Track], i
     """Треки источника по порядку и сколько чужих загрузок в нём пропущено."""
     if source.src == "likes":
         likes = await ym.client.users_likes_tracks()
-        shorts = (likes.tracks if likes else None) or []
-        return [(str(s.id), str(s.album_id) if s.album_id else None) for s in shorts], 0
+        return await ym.track_refs((likes.tracks if likes else None) or []), 0
     if source.src == "pl":
         owner, _, kind = source.ref.partition(".")
         playlist = await ym.get_playlist(kind, owner)
         if playlist is None:
             raise SourceNotFoundError(f"Плейлист «{source.title}» не найден")
         mine = owner == str(ym.uid)
-        shorts = playlist.tracks or []
-        tracks = [(str(s.id), str(s.album_id) if s.album_id else None) for s in shorts if s.album_id or mine]
-        return tracks, len(shorts) - len(tracks)
+        refs = await ym.track_refs(playlist.tracks or [])
+        tracks = [(t, a) for t, a in refs if a or mine]
+        return tracks, len(refs) - len(tracks)
     if source.src == "alb":
         album = await ym.get_album(source.ref)
         if album is None:

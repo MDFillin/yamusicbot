@@ -236,6 +236,15 @@ def track_album(track: Track) -> Album | None:
     return track.albums[0] if track.albums else None
 
 
+def short_album(short: Any) -> str | None:
+    """Альбом трека из списка плейлиста или лайков. В плейлистах Яндекс обычно не присылает albumId — альбом есть
+    только в полном треке внутри. None — альбома нет (загруженный пользователем файл) или трек пришёл без данных."""
+    if getattr(short, "album_id", None):
+        return str(short.album_id)
+    albums = getattr(getattr(short, "track", None), "albums", None)
+    return str(albums[0].id) if albums else None
+
+
 def cover_url(uri: str | None, size: str = "200x200") -> str | None:
     """Адрес картинки Яндекса по шаблону вида avatars.yandex.net/.../%%."""
     if not uri:
@@ -468,6 +477,17 @@ class YandexMusic:
             playlist, revision, ops = result, result.revision or revision + 1, []
         return playlist
 
+    async def track_refs(self, shorts: Sequence[Any]) -> list[tuple[str, str | None]]:
+        """(id трека, id альбома) по порядку; альбом None — загруженный пользователем файл.
+
+        Альбом — из albumId или полного трека (см. short_album); если Яндекс прислал трек без данных, догружаем."""
+        unknown = [str(s.id) for s in shorts if short_album(s) is None and getattr(s, "track", None) is None]
+        fetched: dict[str, str | None] = {}
+        if unknown:
+            for track in await self.get_tracks(unknown):
+                fetched[str(track.id)] = str(track.albums[0].id) if track.albums else None
+        return [(str(s.id), short_album(s) or fetched.get(str(s.id))) for s in shorts]
+
     async def playlist_track_ids(self, kind: int) -> set[str]:
         playlist = await self.get_playlist(kind)
         return {str(s.id) for s in playlist.tracks or []} if playlist is not None else set()
@@ -495,8 +515,8 @@ class YandexMusic:
         for track_id in wanted:
             short = shorts[positions[track_id]]
             item: dict[str, object] = {"id": short.id}
-            if short.album_id:  # у загруженных треков альбома нет
-                item["albumId"] = short.album_id
+            if album := short_album(short):  # у загруженных треков альбома нет
+                item["albumId"] = album
             items.append(item)
         ops: list[dict[str, object]] = [{"op": "insert", "at": 0, "tracks": items}]
         for pos in sorted((positions[t] for t in wanted), reverse=True):

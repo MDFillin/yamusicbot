@@ -205,7 +205,14 @@ class SharedPlaylists:
                 report.errors[user_id] = "плейлист удалён — выйдите из общего плейлиста и присоединитесь заново"
                 self.store.set_shared_member_error(shared_id, user_id, report.errors[user_id])
                 continue
-            current = [(str(s.id), str(s.album_id) if s.album_id else None) for s in playlist.tracks or []]
+            try:
+                current = await ym.track_refs(playlist.tracks or [])
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                report.errors[user_id] = str(e)[:200] or type(e).__name__
+                self.store.set_shared_member_error(shared_id, user_id, report.errors[user_id])
+                continue
             seen = self.store.shared_seen(shared_id, user_id) if row["synced"] else None
             members.append(_Member(user_id, row["kind"], ym, playlist, current, seen))
         return members
@@ -231,7 +238,9 @@ class SharedPlaylists:
                 fresh = track_id not in in_canon and (m.seen is None or track_id not in m.seen)
                 if fresh and track_id not in added:
                     added[track_id] = (album_id, m.user_id)
-        new_canon = [c for c in canon if c[0] not in removed]
+        # Альбом, который раньше не узнали (в плейлисте Яндекса его нет в albumId), — из того, что есть сейчас.
+        albums = {t: a for m in members for t, a in m.current if a}
+        new_canon = [(t, a or albums.get(t), by) for t, a, by in canon if t not in removed]
         new_canon += [(t, a, by) for t, (a, by) in added.items()]
         report.added, report.removed = len(added), len(removed)
         return new_canon, removed

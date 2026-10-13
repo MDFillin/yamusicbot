@@ -15,7 +15,8 @@ ME, FEDYA, THIRD = 1, 2, 3
 
 
 def short(track_id, album_id="a"):
-    return NS(id=track_id, album_id=album_id)
+    """Как отдаёт Яндекс в плейлисте: albumId нет, альбом — только в полном треке (у своих загрузок альбома нет)."""
+    return NS(id=track_id, album_id=None, track=NS(albums=[NS(id=album_id)] if album_id else []))
 
 
 class Client:
@@ -216,3 +217,32 @@ async def test_failed_removal_is_finished_later(world):
     fedya._client.fail_change = False
     await world.shared.sync(sid)
     assert fedya.ids() == ["2"] and me.ids() == ["2"], "удаление доделано, а не потеряно"
+
+
+async def test_friends_catalog_track_reaches_me(world):
+    """Ровно случай из жизни: Федя добавил трек из каталога — он должен появиться у меня (раньше бот принимал его
+    за загруженный файл, потому что Яндекс не присылает albumId в плейлисте)."""
+    me, fedya = world.acc[ME], world.acc[FEDYA]
+    me._client.make(10, [])
+    fedya._client.make(10, [])
+    sid = world.shared.create(ME, "Общий", 10)
+    world.shared.join(world.store.get_shared(sid)["code"], FEDYA, 10)
+    await world.shared.sync(sid)
+    fedya.set(["555"])
+    await world.shared.sync(sid)
+    assert me.ids() == ["555"]
+    assert me._client.playlists[10].tracks[0].track.albums[0].id == "a", "вставлен с альбомом"
+
+
+async def test_old_albumless_entries_are_repaired(world):
+    """Общий список, записанный прошлой версией без альбома, чинится по текущим плейлистам."""
+    me, fedya = world.acc[ME], world.acc[FEDYA]
+    me._client.make(10, [])
+    fedya._client.make(10, ["555"])
+    sid = world.shared.create(ME, "Общий", 10)
+    world.shared.join(world.store.get_shared(sid)["code"], FEDYA, 10)
+    world.store.set_shared_tracks(sid, [("555", None, FEDYA)])
+    world.store.set_shared_seen(sid, ME, set())
+    world.store.set_shared_seen(sid, FEDYA, {"555"})
+    await world.shared.sync(sid)
+    assert me.ids() == ["555"] and world.store.shared_tracks(sid) == [("555", "a", FEDYA)]

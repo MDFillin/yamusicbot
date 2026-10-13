@@ -27,7 +27,7 @@ from yandex_music import TrackShort
 
 from bot import net
 from bot.errors import log_failure, spawn
-from bot.ym import YandexMusic
+from bot.ym import YandexMusic, short_album
 
 log = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class _Watch:
 
 def _is_uploaded(short: TrackShort) -> bool:
     """Похоже на загруженный пользователем трек: у таких нет альбома (и источник OWN, если он известен)."""
-    if short.album_id:
+    if short_album(short):
         return False
     source = getattr(short.track, "track_source", None) if short.track is not None else None
     return source is None or source in OWN_SOURCES
