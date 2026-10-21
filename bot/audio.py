@@ -380,14 +380,15 @@ async def _ffmpeg(src: bytes, out_args: list[str], dst_name: str, *, demuxer: st
 
 
 async def normalize_cover(data: bytes) -> bytes:
-    """Картинка для обложки: JPEG или PNG разумного размера (большие и WEBP/GIF пережимаются в JPEG)."""
+    """Картинка для обложки: JPEG не больше COVER_MAX_SIDE точек по стороне.
+
+    Яндекс не всегда показывает обложку, вшитую в MP3 как PNG или огромный JPEG, поэтому, если есть ffmpeg,
+    любая картинка пережимается в обычный JPEG. Без ffmpeg JPEG и PNG идут как есть."""
     kind = image_type(data)
     if kind is None:
         raise ConversionError("Обложка должна быть картинкой: JPEG, PNG или WEBP")
     if len(data) > MAX_COVER_BYTES:
         raise ConversionError("Обложка больше 10 МБ — выберите картинку поменьше")
-    if kind in ("jpeg", "png") and len(data) <= 1_500_000:
-        return data
     if not ffmpeg_available():
         if kind in ("jpeg", "png"):
             return data

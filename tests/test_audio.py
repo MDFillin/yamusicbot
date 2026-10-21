@@ -8,6 +8,7 @@ from bot.audio import (
     TrackMeta,
     audio_format,
     clean_year,
+    image_type,
     normalize_cover,
     parse_caption,
     prepare_for_upload,
@@ -154,10 +155,25 @@ def test_clean_year():
 
 
 @pytest.mark.asyncio
-async def test_normalize_cover():
+async def test_normalize_cover(monkeypatch):
+    monkeypatch.setattr("bot.audio.ffmpeg_available", lambda: False)  # без ffmpeg JPEG и PNG идут как есть
     assert await normalize_cover(JPEG) == JPEG and await normalize_cover(PNG) == PNG
     with pytest.raises(ConversionError, match="картинкой"):
         await normalize_cover(b"%PDF-1.4")
+
+
+@needs_ffmpeg
+@pytest.mark.asyncio
+async def test_cover_becomes_plain_jpeg(tmp_path):
+    """Яндекс не всегда показывает PNG-обложку из MP3 — любая обложка становится JPEG не больше 1200 точек."""
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "color=c=red:s=2000x1500", "-frames:v", "1", "big.png"], check=True, cwd=tmp_path)
+    out = await normalize_cover((tmp_path / "big.png").read_bytes())
+    assert image_type(out) == "jpeg"
+    (tmp_path / "out.jpg").write_bytes(out)
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                            "out.jpg"], capture_output=True, text=True, cwd=tmp_path, check=True).stdout.strip()
+    assert probe == "1200,900"
 
 
 @needs_ffmpeg
