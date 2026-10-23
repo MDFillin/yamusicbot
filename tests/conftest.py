@@ -14,6 +14,7 @@ def yandex_guard(monkeypatch):
     """Свой регулятор запросов к Яндексу на каждый тест — просторный, чтобы не тормозить остальные тесты."""
     guard = net.Guard(rate=1000, burst=1000)
     monkeypatch.setattr(net, "guard", guard)
+    monkeypatch.setattr("bot.ym.UPLOAD_RETRY_PAUSES", (0, 0))  # повторы загрузки — без пауз
     return guard
 
 

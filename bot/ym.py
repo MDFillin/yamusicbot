@@ -88,6 +88,14 @@ class UploadError(RuntimeError):
     pass
 
 
+class UploadTemporaryError(UploadError):
+    """Сервер загрузки Яндекса не ответил вовремя или временно недоступен (5xx, таймаут) — стоит повторить."""
+
+
+UPLOAD_RETRY_PAUSES = (5, 20)  # сек перед повторами, когда сервер загрузки Яндекса временно не отвечает
+UPLOAD_TEMPORARY = {500, 502, 503, 504}
+
+
 class UnsupportedMediaError(UploadError):
     """Яндекс не принял формат файла (HTTP 415 UNSUPPORTED_MEDIA_TYPE)."""
 
@@ -653,7 +661,7 @@ class YandexMusic:
         Если Яндекс не принял файл как MP3 (HTTP 415), перекодируем его в обычный MP3 и пробуем ещё раз.
         """
         try:
-            return await self._upload_once(playlist_kind, filename, data)
+            return await self._upload_retrying(playlist_kind, filename, data)
         except UnsupportedMediaError as e:
             if not ffmpeg_available():
                 raise UploadError(f"{UNSUPPORTED_MEDIA}. Установите ffmpeg — бот сам переведёт файл в MP3.") from e
@@ -663,11 +671,26 @@ class YandexMusic:
             except ConversionError as conv:
                 raise UploadError(f"{UNSUPPORTED_MEDIA}, а перекодировать его не вышло: {conv}") from conv
         try:
-            result = await self._upload_once(playlist_kind, filename, fixed)
+            result = await self._upload_retrying(playlist_kind, filename, fixed)
         except UnsupportedMediaError as e:
             raise UploadError(f"{UNSUPPORTED_MEDIA}; не помогла и перекодировка в MP3.") from e
         return UploadResult(result.ugc_track_id, result.server_reply,
                             note="Яндекс не принял файл как есть — перекодирован в MP3 320 kbps")
+
+    async def _upload_retrying(self, playlist_kind: int, filename: str, data: bytes) -> UploadResult:
+        """Сервер загрузки Яндекса временами отвечает 504 «upstream request timeout» — это сбой у него, а не файл:
+        пробуем ещё раз с новым адресом загрузки, с паузой."""
+        for attempt, pause in enumerate((*UPLOAD_RETRY_PAUSES, None), 1):
+            try:
+                return await self._upload_once(playlist_kind, filename, data)
+            except UploadTemporaryError as e:
+                if pause is None:
+                    raise UploadTemporaryError(
+                        f"{e}. Это сбой на стороне Яндекса, не в файле: бот пробовал {attempt} раза. "
+                        "Попробуйте ещё раз через несколько минут") from e
+                log.warning("Загрузка %s, попытка %s: %s — повторю через %s с", filename, attempt, e, pause)
+                await asyncio.sleep(pause)
+        raise AssertionError("недостижимо")
 
     async def _upload_once(self, playlist_kind: int, filename: str, data: bytes) -> UploadResult:
         http = self._http()
@@ -684,8 +707,10 @@ class YandexMusic:
             async with http.post(target, data=form, headers=self._auth(target)) as resp:
                 reply = (await resp.text()).strip()
                 status = resp.status
-        except aiohttp.ClientError as e:
-            raise UploadError(f"Сетевая ошибка при отправке файла: {e}") from e
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise UploadTemporaryError(f"Сетевая ошибка при отправке файла: {e}") from e
+        if status in UPLOAD_TEMPORARY:
+            raise UploadTemporaryError(f"Сервер загрузки Яндекса не ответил вовремя (HTTP {status}: {reply[:100]})")
         if status == 415 or "UNSUPPORTED_MEDIA_TYPE" in reply:
             raise UnsupportedMediaError(reply[:300])
         if status in (404, 405, 410, 501):  # адреса для файла больше нет — изменился сам способ загрузки

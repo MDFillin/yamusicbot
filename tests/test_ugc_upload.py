@@ -40,6 +40,9 @@ async def fake_yandex():
         received["content_type"] = field.content_type
         received["data"] = field.file.read()
         received["uploads"].append(received["data"])
+        if received.get("gateway_timeouts", 0) > 0:  # так отвечает перегруженный сервер загрузки Яндекса
+            received["gateway_timeouts"] -= 1
+            return web.Response(status=504, text="upstream request timeout")
         if received["reject"] > 0:  # так Яндекс отвечает на файл, который не считает MP3
             received["reject"] -= 1
             return web.json_response({"result": "UNSUPPORTED_MEDIA_TYPE"}, status=415)
@@ -320,3 +323,21 @@ async def test_cookies_from_refusal_are_used_on_the_same_host(cookie_yandex):
     finally:
         await ym.close()
     assert seen["loader_cookies"] == [[], ["_yasc"]], "повтор на том же адресе, а не запасной адрес API"
+
+
+async def test_gateway_timeout_is_retried(fake_yandex):
+    """504 «upstream request timeout» — сбой у Яндекса, а не файл: бот повторяет с новым адресом загрузки."""
+    from bot.ym import UploadTemporaryError
+
+    base, received = fake_yandex
+    received["gateway_timeouts"] = 2
+    ym = make_ym([f"{base}/api"])
+    try:
+        assert (await ym.upload_track(1003, "a.mp3", b"x")).server_reply == "CREATED"
+        assert len(received["uploads"]) == 3 and received["calls"].count("loader") == 3, "каждый раз новый адрес"
+        received["gateway_timeouts"] = 99
+        with pytest.raises(UploadTemporaryError, match="сбой на стороне Яндекса") as err:
+            await ym.upload_track(1003, "b.mp3", b"y")
+        assert "HTTP 504" in str(err.value) and "отклонил" not in str(err.value)
+    finally:
+        await ym.close()
