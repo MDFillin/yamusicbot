@@ -142,3 +142,51 @@ async def test_backup_asks_password_twice(tmp_path, telegram):
     archive = next(old.glob("yamusicbot-backup-*.tar.gz.enc"))
     code, _ = await run(new, "restore.sh", str(archive), BACKUP_PASSWORD="пароль", RESTORE_NO_START="1")
     assert code == 0 and (new / "data" / "bot.db").exists()
+
+
+async def test_nightly_backup_keeps_claude_and_cron(tmp_path, telegram):
+    old = bot_dir(tmp_path / "old")
+    (old / ".env").write_text("BOT_TOKEN=123:ABC\nADMIN_IDS=42\n")
+    (old / "data").mkdir()
+    sqlite3.connect(old / "data" / "bot.db").close()
+    claude = old / ".claude"  # HOME = папка бота, см. run()
+    (claude / "projects" / "-root-yamusicbot").mkdir(parents=True)
+    (claude / "projects" / "-root-yamusicbot" / "s.jsonl").write_text('{"type":"user"}\n')
+    (claude / ".credentials.json").write_text("SECRET")
+    (claude / "cache").mkdir()
+    (claude / "cache" / "big").write_text("x")
+    crontab = old / "bin" / "crontab"
+    crontab.write_text('#!/bin/sh\nif [ "$1" = -l ]; then [ -f "$CRON" ] && cat "$CRON"; else cp "$1" "$CRON"; fi\n')
+    crontab.chmod(0o755)
+    (old / "cron").write_text("17 1 * * * backup\n")
+    (old / "pass").write_text("ночной\n")
+    for stamp in ("20200101-0000", "20200102-0000"):  # старые копии из прошлых ночей
+        (old / f"yamusicbot-backup-{stamp}.tar.gz.enc").write_text("old")
+
+    code, out = await run(old, "backup.sh", BACKUP_PASSWORD_FILE=str(old / "pass"), BACKUP_KEEP="2",
+                          TG_API=telegram["url"], CRON=str(old / "cron"))
+    assert code == 0, out
+    copies = sorted(p.name for p in old.glob("yamusicbot-backup-*.tar.gz.enc"))
+    assert len(copies) == 2 and copies[0] == "yamusicbot-backup-20200102-0000.tar.gz.enc", "лишние старые — удалены"
+
+    new = bot_dir(tmp_path / "new")
+    shutil.copy(crontab, new / "bin" / "crontab")
+    (new / ".claude").mkdir()
+    (new / ".claude" / ".credentials.json").write_text("NEW LOGIN")
+    code, out = await run(new, "restore.sh", "F1", BOT_TOKEN="123:ABC", BACKUP_PASSWORD="ночной",
+                          RESTORE_NO_START="1", TG_API=telegram["url"], CRON=str(new / "cron"))
+    assert code == 0, out
+    assert (new / ".claude" / "projects" / "-root-yamusicbot" / "s.jsonl").read_text() == '{"type":"user"}\n'
+    assert (new / ".claude" / ".credentials.json").read_text() == "NEW LOGIN", "вход в Claude не из копии"
+    assert not (new / ".claude" / "cache").exists() and not (new / "claude-home").exists()
+    assert (new / "cron").read_text() == "17 1 * * * backup\n" and not (new / "crontab.txt").exists()
+
+
+async def test_backup_without_password_file_warns_in_telegram(tmp_path, telegram):
+    old = bot_dir(tmp_path / "old")
+    (old / ".env").write_text("BOT_TOKEN=123:ABC\nADMIN_IDS=42\n")
+    (old / "data").mkdir()
+    code, out = await run(old, "backup.sh", BACKUP_PASSWORD_FILE=str(old / "нет"), TG_API=telegram["url"])
+    assert code == 1 and not telegram["sent"]
+    [(chat, text)] = telegram["messages"]
+    assert chat == "42" and "не сделана" in text

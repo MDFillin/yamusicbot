@@ -4,8 +4,9 @@
 #   cd ~/yamusicbot && bash scripts/restore.sh <file_id из Telegram>     — скачает архив из Telegram
 #   cd ~/yamusicbot && bash scripts/restore.sh ~/yamusicbot-backup-….enc — архив уже на сервере
 #
-# Спросит токен бота (только для скачивания из Telegram) и пароль архива, разложит .env и data/ по местам
-# и запустит бота. Без вопросов: BOT_TOKEN=… BACKUP_PASSWORD=… bash scripts/restore.sh …
+# Спросит токен бота (только для скачивания из Telegram) и пароль архива, разложит .env и data/ по местам,
+# вернёт переписку Claude Code в ~/.claude и crontab (если они есть в копии) и запустит бота.
+# Без вопросов: BOT_TOKEN=… BACKUP_PASSWORD=… bash scripts/restore.sh …
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -69,7 +70,25 @@ if command -v docker >/dev/null; then
 fi
 umask 077
 openssl enc -d "${CIPHER[@]}" -pass env:BACKUP_PASSWORD -in "$archive" | tar -xzf -
-echo "✅ Восстановлено: $(echo "$listing" | sed 's#^\./##' | cut -d/ -f1 | sort -u | tr '\n' ' ')"
+echo "✅ Восстановлено: $(echo "$listing" | sed 's#^\./##' | cut -d/ -f1 | grep -vxE 'claude-home|crontab.txt' | sort -u | tr '\n' ' ')"
+
+if [ -d claude-home ]; then
+  # Поверх уже установленного Claude Code: его файл входа в копию не попадал и останется на месте.
+  mkdir -p "$HOME/.claude"
+  cp -a claude-home/. "$HOME/.claude/"
+  rm -rf claude-home
+  echo "✅ Переписка и память Claude Code — в $HOME/.claude. Продолжить: cd $(pwd) && claude --continue"
+fi
+if [ -f crontab.txt ]; then
+  if ! command -v crontab >/dev/null; then
+    echo "⚠️ Нет cron, расписание из копии не восстановлено: apt install -y cron && crontab $(pwd)/crontab.txt"
+  elif crontab -l >/dev/null 2>&1 && [ "${RESTORE_FORCE:-}" != 1 ]; then
+    echo "⚠️ На сервере уже есть своё расписание cron — не трогаю. Из копии: $(pwd)/crontab.txt"
+  else
+    crontab crontab.txt && rm -f crontab.txt
+    echo "✅ Расписание cron (ночная копия) восстановлено"
+  fi
+fi
 
 if grep -qE '^DOMAIN=.+' .env; then
   echo "⚠️ В .env указан свой домен ($(grep -E '^DOMAIN=' .env | tail -n 1 | cut -d= -f2-)): направьте его A-запись на новый IP сервера."
