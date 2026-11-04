@@ -153,6 +153,8 @@ async def test_nightly_backup_keeps_claude_and_cron(tmp_path, telegram):
     (claude / "projects" / "-root-yamusicbot").mkdir(parents=True)
     (claude / "projects" / "-root-yamusicbot" / "s.jsonl").write_text('{"type":"user"}\n')
     (claude / ".credentials.json").write_text("SECRET")
+    for i in range(5000):  # длинный список файлов в архиве: проверка архива не должна падать от SIGPIPE
+        (claude / "projects" / "-root-yamusicbot" / f"tool-result-{i:05}.txt").write_text("x")
     (claude / "cache").mkdir()
     (claude / "cache" / "big").write_text("x")
     crontab = old / "bin" / "crontab"
@@ -188,5 +190,8 @@ async def test_backup_without_password_file_warns_in_telegram(tmp_path, telegram
     (old / "data").mkdir()
     code, out = await run(old, "backup.sh", BACKUP_PASSWORD_FILE=str(old / "нет"), TG_API=telegram["url"])
     assert code == 1 and not telegram["sent"]
-    [(chat, text)] = telegram["messages"]
-    assert chat == "42" and "не сделана" in text
+    (old / "pass").write_text("\n")
+    code, out = await run(old, "backup.sh", BACKUP_PASSWORD_FILE=str(old / "pass"), TG_API=telegram["url"])
+    assert code == 1 and "пустой пароль" in out and not telegram["sent"]
+    assert [chat for chat, _ in telegram["messages"]] == ["42", "42"]
+    assert all("не сделана" in text for _, text in telegram["messages"])

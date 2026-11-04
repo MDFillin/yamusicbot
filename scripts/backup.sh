@@ -47,6 +47,11 @@ if [ -z "${BACKUP_PASSWORD:-}" ] && [ -n "${BACKUP_PASSWORD_FILE:-}" ]; then
     exit 1
   fi
   BACKUP_PASSWORD="$(head -n 1 "$BACKUP_PASSWORD_FILE" | tr -d '\r')"
+  if [ -z "$BACKUP_PASSWORD" ]; then
+    echo "В файле $BACKUP_PASSWORD_FILE пустой пароль" >&2
+    notify "⚠️ Резервная копия не сделана: в файле $BACKUP_PASSWORD_FILE пустой пароль"
+    exit 1
+  fi
 fi
 if [ -z "${BACKUP_PASSWORD:-}" ]; then
   echo "Придумайте пароль для архива. Он понадобится при восстановлении — запишите его: без пароля архив не открыть."
@@ -101,7 +106,8 @@ trap - EXIT
 # Проверка: архив расшифровывается этим паролем и в нём всё на месте.
 listing="$(openssl enc -d "${CIPHER[@]}" -pass env:BACKUP_PASSWORD -in "$out" | tar -tzf -)"
 for need in .env data/bot.db; do
-  echo "$listing" | grep -qx "\\(\\./\\)\\?$need" || { echo "В архиве нет $need — что-то пошло не так" >&2; exit 1; }
+  # Через <<<, а не echo | grep -q: grep выходит на первом совпадении, и на длинном списке echo падал бы от SIGPIPE.
+  grep -qx "\\(\\./\\)\\?$need" <<<"$listing" || { echo "В архиве нет $need — что-то пошло не так" >&2; exit 1; }
 done
 size=$(wc -c <"$out")
 echo
