@@ -24,7 +24,7 @@ from aiohttp import web
 from yandex_music import Album, Artist, Playlist, Track
 from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
-from bot import net
+from bot import net, wave
 from bot.accounts import Accounts, LoginError, LoginSession
 from bot.admin import ADMIN_MAX_AGE, Admin, LimitReached
 from bot.audio import (
@@ -78,6 +78,9 @@ REVOKED = "Яндекс Музыка не приняла ваш вход — в�
 COMPRESS_TYPES = {"application/json", "text/html", "text/css", "application/javascript", "image/svg+xml"}
 MAX_JSON_BYTES = 64 * 1024  # запросы с JSON крошечные; большие тела нужны только /api/upload
 UPLOAD_SLOTS = 3  # файлов, которые сервер принимает одновременно (каждый держит в памяти до WEB_MAX_UPLOAD_MB)
+WAVE_OPTIONS_TTL = 6 * 3600  # сек: список занятий, жанров и эпох у Яндекса меняется редко, а весит мегабайты
+WAVE_SESSION_RE = re.compile(r"[\w\-.]{1,128}")
+WAVE_EVENTS = {"trackStarted", "trackFinished", "skip"}
 TOKEN_MAX_AGE = 3600  # сек: токен показываем только недавно открытому приложению
 # Страница берёт скрипты только у себя и у Telegram: даже если в данных окажется разметка, чужой код не запустится.
 CSP = "; ".join((
@@ -144,6 +147,19 @@ class WebContext:
     upload_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(UPLOAD_SLOTS))
     upload_locks: defaultdict[int, asyncio.Lock] = field(default_factory=lambda: defaultdict(asyncio.Lock))
     download_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(PARALLEL_DOWNLOADS))
+    wave_options_cache: tuple[float, list[dict[str, Any]]] | None = None
+    wave_options_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def wave_options(self, ym: YandexMusic) -> list[dict[str, Any]]:
+        """Настройки волны одни на всех: берём через того, кто первым открыл, и держим несколько часов."""
+        async with self.wave_options_lock:
+            if self.wave_options_cache and time.monotonic() - self.wave_options_cache[0] < WAVE_OPTIONS_TTL:
+                return self.wave_options_cache[1]
+            settings, stations = await asyncio.gather(ym.wave_settings(), ym.wave_stations())
+            options = wave.build_options(settings, stations)
+            if options:
+                self.wave_options_cache = (time.monotonic(), options)
+            return options
 
     async def source(self, user_id: int, ym: YandexMusic, src: str, ref: str, fresh: bool) -> TrackSource:
         key = (user_id, src, ref)
@@ -568,6 +584,76 @@ async def api_unlike(request: web.Request) -> web.Response:
     await request[YM].unlike(request.match_info["track_id"])
     _ctx(request).sources.pop((_user_id(request), "likes", ""))
     return web.json_response({"liked": False})
+
+
+@routes.post(r"/api/dislikes/{track_id:[\w.\-]+}")
+async def api_dislike(request: web.Request) -> web.Response:
+    await request[YM].dislike(request.match_info["track_id"])
+    return web.json_response({"disliked": True})
+
+
+# ---------- Моя волна ----------
+
+def _wave_session(request: web.Request) -> str:
+    session_id = request.match_info["session"]
+    if not WAVE_SESSION_RE.fullmatch(session_id):
+        raise web.HTTPBadRequest(text="Неверная сессия волны")
+    return session_id
+
+
+def _wave_json(request: web.Request, batch) -> dict[str, Any]:
+    ctx, user_id = _ctx(request), _user_id(request)
+    return {"session": batch.session_id, "batch": batch.batch_id,
+            "tracks": [track_json(t, ctx.signer, user_id) for t in batch.tracks]}
+
+
+@routes.get("/api/wave")
+async def api_wave(request: web.Request) -> web.Response:
+    ctx, user_id = _ctx(request), _user_id(request)
+    options = await ctx.wave_options(request[YM])
+    return web.json_response({"groups": options,
+                              "choice": wave.clean_choice(wave.load_choice(ctx.store, user_id), options)})
+
+
+@routes.post("/api/wave/start")
+async def api_wave_start(request: web.Request) -> web.Response:
+    """Запуск волны с выбранными настройками; выбор запоминается — в следующий раз волна начнётся с него."""
+    ctx, user_id, ym = _ctx(request), _user_id(request), request[YM]
+    body = await _json_body(request)
+    choice = wave.clean_choice(body.get("choice"), await ctx.wave_options(ym))
+    wave.save_choice(ctx.store, user_id, choice)
+    batch = await ym.wave_start(wave.seeds(choice))
+    try:
+        await ym.wave_feedback(batch.session_id, batch.batch_id, {"type": "radioStarted", "from": "web-radio-mobile"})
+    except Exception as e:  # без отклика волна всё равно играет
+        log.info("Волна %s: не принят отклик radioStarted: %s", user_id, e)
+    return web.json_response(_wave_json(request, batch))
+
+
+@routes.post(r"/api/wave/{session}/tracks")
+async def api_wave_next(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    queue = [str(x)[:64] for x in body.get("queue") or [] if isinstance(x, str | int)][-50:]
+    batch = await request[YM].wave_next(_wave_session(request), queue)
+    return web.json_response(_wave_json(request, batch))
+
+
+@routes.post(r"/api/wave/{session}/feedback")
+async def api_wave_feedback(request: web.Request) -> web.Response:
+    """Отклик плеера: трек начался, дослушан или пропущен — по ним волна подбирает следующие."""
+    body = await _json_body(request)
+    kind, track = body.get("type"), str(body.get("track") or "")[:64]
+    if kind not in WAVE_EVENTS or not re.fullmatch(r"\d+(:\d+)?", track):
+        raise web.HTTPBadRequest(text="Неверный отклик волны")
+    event: dict[str, Any] = {"type": kind, "trackId": track}
+    if kind != "trackStarted":
+        try:
+            event["totalPlayedSeconds"] = max(0, min(int(body.get("played") or 0), 24 * 3600))
+        except (TypeError, ValueError) as e:
+            raise web.HTTPBadRequest(text="Неверный отклик волны") from e
+    batch = body.get("batch")
+    await request[YM].wave_feedback(_wave_session(request), batch if isinstance(batch, str) else None, event)
+    return web.json_response({"ok": True})
 
 
 @routes.post("/api/playlists")

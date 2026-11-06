@@ -21,7 +21,7 @@ from bot.audio import read_mp3_tags, read_tags, tag_mp3
 from bot.config import Config
 from bot.storage import Storage
 from bot.web.app import create_app
-from bot.ym import UploadResult, YandexNotReady
+from bot.ym import UploadResult, WaveBatch, YandexNotReady
 
 TOKEN = "42:TEST-TOKEN"
 OWNER_ID = 1
@@ -46,6 +46,24 @@ def init_data(user_id: int = OWNER_ID, token: str = TOKEN, auth_date: int | None
 
 def as_user(user_id: int) -> dict[str, str]:
     return {"X-Telegram-Init-Data": init_data(user_id)}
+
+
+WAVE_SETTINGS = {
+    "blocks": [{"type": "contexts", "items": [
+        {"id": {"type": "activity", "tag": "workout"}, "name": "Тренируюсь",
+         "icon": {"backgroundColor": "#123456", "imageUrl": "avatars.yandex.net/workout/%%"}},
+    ]}],
+    "settingRestrictions": {"moodEnergy": {"possibleValues": [
+        {"value": "active", "name": "Бодрое", "serializedSeed": "settingMoodEnergy:active"},
+        {"value": "all", "name": "Любое", "unspecified": True, "serializedSeed": "settingMoodEnergy:all"},
+    ]}},
+}
+WAVE_STATIONS = [
+    {"station": {"id": {"type": "genre", "tag": "rap"}, "name": "Рэп и хип-хоп", "icon": {}}},
+    {"station": {"id": {"type": "genre", "tag": "trap"}, "name": "Трэп", "parentId": {"type": "genre", "tag": "rap"}}},
+    {"station": {"id": {"type": "epoch", "tag": "nineties"}, "name": "1990-е"}},
+    {"station": {"id": {"type": "mood", "tag": "sad"}, "name": "Грустное"}},
+]
 
 
 def make_track(track_id: int, title: str) -> NS:
@@ -140,6 +158,28 @@ class FakeYM:
     async def download_tagged(self, track, max_bitrate=None):
         self.calls.append(("download", str(track.id), max_bitrate))
         return tag_mp3(FAKE_MP3, artist="Кино", title=track.title), max_bitrate or 320
+
+    async def dislike(self, track_id):
+        self.calls.append(("dislike", track_id))
+        return True
+
+    async def wave_settings(self):
+        self.calls.append(("wave_settings",))
+        return WAVE_SETTINGS
+
+    async def wave_stations(self):
+        return WAVE_STATIONS
+
+    async def wave_start(self, seeds):
+        self.calls.append(("wave_start", list(seeds)))
+        return WaveBatch("sess-1", "b1", [self.tracks["1"], self.tracks["2"]])
+
+    async def wave_next(self, session_id, queue):
+        self.calls.append(("wave_next", session_id, list(queue)))
+        return WaveBatch(session_id, "b2", [self.tracks["2"]])
+
+    async def wave_feedback(self, session_id, batch_id, event):
+        self.calls.append(("wave_feedback", session_id, batch_id, event))
 
     async def upload_track(self, kind, filename, data):
         self.calls.append(("upload", kind, filename, data))
@@ -779,3 +819,55 @@ async def test_api_shared_playlists(env, monkeypatch):
     assert r.status == 200 and (await r.json())["title"] == "Мы с Федей"
     assert (await env.client.delete(f"/api/shared/{info['id']}")).status == 200
     assert len((await (await env.client.get("/api/shared")).json())["items"]) == 1
+
+
+# ---------- Моя волна ----------
+
+async def test_wave_settings_like_in_yandex_app(env):
+    data = await (await env.client.get("/api/wave")).json()
+    groups = {g["key"]: g for g in data["groups"]}
+    assert list(groups) == ["context", "moodEnergy", "genre", "epoch"]
+    assert groups["context"]["items"] == [{"seed": "activity:workout", "name": "Тренируюсь", "color": "#123456",
+                                           "image": "https://avatars.yandex.net/workout/100x100"}]
+    assert [i["seed"] for i in groups["moodEnergy"]["items"]] == ["settingMoodEnergy:active"], "«Любое» — без выбора"
+    assert [i["name"] for i in groups["genre"]["items"]] == ["Рэп и хип-хоп"], "поджанры не показываем"
+    assert data["choice"] == {}
+    await env.client.get("/api/wave")
+    assert env.ym.calls.count(("wave_settings",)) == 1, "настройки кэшируются"
+
+
+async def test_wave_start_saves_choice_and_drops_foreign_seeds(env):
+    choice = {"context": "activity:workout", "genre": "genre:rap", "epoch": "evil:1", "moodEnergy": 5}
+    resp = await env.client.post("/api/wave/start", json={"choice": choice})
+    data = await resp.json()
+    assert resp.status == 200 and data["session"] == "sess-1" and data["batch"] == "b1"
+    assert [t["title"] for t in data["tracks"]] == ["Кукушка", "Группа крови"] and data["tracks"][0]["stream"]
+    assert ("wave_start", ["user:onyourwave", "activity:workout", "genre:rap"]) in env.ym.calls
+    started = [c for c in env.ym.calls if c[0] == "wave_feedback"]
+    assert started == [("wave_feedback", "sess-1", "b1", {"type": "radioStarted", "from": "web-radio-mobile"})]
+    saved = await (await env.client.get("/api/wave")).json()
+    assert saved["choice"] == {"context": "activity:workout", "genre": "genre:rap"}, "выбор запоминается"
+    friend = await (await env.client.get("/api/wave", headers=as_user(FRIEND_ID))).json()
+    assert friend["choice"] == {}, "у каждого свой выбор"
+
+
+async def test_wave_next_and_feedback(env):
+    resp = await env.client.post("/api/wave/sess-1/tracks", json={"queue": ["1:10", "2:10"]})
+    assert resp.status == 200 and [t["id"] for t in (await resp.json())["tracks"]] == ["2"]
+    assert ("wave_next", "sess-1", ["1:10", "2:10"]) in env.ym.calls
+    ok = await env.client.post("/api/wave/sess-1/feedback", json={"type": "skip", "track": "1:10", "batch": "b1",
+                                                                   "played": 12.4})
+    assert ok.status == 200
+    assert env.ym.calls[-1] == ("wave_feedback", "sess-1", "b1",
+                                {"type": "skip", "trackId": "1:10", "totalPlayedSeconds": 12})
+    await env.client.post("/api/wave/sess-1/feedback", json={"type": "trackStarted", "track": "2"})
+    assert env.ym.calls[-1] == ("wave_feedback", "sess-1", None, {"type": "trackStarted", "trackId": "2"})
+    for bad in ({"type": "radioStarted", "track": "1"}, {"type": "skip", "track": "../x"},
+                {"type": "skip", "track": "1", "played": "много"}):
+        assert (await env.client.post("/api/wave/sess-1/feedback", json=bad)).status == 400
+    assert (await env.client.post("/api/wave/bad session!/tracks", json={})).status in (400, 404)
+
+
+async def test_dislike(env):
+    resp = await env.client.post("/api/dislikes/1")
+    assert resp.status == 200 and ("dislike", "1") in env.ym.calls

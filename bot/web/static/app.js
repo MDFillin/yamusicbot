@@ -62,6 +62,8 @@
     alert: '<path d="m10.3 3.9-8.2 14a2 2 0 0 0 1.7 3h16.4a2 2 0 0 0 1.7-3l-8.2-14a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
     ban: '<circle cx="12" cy="12" r="9"/><path d="m5.7 5.7 12.6 12.6"/>',
     server: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+    wave: '<path d="M2 9c2.5-3 4.5-3 7 0s4.5 3 7 0 3.5-3 6-1"/><path d="M2 15c2.5-3 4.5-3 7 0s4.5 3 7 0 3.5-3 6-1"/>',
+    dislike: '<path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.7a2 2 0 0 0-2 1.7l-1.4 9A2 2 0 0 0 4.3 15z"/><path d="M17 2h3a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-3"/>',
     save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
   };
 
@@ -1257,6 +1259,12 @@
       h('div', { class: 'meta' }, h('div', { class: 't' }, 'Мне нравится'), likesSub),
       h('button', { class: 'tile-play', 'aria-label': 'Слушать', onclick: (e) => { e.stopPropagation(); haptic.tap(); playSource('likes', '', true); } },
         icon('play')));
+    const waveSub = h('div', { class: 's' }, waveSummary());
+    const wave = h('div', { class: 'likes-tile wave-tile', role: 'button', onclick: () => { haptic.tap(); waveSheet(); } },
+      h('div', { class: 'heart' }, icon('wave')),
+      h('div', { class: 'meta' }, h('div', { class: 't' }, 'Моя волна'), waveSub),
+      h('button', { class: 'tile-play', 'aria-label': 'Слушать', onclick: (e) => { e.stopPropagation(); haptic.tap(); startWave(); } },
+        icon('play')));
     const grid = h('div', { class: 'grid' }, skTiles(4));
     const statsTile = h('button', { class: 'row stats-tile', onclick: () => { haptic.tap(); openStats('week'); } },
       h('span', { class: 'set-icon' }, icon('chart', 'sm')),
@@ -1272,7 +1280,7 @@
       h('div', { class: 'lib-head' },
         h('div', {}, h('div', { class: 'hello' }, name ? `Привет, ${name} 👋` : 'Привет 👋'), h('h1', { class: 'page-title' }, 'Медиатека')),
         h('div', { class: 'head-btns' }, shield, gear)),
-      chip, likes, statsTile, sharedTile,
+      chip, wave, likes, statsTile, sharedTile,
       h('div', { class: 'section-head' }, h('h2', {}, 'Мои плейлисты'),
         h('button', { class: 'link-btn', onclick: () => createPlaylistSheet() }, icon('plus', 'sm'), 'Создать')),
       grid);
@@ -1295,12 +1303,145 @@
         ...state.playlists.map(tile));
     };
     const refresh = () => loadLibrary().then(() => alive() && draw()).catch(fail);
+    const drawWave = () => { waveSub.textContent = waveSummary(); };
+    loadWave().then(() => alive() && drawWave()).catch(() => {});
     entry.onShow = () => {
+      drawWave();
       if (state.libraryLoaded) draw();
       if (Date.now() - state.libraryAt > 30000) refresh(); // вернулись спустя время — тихо обновим
     };
     if (state.libraryLoaded) draw();
     refresh();
+  }
+
+  // ---------- Моя волна (bot/wave.py) ----------
+  // Настройки — те же, что в приложении Яндекса (занятие, характер, настроение, язык, жанр, эпоха): по одному
+  // значению в группе, повторное нажатие снимает выбор. Плеер сообщает Яндексу, что трек начался, дослушан или
+  // пропущен, — по этим откликам волна подбирает следующие треки.
+  const waveState = { groups: null, choice: {}, loading: null };
+
+  function loadWave() {
+    if (waveState.groups) return Promise.resolve();
+    if (!waveState.loading) {
+      waveState.loading = api('/api/wave')
+        .then((r) => { waveState.groups = r.groups; waveState.choice = r.choice || {}; })
+        .finally(() => { waveState.loading = null; });
+    }
+    return waveState.loading;
+  }
+
+  function waveNames(choice) {
+    const names = [];
+    for (const g of waveState.groups || []) {
+      const item = g.items.find((i) => i.seed === choice[g.key]);
+      if (item) names.push(item.name);
+    }
+    return names;
+  }
+  const waveSummary = () => waveNames(waveState.choice).join(' · ') || 'Музыка, подобранная под вас';
+
+  function waveChip(item, on, onclick) {
+    const pic = item.image
+      ? h('span', { class: 'wave-pic', style: `background-image: ${cssUrl(item.image)}${item.color ? `; background-color: ${item.color}` : ''}` })
+      : null;
+    return h('button', { class: on ? 'on' : '', onclick }, pic, h('span', {}, item.name));
+  }
+
+  async function waveSheet() {
+    try { await loadWave(); } catch (e) { fail(e); return; }
+    const draft = { ...waveState.choice };
+    const body = h('div', { class: 'wave-settings' });
+    const draw = () => put(body, ...waveState.groups.map((g) => h('section', { class: 'set-group' }, h('h3', {}, g.title),
+      h('div', { class: 'chips wave-chips' }, g.items.map((item) => waveChip(item, draft[g.key] === item.seed, () => {
+        haptic.tap();
+        if (draft[g.key] === item.seed) delete draft[g.key]; else draft[g.key] = item.seed;
+        draw();
+      }))))));
+    draw();
+    openSheet([
+      h('div', { class: 'sheet-title' }, 'Настроить Мою волну'),
+      body,
+      h('div', { class: 'wave-actions' },
+        h('button', { class: 'btn secondary', onclick: () => { haptic.tap(); Object.keys(draft).forEach((k) => delete draft[k]); draw(); } }, 'Сбросить'),
+        h('button', { class: 'btn', onclick: () => { haptic.tap(); closeSheet(); startWave(draft); } }, icon('play', 'sm'), 'Слушать')),
+    ], 'wave-sheet');
+  }
+
+  // iOS включает звук только в ответ на нажатие, а треки волны приходят с сервера позже. Короткая тишина,
+  // включённая прямо в обработчике нажатия, «разрешает» плеер — потом трек включится уже без нажатия.
+  let silenceUrl = null;
+  function unlockAudio() {
+    if (!audio.paused) return;
+    if (!silenceUrl) {
+      const n = 800;
+      const buf = new DataView(new ArrayBuffer(44 + n));
+      const str = (o, t) => [...t].forEach((c, i) => buf.setUint8(o + i, c.charCodeAt(0)));
+      str(0, 'RIFF'); buf.setUint32(4, 36 + n, true); str(8, 'WAVEfmt '); buf.setUint32(16, 16, true);
+      buf.setUint16(20, 1, true); buf.setUint16(22, 1, true); buf.setUint32(24, 8000, true); buf.setUint32(28, 8000, true);
+      buf.setUint16(32, 1, true); buf.setUint16(34, 8, true); str(36, 'data'); buf.setUint32(40, n, true);
+      for (let i = 0; i < n; i += 1) buf.setUint8(44 + i, 128);
+      silenceUrl = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+    }
+    audio.src = silenceUrl;
+    audio.play().catch(() => {});
+  }
+
+  const waveTrackId = (t) => (t.album_id ? `${t.id}:${t.album_id}` : String(t.id));
+
+  async function startWave(choice = waveState.choice) {
+    if (player.wave && !player.wave.loading && choice === waveState.choice && current()) { toggle(); return; }
+    unlockAudio();
+    toast('Включаю Мою волну…');
+    try {
+      const r = await api('/api/wave/start', { method: 'POST', body: { choice } });
+      waveState.choice = { ...choice };
+      document.querySelectorAll('.wave-tile .s').forEach((el) => { el.textContent = waveSummary(); });
+      const tracks = r.tracks.filter((t) => t.available).map((t) => ({ ...t, batch: r.batch }));
+      if (!tracks.length) { restoreAfterUnlock(); toast('Яндекс не подобрал треки — попробуйте другие настройки'); return; }
+      Object.assign(player, { queue: tracks, original: null, index: 0, shuffle: false, repeat: 'off',
+        wave: { session: r.session, loading: null } });
+      start();
+    } catch (e) { restoreAfterUnlock(); fail(e); }
+  }
+
+  function restoreAfterUnlock() { // волна не включилась — вернём плееру прежний трек (на паузе)
+    if (silenceUrl && audio.src === silenceUrl && current()) audio.src = current().stream;
+  }
+
+  function waveMore() {
+    const w = player.wave;
+    if (!w) return Promise.resolve(false);
+    if (!w.loading) {
+      w.loading = api(`/api/wave/${encodeURIComponent(w.session)}/tracks`, { method: 'POST',
+        body: { queue: player.queue.slice(-50).map(waveTrackId) } })
+        .then((r) => {
+          if (player.wave !== w) return false;
+          const have = new Set(player.queue.map((t) => t.id));
+          const fresh = r.tracks.filter((t) => t.available && !have.has(t.id)).map((t) => ({ ...t, batch: r.batch }));
+          player.queue.push(...fresh);
+          return fresh.length > 0;
+        })
+        .catch(() => false)
+        .finally(() => { w.loading = null; });
+    }
+    return w.loading;
+  }
+
+  function waveFeedback(type, t, played) {
+    if (!player.wave || !t) return;
+    api(`/api/wave/${encodeURIComponent(player.wave.session)}/feedback`, { method: 'POST',
+      body: { type, track: waveTrackId(t), batch: t.batch || null, played: Math.round(played || 0) } }).catch(() => {});
+  }
+
+  async function dislikeCurrent() {
+    const t = current();
+    if (!t) return;
+    haptic.tap();
+    try {
+      await api(`/api/dislikes/${encodeURIComponent(t.id)}`, { method: 'POST' });
+      toast('Больше не поставим');
+      step(1);
+    } catch (e) { fail(e); }
   }
 
   // ---------- общие плейлисты (bot/shared.py) ----------
@@ -2348,7 +2489,7 @@
   // ---------- плеер ----------
   const audio = $('#audio');
   const playerBar = $('#player');
-  const player = { queue: [], original: null, index: -1, shuffle: false, repeat: 'off' };
+  const player = { queue: [], original: null, index: -1, shuffle: false, repeat: 'off', wave: null };
   let now = null; // элементы открытого полноэкранного плеера
 
   const current = () => player.queue[player.index];
@@ -2386,6 +2527,7 @@
       if (!t.available) { toast('Трек недоступен'); return; }
       Object.assign(player, { original: null, queue: queue.slice(), index, shuffle: false });
     }
+    player.wave = null;
     start();
   }
 
@@ -2397,6 +2539,10 @@
     drawBar();
     markPlaying();
     if (now) drawNow();
+    if (player.wave) {
+      waveFeedback('trackStarted', t);
+      if (player.index >= player.queue.length - 2) waveMore();
+    }
     if ('mediaSession' in navigator) {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: t.title, artist: t.artists, album: t.album || '',
@@ -2408,6 +2554,16 @@
   function step(delta, auto = false) {
     if (!player.queue.length) return false;
     if (auto && player.repeat === 'one') { heardReset(); audio.currentTime = 0; audio.play().catch(() => {}); return true; }
+    if (player.wave && delta > 0) {
+      waveFeedback(auto ? 'trackFinished' : 'skip', current(), audio.currentTime);
+      if (player.index + 1 >= player.queue.length) { // порция кончилась — дождёмся следующей
+        waveMore().then((more) => { if (more && player.wave) { player.index += 1; start(); } else drawBar(); });
+        return true;
+      }
+      player.index += 1;
+      start();
+      return true;
+    }
     const n = player.queue.length;
     let i = player.index;
     for (let k = 0; k < n; k += 1) {
@@ -2452,7 +2608,7 @@
   function stopPlayer() {
     audio.pause();
     audio.removeAttribute('src');
-    Object.assign(player, { queue: [], original: null, index: -1 });
+    Object.assign(player, { queue: [], original: null, index: -1, wave: null });
     drawBar();
   }
 
@@ -2496,6 +2652,9 @@
     now.like.replaceWith(now.like = likeButton(t));
     now.shuffle.classList.toggle('on', player.shuffle);
     now.repeat.classList.toggle('on', player.repeat !== 'off');
+    now.shuffle.hidden = now.repeat.hidden = !!player.wave; // у волны свой порядок и нет конца
+    now.dislike.hidden = !player.wave;
+    now.waveLabel.hidden = !player.wave;
     put(now.repeat, icon(player.repeat === 'one' ? 'repeatOne' : 'repeat'));
     drawProgress();
   }
@@ -2513,18 +2672,22 @@
       like: h('span'),
       shuffle: h('button', { class: 'icon-btn mode', 'aria-label': 'Перемешать', onclick: toggleShuffle }, icon('shuffle')),
       repeat: h('button', { class: 'icon-btn mode', 'aria-label': 'Повтор', onclick: cycleRepeat }),
+      dislike: h('button', { class: 'icon-btn mode', 'aria-label': 'Не нравится', onclick: dislikeCurrent }, icon('dislike')),
+      waveLabel: h('button', { class: 'now-wave', onclick: () => { closeSheet(); waveSheet(); } }, icon('wave', 'sm'), 'Моя волна · настроить'),
       dragging: false,
     };
     seek.addEventListener('input', () => { els.dragging = true; els.cur.textContent = fmtTime(seek.value); });
     seek.addEventListener('change', () => { audio.currentTime = Number(seek.value); els.dragging = false; });
     const trackNow = () => current();
     openSheet([els.bg, h('div', { class: 'now' },
+      els.waveLabel,
       els.cover,
       h('div', { class: 'now-head' }, h('div', { class: 'meta' }, els.title, els.sub), els.like),
       seek,
       h('div', { class: 'times' }, els.cur, els.total),
       h('div', { class: 'controls' },
         els.shuffle,
+        els.dislike,
         h('button', { class: 'icon-btn', 'aria-label': 'Предыдущий', onclick: () => (audio.currentTime > 5 ? (audio.currentTime = 0) : step(-1)) }, icon('prev')),
         els.play,
         h('button', { class: 'icon-btn', 'aria-label': 'Следующий', onclick: () => step(1) }, icon('next')),
@@ -2549,7 +2712,10 @@
   audio.addEventListener('seeking', () => { heard.last = null; });
   audio.addEventListener('loadedmetadata', drawProgress);
   for (const ev of ['play', 'pause']) audio.addEventListener(ev, () => { drawBar(); if (now) drawNow(); });
-  audio.addEventListener('ended', () => { if (!step(1, true)) drawBar(); });
+  audio.addEventListener('ended', () => {
+    if (silenceUrl && audio.src === silenceUrl) return; // тишина из unlockAudio — это не конец трека
+    if (!step(1, true)) drawBar();
+  });
   audio.addEventListener('error', () => { if (audio.getAttribute('src') && current()) toast('Не удалось загрузить трек'); });
   if ('mediaSession' in navigator) {
     const handlers = { play: () => audio.play(), pause: () => audio.pause(), previoustrack: () => step(-1), nexttrack: () => step(1) };

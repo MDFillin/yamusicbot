@@ -230,6 +230,23 @@ class UploadResult:
     note: str | None = None  # что пришлось сделать с файлом, чтобы Яндекс его принял
 
 
+@dataclass(frozen=True)
+class WaveBatch:
+    """Порция треков волны: сессия, номер порции (для откликов) и сами треки."""
+    session_id: str
+    batch_id: str | None
+    tracks: list[Track]
+
+
+def _pick(data: Any, *keys: str) -> Any:
+    """Значение по первому найденному ключу: библиотека приводит к snake_case не все ответы."""
+    if isinstance(data, dict):
+        for key in keys:
+            if data.get(key) is not None:
+                return data[key]
+    return None
+
+
 def track_artists(track: Track) -> str:
     names = [a.name for a in (track.artists or []) if a.name]
     return ", ".join(names) or "Неизвестный исполнитель"
@@ -541,6 +558,53 @@ class YandexMusic:
 
     async def unlike(self, track_id: str) -> bool:
         return await self.client.users_likes_tracks_remove(track_id)
+
+    async def dislike(self, track_id: str) -> bool:
+        return await self.client.users_dislikes_tracks_add(track_id)
+
+    # ---------- Моя волна ----------
+    # Сессии волны (rotor/session) — как в приложении Яндекса: волна с настройками (занятие, жанр, эпоха, характер,
+    # настроение, язык), порции треков и отклики «начал / дослушал / пропустил», по которым волна подстраивается.
+
+    async def wave_settings(self) -> Any:
+        """Что можно настроить в волне: занятия и общие настройки, с названиями и картинками Яндекса."""
+        return await self.client._request.get(f"{self.client.base_url}/rotor/wave/settings")
+
+    async def wave_stations(self) -> Any:
+        """Все станции (жанры, эпохи, настроения…) — отсюда берём жанры и эпохи для настроек волны."""
+        return await self.client._request.get(f"{self.client.base_url}/rotor/stations/list", {"language": "ru"})
+
+    async def wave_start(self, seeds: Sequence[str]) -> WaveBatch:
+        data = await self.client._request.post(
+            f"{self.client.base_url}/rotor/session/new",
+            json={"seeds": list(seeds), "includeTracksInResponse": True, "includeWaveModel": True, "interactive": True},
+        )
+        return self._wave_batch(data, _pick(data, "radioSessionId", "radio_session_id"))
+
+    async def wave_next(self, session_id: str, queue: Sequence[str]) -> WaveBatch:
+        """Следующая порция; queue — уже сыгранные и стоящие в очереди треки («id:альбом»), чтобы не повторяться."""
+        data = await self.client._request.post(f"{self.client.base_url}/rotor/session/{session_id}/tracks",
+                                               json={"queue": list(queue)})
+        return self._wave_batch(data, session_id)
+
+    async def wave_feedback(self, session_id: str, batch_id: str | None, event: dict[str, Any]) -> None:
+        event = {**event, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+        body: dict[str, Any] = {"event": event}
+        if batch_id:
+            body["batchId"] = batch_id
+        await self.client._request.post(f"{self.client.base_url}/rotor/session/{session_id}/feedback", json=body)
+
+    def _wave_batch(self, data: Any, session_id: str | None) -> WaveBatch:
+        if not isinstance(data, dict) or not session_id:
+            raise YandexMusicError("Яндекс не запустил волну")
+        tracks = []
+        for item in data.get("sequence") or []:
+            raw = item.get("track") if isinstance(item, dict) else None
+            if raw and (item.get("type") in (None, "track")):
+                track = Track.de_json(raw, self.client)
+                if track is not None:
+                    tracks.append(track)
+        return WaveBatch(session_id, _pick(data, "batchId", "batch_id"), tracks)
 
     # ---------- скачивание ----------
 

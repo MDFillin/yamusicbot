@@ -141,6 +141,18 @@ body.no-tabs .page { padding-bottom: calc(var(--safe-bottom) + 16px); }
 .likes-tile .meta { flex: 1; min-width: 0; }
 .likes-tile .t { font-size: 19px; font-weight: 800; letter-spacing: -.01em; }
 .likes-tile .s { opacity: .88; font-size: 14px; margin-top: 2px; }
+/* ---------- «Моя волна» ---------- */
+.wave-tile { margin-bottom: 12px; background: radial-gradient(120% 140% at 0% 0%, #7b6cff 0%, #4a3aff 45%, #1f8bff 100%); box-shadow: 0 10px 26px rgba(74, 58, 255, .28); }
+.wave-tile .tile-play { color: #4a3aff; }
+.wave-tile .s { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wave-sheet .set-group:first-child { margin-top: 0; }
+.wave-chips button { background: var(--fill); padding: 6px 12px 6px 6px; border-radius: 99px; min-height: 36px; }
+.wave-chips button:not(:has(.wave-pic)) { padding-left: 12px; }
+.wave-chips button.on { background: var(--accent-grad, var(--accent)); color: var(--accent-text); }
+.wave-pic { width: 24px; height: 24px; border-radius: 50%; flex: none; background-size: cover; background-position: center; }
+.wave-actions { position: sticky; bottom: 0; display: flex; gap: 10px; padding: 14px 0 4px; background: inherit; }
+.wave-actions .btn { flex: 1; }
+.now-wave { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 99px; font-size: 13px; font-weight: 600; color: #fff; background: rgba(255, 255, 255, .14); }
 .tile-play {
   position: relative; z-index: 1; width: 46px; height: 46px; border-radius: 50%; flex: none; display: grid; place-items: center;
   background: #fff; color: #ff2e63; box-shadow: 0 6px 16px rgba(0, 0, 0, .18);
