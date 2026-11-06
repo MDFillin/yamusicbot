@@ -22,7 +22,7 @@ done
 [ -d data ] || { echo "Нет папки data — похоже, бот ещё ни разу не запускался" >&2; exit 1; }
 
 items=(.env data)
-for extra in ssh docker-compose.override.yml; do
+for extra in ssh docker-compose.override.yml Caddyfile; do
   if [ -e "$extra" ]; then items+=("$extra"); fi
 done
 

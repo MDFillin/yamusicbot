@@ -31,6 +31,10 @@ Telegram-бот на aiogram и мини-приложение («Медиате�
 - «Медиатека» с 04.11.2026 — `https://bobikmusic.duckdns.org` через Caddy (профиль `https`, IP 153.52.117.177,
   домен на DuckDNS у пользователя). fxTunnel убран: 1–4.11 он лежал целиком (DNS fxtun.ru не отвечал).
   При переезде на новый IP — поменять IP домена на duckdns.org.
+- «Моя волна» — в «Медиатеке» (bot/wave.py, /api/wave*): сессии rotor/session с настройками из rotor/wave/settings
+  и жанрами/эпохами из rotor/stations/list, отклики trackStarted/trackFinished/skip.
+- На сервере Caddy общий с MeshCentral (udalenka666.duckdns.org): `docker-compose.override.yml` + `Caddyfile` лежат
+  только на сервере, не в git (попадают в ночную копию). Пересобирать бота — `docker compose up -d --build bot`.
 - Ночная копия: cron в 01:17 UTC запускает `scripts/backup.sh` с паролем из `~/.yamusicbot-backup-pass`; архив
   (бот + `~/.claude` + crontab) приходит владельцу в Telegram. Лог — `~/yamusicbot-backup.log`.
 
