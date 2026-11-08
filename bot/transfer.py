@@ -42,6 +42,10 @@ VERSION_WORDS = ("remix", "ремикс", "live", "лайв", "acoustic", "ак�
                  "radio edit", "extended", "mashup", "мэшап", "bass boosted", "8d", "reverb")
 _FEAT = re.compile(r"\s*[\(\[]?\b(feat\.?|ft\.?|featuring|при уч\.?|при участии)\s[^\)\]]*[\)\]]?", re.I)
 _BRACKETS = re.compile(r"[\(\[][^\)\]]*[\)\]]")
+# Spotify пишет версию через дефис: «Song - Remastered 2011», «Song - Radio Edit». Сама версия (remix, live…)
+# сравнивается отдельно по полному названию (versions), а для похожести названий хвост лишний.
+_DASH_SUFFIX = re.compile(r"\s+[-–—]\s+[^-–—]*\b(remaster(ed)?|remix|live|edit|version|mix|mono|stereo|acoustic|"
+                          r"slowed|sped|instrumental|demo|single|\d{4})\b.*$", re.I)
 _NON_WORD = re.compile(r"[^\w\s]", re.U)
 _SPACES = re.compile(r"\s+")
 _TRANSLIT = str.maketrans({
@@ -58,7 +62,7 @@ def _plain(text: str) -> str:
 
 def norm_title(title: str) -> str:
     """Название без «feat.» и скобок: «Song (feat. X) [Remastered]» → «song»."""
-    return _plain(_BRACKETS.sub(" ", _FEAT.sub(" ", title or ""))) or _plain(title)
+    return _plain(_DASH_SUFFIX.sub(" ", _BRACKETS.sub(" ", _FEAT.sub(" ", title or "")))) or _plain(title)
 
 
 def latin(text: str) -> str:
@@ -167,6 +171,63 @@ def is_uploaded(track: Any) -> bool:
     return not str(track.id).isdigit()  # у загруженных файлов id — UUID, у каталожных — число
 
 
+class SpotifyLibrary:
+    """Что уже есть в Spotify («Любимые» или плейлист): чтобы не добавить второй раз ту же песню, даже если
+    её раньше перенесли другой версией (другой ID — сборник, переиздание) или локальным файлом."""
+
+    def __init__(self, tracks: list[dict[str, Any]]) -> None:
+        self.uris: set[str] = set()
+        self.by_title: dict[str, list[dict[str, Any]]] = {}
+        for t in tracks:
+            if not t.get("uri"):
+                continue
+            self.uris.add(t["uri"])
+            key = norm_title(t.get("name") or "")
+            for k in {key, latin(key)}:
+                self.by_title.setdefault(k, []).append(t)
+
+    def find(self, wanted: Wanted) -> str | None:
+        best_uri, best = None, 0.0
+        for title, _ in variants(wanted):
+            key = norm_title(title)
+            for t in self.by_title.get(key, []) + self.by_title.get(latin(key), []):
+                s = score(wanted, t.get("name") or "", [a.get("name") or "" for a in t.get("artists") or []],
+                          int(t.get("duration_ms") or 0))
+                if s > best:
+                    best_uri, best = t["uri"], s
+        return best_uri if best >= ACCEPT else None
+
+
+def merge_plan(current: list[str], desired: list[str]) -> list[tuple[int, list[str]]]:
+    """Куда вставить недостающее, чтобы порядок desired сохранился, а уже имеющееся (и добавленное
+    вручную в Spotify) осталось на местах: [(позиция, uris)] — в порядке выполнения. Новый трек встаёт
+    прямо перед следующим за ним (по Яндексу) уже имеющимся, а хвост — в конец плейлиста."""
+    current = list(current)
+    plan: list[tuple[int, list[str]]] = []
+    anchor = -1  # место последнего найденного в current
+    pending: list[str] = []
+
+    def insert(at: int) -> None:
+        plan.append((at, list(pending)))
+        current[at:at] = pending
+        pending.clear()
+
+    for uri in dict.fromkeys(desired):
+        later = [i for i, u in enumerate(current) if u == uri and i > anchor]
+        if later:
+            if pending:
+                insert(later[0])
+                later[0] += len(plan[-1][1])
+            anchor = later[0]
+        elif uri in current:
+            continue  # стоит раньше (переставили вручную) — не трогаем
+        else:
+            pending.append(uri)
+    if pending:
+        insert(len(current))
+    return plan
+
+
 # ---------- задания ----------
 
 @dataclass
@@ -261,6 +322,15 @@ class Transfers:
         likes = pick.src == "likes"
         st["title"] = source.name or source.title
         st["total"] = len(items)
+        st["phase"] = "library"
+        self._save(job)
+        # Что уже лежит в Spotify: туда второй раз не добавляем.
+        playlist_id = None
+        if likes:
+            library = SpotifyLibrary(await sp.liked_tracks())
+        else:
+            playlist_id = await self._target_playlist(job, sp, pick, st["title"])
+            library = SpotifyLibrary(await sp.playlist_items(playlist_id) if playlist_id else [])
         st["phase"] = "search"
         self._save(job)
         # Порядок как в Яндексе. У Яндекса новые лайки — первыми, а Spotify сортирует «Любимые» по дате
@@ -268,7 +338,7 @@ class Transfers:
         order = list(range(len(items)))
         if likes:
             order.reverse()
-        found: list[str] = []
+        desired: list[str] = []  # пары в порядке Яндекса (и уже имеющиеся, и новые)
         for chunk_start in range(0, len(order), YM_PAGE):
             chunk = order[chunk_start:chunk_start + YM_PAGE]
             with net.background():
@@ -287,15 +357,21 @@ class Transfers:
             for w in wanted:
                 if job.cancelled:
                     return
-                hit = known.get(w.src_id)
-                if hit and (hit[0] or time.time() - hit[1] < MISS_RETRY):
-                    uri = hit[0]
-                    st["already"] += 1
-                else:
-                    uri = await find_on_spotify(sp, w)
-                    self.store.set_match(YM2SP, w.src_id, uri)
+                uri = library.find(w)  # уже в Spotify — даже без поиска
                 if uri:
-                    found.append(uri)
+                    st["in_spotify"] = st.get("in_spotify", 0) + 1
+                else:
+                    hit = known.get(w.src_id)
+                    if hit and (hit[0] or time.time() - hit[1] < MISS_RETRY):
+                        uri = hit[0]
+                        st["already"] += 1
+                    else:
+                        uri = await find_on_spotify(sp, w)
+                        self.store.set_match(YM2SP, w.src_id, uri)
+                    if uri and uri in library.uris:
+                        st["in_spotify"] = st.get("in_spotify", 0) + 1
+                if uri:
+                    desired.append(uri)
                     st["found"] += 1
                     st["files_found"] = st.get("files_found", 0) + w.ugc
                 elif len(st["missed"]) < MAX_MISSES:
@@ -305,19 +381,17 @@ class Transfers:
                 if st["done"] % SAVE_EVERY == 0:
                     self._save(job)
         if likes:
-            await self._save_likes(job, sp, list(dict.fromkeys(found)), st)
+            await self._save_likes(job, sp, [u for u in dict.fromkeys(desired) if u not in library.uris], st)
         else:
-            await self._fill_playlist(job, sp, pick, found, st)
+            await self._fill_playlist(job, sp, pick, playlist_id, library, desired, st)
         st["phase"] = "done"
         self._save(job)
 
     async def _save_likes(self, job: TransferJob, sp: Spotify, uris: list[str], st: dict) -> None:
-        """По одному, от старых к новым. Что уже в «Любимых» — не трогаем: повторное сохранение могло бы
-        сдвинуть дату добавления и сломать порядок."""
+        """Только недостающие, по одному, от старых к новым: у каждого своё время добавления — порядок как
+        в Яндексе. Что уже в «Любимых», не трогаем: повторное сохранение сдвинуло бы его дату."""
         st["phase"] = "saving"
-        saved = await sp.library_contains(uris)
-        todo = [u for u, already in zip(uris, saved, strict=True) if not already]
-        st["to_save"], st["saved"] = len(todo), 0
+        st["to_save"], st["saved"] = len(uris), 0
         self._save(job)
 
         def on_saved(_uri: str) -> bool:
@@ -326,31 +400,45 @@ class Transfers:
                 self._save(job)
             return not job.cancelled
 
-        await sp.save_tracks(todo, on_saved)
+        await sp.save_tracks(uris, on_saved)
         st["url"] = "https://open.spotify.com/collection/tracks"
 
-    async def _fill_playlist(self, job: TransferJob, sp: Spotify, pick: SourcePick, uris: list[str], st: dict) -> None:
-        """Плейлист в Spotify — с тем же названием и в том же порядке. Повторный перенос обновляет тот же
-        плейлист (бот помнит, какой создал), а не плодит копии."""
+    async def _target_playlist(self, job: TransferJob, sp: Spotify, pick: SourcePick, title: str) -> str | None:
+        """Плейлист в Spotify, который дополняем: созданный ботом раньше, а если такого нет — свой плейлист
+        с тем же названием (например, перенесённый когда-то другим сервисом). None — создадим новый."""
+        key = f"spotify_playlist:{pick.ref}"
+        playlists = await sp.playlists()
+        me = await sp.me()
+        mine = [p for p in playlists if (p.get("owner") or {}).get("id") == me.get("id")]
+        remembered = self.store.get_setting(job.user_id, key)
+        if remembered and any(p.get("id") == remembered for p in mine):
+            return remembered
+        same = [p for p in mine if (p.get("name") or "").strip().casefold() == title.strip().casefold()]
+        if same:
+            self.store.set_setting(job.user_id, key, str(same[0]["id"]))
+            return str(same[0]["id"])
+        return None
+
+    async def _fill_playlist(self, job: TransferJob, sp: Spotify, pick: SourcePick, playlist_id: str | None,
+                             library: SpotifyLibrary, desired: list[str], st: dict) -> None:
+        """Плейлист в Spotify — в порядке Яндекса. В имеющийся вставляем только недостающее, на свои места
+        между уже лежащими треками; ничего не удаляем (и то, что добавлено вручную в Spotify, тоже)."""
         if job.cancelled:
             return
         st["phase"] = "saving"
-        self._save(job)
-        key = f"spotify_playlist:{pick.ref}"
-        playlist_id = self.store.get_setting(job.user_id, key)
-        if playlist_id:
-            try:
-                await sp.replace_playlist(playlist_id, uris)
-            except SpotifyError as e:
-                if e.status not in (403, 404):
-                    raise
-                playlist_id = None  # удалили в Spotify — создадим заново
-        if not playlist_id:
+        if playlist_id is None:
             playlist = await sp.create_playlist(st["title"], "Перенесено из Яндекс Музыки")
             playlist_id = str(playlist["id"])
-            self.store.set_setting(job.user_id, key, playlist_id)
-            if uris:
-                await sp.add_to_playlist(playlist_id, uris)
+            self.store.set_setting(job.user_id, f"spotify_playlist:{pick.ref}", playlist_id)
+            current: list[str] = []
+        else:
+            current = [t["uri"] for t in await sp.playlist_items(playlist_id)]
+        plan = merge_plan(current, desired)
+        st["to_save"], st["saved"] = sum(len(u) for _, u in plan), 0
+        self._save(job)
+        for position, uris in plan:
+            await sp.add_to_playlist(playlist_id, uris, position if current else None)
+            st["saved"] += len(uris)
         st["url"] = f"https://open.spotify.com/playlist/{playlist_id}"
 
 
@@ -365,8 +453,14 @@ def summary_text(state: dict) -> str:
             continue
         missed = s["total"] - s["found"] if s["done"] >= s["total"] else len(s["missed"])
         files += sum(1 for m in s["missed"] if m.get("ugc"))
-        lines.append(f"• {s['title']}: перенесено {s['found']} из {s['total']}"
-                     + (f", не нашлось {missed}" if missed else ""))
+        had = s.get("in_spotify", 0)
+        added = s.get("saved", 0)
+        parts = [f"в Spotify {s['found']} из {s['total']}"]
+        if had:
+            parts.append(f"{had} уже были, добавлено {added}")
+        if missed:
+            parts.append(f"не нашлось {missed}")
+        lines.append(f"• {s['title']}: " + ", ".join(parts))
     if files:
         lines.append(f"Ваших загруженных файлов нет в Spotify: {files}. Их можно получить в чат кнопкой во вкладке "
                      "«Перенос» и добавить в Spotify на компьютере как локальные файлы.")

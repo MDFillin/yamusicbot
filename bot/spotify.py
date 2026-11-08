@@ -195,20 +195,24 @@ class Spotify:
     async def playlists(self) -> list[dict[str, Any]]:
         return [p async for p in self._pages("/me/playlists") if p]
 
+    async def liked_tracks(self) -> list[dict[str, Any]]:
+        """Все «Любимые треки» (вместе с локальными файлами, если их туда добавляли)."""
+        return [i["track"] async for i in self._pages("/me/tracks") if i and i.get("track")]
+
+    async def playlist_items(self, playlist_id: str) -> list[dict[str, Any]]:
+        """Треки своего плейлиста по порядку (чужие плейлисты Spotify с 2026 года не отдаёт)."""
+        result = []
+        async for i in self._pages(f"/playlists/{playlist_id}/items"):
+            track = i.get("item") or i.get("track") if i else None
+            if track and track.get("uri"):
+                result.append(track)
+        return result
+
     async def search_tracks(self, query: str) -> list[dict[str, Any]]:
         data = await self.request("GET", "/search", params={"q": query, "type": "track", "limit": SEARCH_LIMIT})
         return [t for t in ((data or {}).get("tracks") or {}).get("items") or [] if t]
 
     # ---------- запись ----------
-
-    async def library_contains(self, uris: Sequence[str]) -> list[bool]:
-        result: list[bool] = []
-        for i in range(0, len(uris), LIBRARY_BATCH):
-            batch = list(uris[i:i + LIBRARY_BATCH])
-            data = await self.request("GET", "/me/library/contains", params={"uris": ",".join(batch)})
-            ok = isinstance(data, list) and len(data) == len(batch)
-            result += [bool(x) for x in data] if ok else [False] * len(batch)
-        return result
 
     async def save_tracks(self, uris: Sequence[str], on_saved=None) -> None:
         """В «Любимые треки» по одному, от старых к новым: дата добавления у каждого своя — порядок как задан."""
@@ -226,16 +230,13 @@ class Spotify:
         return await self.request("POST", "/me/playlists",
                                   json={"name": name[:100], "public": False, "description": description[:300]})
 
-    async def replace_playlist(self, playlist_id: str, uris: Sequence[str]) -> None:
-        """Содержимое плейлиста — ровно uris в этом порядке (первые 100 заменяют всё, остальные дописываются)."""
-        await self.request("PUT", f"/playlists/{playlist_id}/items", json={"uris": list(uris[:PLAYLIST_BATCH])})
-        if len(uris) > PLAYLIST_BATCH:
-            await self.add_to_playlist(playlist_id, uris[PLAYLIST_BATCH:])
-
-    async def add_to_playlist(self, playlist_id: str, uris: Sequence[str]) -> None:
+    async def add_to_playlist(self, playlist_id: str, uris: Sequence[str], position: int | None = None) -> None:
+        """В конец или, если задана position, начиная с этого места — в том же порядке."""
         for i in range(0, len(uris), PLAYLIST_BATCH):
-            batch = list(uris[i:i + PLAYLIST_BATCH])
-            await self.request("POST", f"/playlists/{playlist_id}/items", json={"uris": batch})
+            body: dict[str, Any] = {"uris": list(uris[i:i + PLAYLIST_BATCH])}
+            if position is not None:
+                body["position"] = position + i
+            await self.request("POST", f"/playlists/{playlist_id}/items", json=body)
 
 
 def _error_text(text: str) -> str:

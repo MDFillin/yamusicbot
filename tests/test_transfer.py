@@ -48,20 +48,31 @@ def sp_track(uri: str, name: str, artist: str, ms: int = 200_000) -> dict:
 class FakeSpotify:
     def __init__(self, catalog: dict[str, list[dict]] | None = None) -> None:
         self.catalog = catalog or {}
+        self.tracks = {t["uri"]: t for ts in self.catalog.values() for t in ts}
         self.searches: list[str] = []
-        self.saved: list[str] = []
-        self.playlists: list[tuple[str, list[str]]] = []
-        self.replaced: list[tuple[str, list[str]]] = []
+        self.saved: list[str] = []  # «Любимые» по порядку добавления
+        self.pls: list[tuple[str, list[str]]] = []
+        self.inserts: list[tuple[str, int | None, list[str]]] = []
+
+    def add_known(self, *tracks):
+        for t in tracks:
+            self.tracks[t["uri"]] = t
 
     async def me(self):
-        return {"display_name": "Андрей"}
+        return {"id": "me", "display_name": "Андрей"}
+
+    async def liked_tracks(self):
+        return [self.tracks[u] for u in reversed(self.saved)]
+
+    async def playlists(self):
+        return [{"id": f"p{i + 1}", "name": name, "owner": {"id": "me"}} for i, (name, _) in enumerate(self.pls)]
+
+    async def playlist_items(self, playlist_id):
+        return [self.tracks[u] for u in self.pls[int(playlist_id[1:]) - 1][1]]
 
     async def search_tracks(self, query):
         self.searches.append(query)
         return [t for key, tracks in self.catalog.items() if key.lower() in query.lower() for t in tracks]
-
-    async def library_contains(self, uris):
-        return [u in self.saved for u in uris]
 
     async def save_tracks(self, uris, on_saved=None):
         for uri in uris:
@@ -69,16 +80,15 @@ class FakeSpotify:
             if on_saved and on_saved(uri) is False:
                 return
 
-    async def replace_playlist(self, playlist_id, uris):
-        self.replaced.append((playlist_id, list(uris)))
-        self.playlists[int(playlist_id[1:]) - 1] = (self.playlists[int(playlist_id[1:]) - 1][0], list(uris))
 
     async def create_playlist(self, name, description=""):
-        self.playlists.append((name, []))
-        return {"id": f"p{len(self.playlists)}", "external_urls": {"spotify": f"https://open.spotify.com/playlist/p{len(self.playlists)}"}}
+        self.pls.append((name, []))
+        return {"id": f"p{len(self.pls)}"}
 
-    async def add_to_playlist(self, playlist_id, uris):
-        self.playlists[int(playlist_id[1:]) - 1][1].extend(uris)
+    async def add_to_playlist(self, playlist_id, uris, position=None):
+        self.inserts.append((playlist_id, position, list(uris)))
+        items = self.pls[int(playlist_id[1:]) - 1][1]
+        items[len(items) if position is None else position:len(items) if position is None else position] = uris
 
 
 async def test_find_tries_translit_and_picks_best():
@@ -109,10 +119,6 @@ async def spotify_api():
         calls.append(("library", request.headers["Authorization"], request.query["uris"].split(",")))
         return web.Response(status=200)
 
-    async def contains(request):
-        uris = request.query["uris"].split(",")
-        calls.append(("contains", uris))
-        return web.json_response([u.endswith("0") for u in uris])
 
     async def items(request):
         calls.append(("items", request.match_info["id"], (await request.json())["uris"]))
@@ -125,7 +131,6 @@ async def spotify_api():
 
     app.router.add_post("/api/token", token)
     app.router.add_put("/v1/me/library", library)
-    app.router.add_get("/v1/me/library/contains", contains)
     app.router.add_post("/v1/playlists/{id}/items", items)
     app.router.add_get("/v1/me", me)
     server = TestServer(app)
@@ -146,9 +151,6 @@ async def test_spotify_refreshes_token_retries_429_and_batches(spotify_api):
     uris = [f"spotify:track:{i}" for i in range(85)]
     await sp.save_tracks(uris[:3])
     await sp.add_to_playlist("pl", uris + uris + uris)
-    contains = await sp.library_contains(uris)
-    assert contains == [u.endswith("0") for u in uris]
-    assert [len(c[1]) for c in spotify_api.calls if c[0] == "contains"] == [40, 40, 5]
     token = [c for c in spotify_api.calls if c[0] == "token"]
     assert token[0][1] == {"grant_type": "refresh_token", "refresh_token": "R1", "client_id": "c" * 32}
     assert len(token) == 1 and saved and saved[0].access == "A2" and saved[0].refresh == "R2"
@@ -193,7 +195,7 @@ async def test_transfer_likes_and_playlist(tmp_path):
     job = await wait_job(transfers, 1)
     assert job.state["status"] == "done"
     assert sp.saved == ["spotify:track:k", "spotify:track:g"], "в Spotify — от старых лайков к новым"
-    assert sp.playlists == [("Мои записи", ["spotify:track:k", "spotify:track:g"])]
+    assert sp.pls == [("Мои записи", ["spotify:track:k", "spotify:track:g"])]
     likes, playlist = job.state["sources"]
     assert (likes["total"], likes["done"], likes["found"]) == (3, 3, 2)
     assert likes["missed"] == [{"title": "Нет в Spotify", "artists": "Кино", "id": "3", "ugc": False, "pos": 3}]
@@ -201,16 +203,16 @@ async def test_transfer_likes_and_playlist(tmp_path):
     assert playlist["url"] == "https://open.spotify.com/playlist/p1" and playlist["already"] == 2, "пары запомнены"
     assert store.last_transfer_job(1)[2] == "done"
     [(user, text)] = sent
-    assert user == 1 and "перенесено 2 из 3, не нашлось 1" in text
+    assert user == 1 and "Мне нравится: в Spotify 2 из 3, не нашлось 1" in text
 
     searches = len(sp.searches)
     transfers.start(1, ym_with_library(), sp, [SourcePick("likes"), SourcePick("pl", "42.1003")])
     job = await wait_job(transfers, 1)
     assert len(sp.searches) == searches, "второй раз — без поиска: найденное и «не нашли» в кэше"
     assert sp.saved == ["spotify:track:k", "spotify:track:g"], "уже сохранённые лайки не трогаем — порядок цел"
-    assert job.state["sources"][0]["to_save"] == 0
-    assert len(sp.playlists) == 1 and sp.replaced == [("p1", ["spotify:track:k", "spotify:track:g"])], \
-        "тот же плейлист обновлён, а не создан второй"
+    likes, playlist = job.state["sources"]
+    assert (likes["to_save"], likes["in_spotify"], playlist["to_save"], playlist["in_spotify"]) == (0, 2, 0, 2)
+    assert len(sp.pls) == 1, "тот же плейлист, а не второй"
     store.set_match(YM2SP, "3", None)
     store._db.execute("UPDATE transfer_matches SET at = 0 WHERE src_id = '3'")
     transfers.start(1, ym_with_library(), sp, [SourcePick("likes")])
@@ -336,7 +338,7 @@ async def test_uploaded_files_are_searched_and_kept_in_order(tmp_path):
     transfers.start(1, ym_with_files(), sp, [SourcePick("pl", "42.1003")])
     job = await wait_job(transfers, 1)
     st = job.state["sources"][0]
-    assert sp.playlists == [("Мои записи", ["spotify:track:bitz", "spotify:track:k"])], "порядок как в Яндексе"
+    assert sp.pls == [("Мои записи", ["spotify:track:bitz", "spotify:track:k"])], "порядок как в Яндексе"
     assert st["files_found"] == 1
     assert st["missed"] == [{"title": "Демо с репетиции", "artists": "Я", "id": "u2", "ugc": True, "pos": 3}]
     assert "загруженных файлов нет в Spotify: 1" in summary_text(job.state)
@@ -356,3 +358,48 @@ async def test_send_missing_files_to_chat(tenv, monkeypatch):
     resp = await tenv.client.post("/api/transfer/files")
     assert (await resp.json()) == {"started": True, "count": 3}
     assert calls[0]["items"] == ["a", "b", "c"], "по порядку списков, без каталожных и без повторов"
+
+
+async def test_retransfer_adds_only_new_and_merges_existing(tmp_path):
+    """Год назад перенесли другим сервисом: в «Любимых» уже есть Кукушка (другой версией — другой ID),
+    в Spotify уже есть плейлист «Мои записи» с одним треком и с треком, добавленным вручную."""
+    store = Storage(tmp_path / "bot.db")
+    transfers = Transfers(store)
+    old_k = sp_track("spotify:track:k_from_compilation", "Kukushka - Remastered", "KINO", 201_000)
+    manual = sp_track("spotify:track:manual", "Своё", "Кто-то", 100_000)
+    sp = FakeSpotify({"Кукушка": [sp_track("spotify:track:k", "Kukushka", "Kino", 200_000)],
+                      "Группа крови": [sp_track("spotify:track:g", "Gruppa krovi", "Kino", 200_000)]})
+    sp.add_known(old_k, manual)
+    sp.saved = [old_k["uri"]]
+    sp.pls = [("мои записи", [manual["uri"], "spotify:track:g"])]
+    ym = ym_with_library()
+    ym.playlist.tracks.insert(0, NS(id=3, track=None, track_id="3:10"))  # Нет в Spotify, Кукушка, Группа крови
+
+    transfers.start(1, ym, sp, [SourcePick("likes"), SourcePick("pl", "42.1003")])
+    job = await wait_job(transfers, 1)
+    likes, playlist = job.state["sources"]
+    assert sp.saved == [old_k["uri"], "spotify:track:g"], "Кукушку второй раз не добавили — только новое"
+    assert (likes["in_spotify"], likes["saved"]) == (1, 1)
+    assert len(sp.pls) == 1, "плейлист с тем же названием дополнен, а не создан второй"
+    assert sp.pls[0][1] == [manual["uri"], "spotify:track:k", "spotify:track:g"], \
+        "Кукушка вставлена перед Группой крови, ручное — на месте"
+    assert (playlist["in_spotify"], playlist["saved"]) == (1, 1)
+    assert "1 уже были, добавлено 1" in summary_text(job.state)
+    store.close()
+
+
+@pytest.mark.parametrize(("current", "desired", "result"), [
+    ("", "ABC", "ABC"),
+    ("AC", "ABCD", "ABCD"),
+    ("ABC", "XABC", "XABC"),  # новое сверху — сверху
+    ("AXC", "ABC", "AXBC"),  # X добавлен вручную — остаётся, B встаёт перед C
+    ("ABC", "ABC", "ABC"),
+    ("CBA", "ABCD", "CBAD"),  # переставлено вручную — не трогаем, новое в конец
+    ("AB", "AAB", "AB"),  # повтор в Яндексе — один раз
+])
+def test_merge_plan(current, desired, result):
+    from bot.transfer import merge_plan
+    items = list(current)
+    for pos, uris in merge_plan(list(current), list(desired)):
+        items[pos:pos] = uris
+    assert "".join(items) == result

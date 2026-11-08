@@ -1546,8 +1546,10 @@
       put(body, account, info.job ? resultCard(info.job) : null,
         h('div', { class: 'section-head' }, h('h2', {}, 'Что перенести')), list,
         h('div', { class: 'hint' }, 'Порядок сохраняется как в Яндексе. Лайки попадут в «Любимые треки» Spotify — бот добавляет их ',
-          'по одному, от старых к новым, примерно секунда на трек. Плейлисты появятся в Spotify с теми же названиями ',
-          '(при повторном переносе обновятся, а не задвоятся). Ваши загруженные файлы бот тоже ищет в Spotify; ',
+          'по одному, от старых к новым, примерно секунда на трек. Плейлисты появятся в Spotify с теми же названиями. ',
+          'Повторять перенос можно сколько угодно: что уже есть в Spotify (даже перенесённое раньше другим сервисом ',
+          'или другой версией), бот узнает и не добавит второй раз — добавится только новое, а плейлист с тем же ',
+          'названием дополнится, не теряя того, что вы добавили в Spotify сами. Ваши загруженные файлы бот тоже ищет в Spotify; ',
           'каких там нет — пришлёт в чат, чтобы добавить их в Spotify на компьютере.'),
         go);
       let src;
@@ -1582,15 +1584,23 @@
     }
 
     // ----- шаг 3: прогресс и итог -----
+    function transferStats(s) {
+      const parts = [`в Spotify ${s.found} из ${s.total}`];
+      if (s.in_spotify) parts.push(`${s.in_spotify} уже были`, `добавлено ${s.saved || 0}`);
+      return parts.join(' · ');
+    }
+
     function sourceLine(s) {
       let sub = 'ждёт очереди';
       if (s.phase === 'saving' && s.src === 'likes' && s.to_save != null) {
         const left = Math.max(0, s.to_save - s.saved);
         sub = `добавляю в «Любимые» по порядку: ${s.saved} из ${s.to_save}` + (left > 60 ? ` · ещё ~${Math.ceil(left * 1.2 / 60)} мин` : '');
       } else if (s.phase === 'saving') {
-        sub = 'собираю плейлист в Spotify…';
+        sub = s.to_save ? `добавляю в плейлист: ${s.saved || 0} из ${s.to_save}` : 'сверяю плейлист в Spotify…';
+      } else if (s.phase === 'library') {
+        sub = 'смотрю, что уже есть в Spotify…';
       } else if (s.phase === 'done') {
-        sub = `готово · перенесено ${s.found} из ${s.total}`;
+        sub = transferStats(s);
       } else if (s.total != null) {
         sub = `ищу в Spotify: ${s.done} из ${s.total} · найдено ${s.found}`;
       }
@@ -1624,7 +1634,7 @@
         job.error ? h('div', { class: 'sub err' }, job.error) : null,
         job.sources.filter((s) => s.total != null).map((s) => h('div', { class: 'transfer-src' },
           h('div', { class: 'meta' }, h('div', { class: 'title' }, s.title),
-            h('div', { class: 'sub' }, `перенесено ${s.found} из ${s.total}`)),
+            h('div', { class: 'sub' }, transferStats(s))),
           s.url ? h('button', { class: 'link-btn', onclick: () => openLink(s.url) }, 'Открыть') : null)),
         missed.length ? h('button', { class: 'link-btn', onclick: () => missedSheet(job) },
           `Не нашлось: ${missed.length} — показать`) : null,
