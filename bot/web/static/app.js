@@ -62,6 +62,7 @@
     alert: '<path d="m10.3 3.9-8.2 14a2 2 0 0 0 1.7 3h16.4a2 2 0 0 0 1.7-3l-8.2-14a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
     ban: '<circle cx="12" cy="12" r="9"/><path d="m5.7 5.7 12.6 12.6"/>',
     server: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+    swap: '<path d="M7 4 3 8l4 4"/><path d="M3 8h14"/><path d="m17 20 4-4-4-4"/><path d="M21 16H7"/>',
     wave: '<path d="M2 9c2.5-3 4.5-3 7 0s4.5 3 7 0 3.5-3 6-1"/><path d="M2 15c2.5-3 4.5-3 7 0s4.5 3 7 0 3.5-3 6-1"/>',
     dislike: '<path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.7a2 2 0 0 0-2 1.7l-1.4 9A2 2 0 0 0 4.3 15z"/><path d="M17 2h3a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-3"/>',
     save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
@@ -331,7 +332,7 @@
   // ---------- навигация: у каждой вкладки свой стек экранов ----------
   // Экраны не пересоздаются при возврате «назад»: остаются прокрутка и уже загруженные треки.
   const view = $('#view');
-  let stacks = { library: [], search: [], upload: [] };
+  let stacks = { library: [], search: [], upload: [], transfer: [] };
   const stackOf = () => stacks[state.tab] || [];
   const top = () => stackOf()[stackOf().length - 1];
 
@@ -389,7 +390,7 @@
 
   function resetNav() {
     for (const s of Object.values(stacks)) s.forEach((e) => { e.dead = true; });
-    stacks = { library: [], search: [], upload: [] };
+    stacks = { library: [], search: [], upload: [], transfer: [] };
     state.tab = null;
   }
 
@@ -1444,6 +1445,190 @@
     } catch (e) { fail(e); }
   }
 
+  // ---------- перенос между сервисами (bot/transfer.py) ----------
+  // У каждого своё приложение Spotify (так требуют правила Spotify 2026 года): человек создаёт его на
+  // developer.spotify.com, вставляет сюда Client ID и входит. Секрет приложения не нужен (вход по PKCE).
+  const SPOTIFY_DASHBOARD = 'https://developer.spotify.com/dashboard';
+
+  function transferView(root, alive, entry) {
+    const body = h('div', { class: 'transfer' }, h('div', { class: 'spinner' }));
+    root.append(
+      h('h1', { class: 'page-title' }, 'Перенос'),
+      h('div', { class: 'hint transfer-lead' }, 'Лайки и плейлисты из Яндекс Музыки — в Spotify.'),
+      h('div', { class: 'seg-full transfer-dir' },
+        h('button', { class: 'on' }, h('b', {}, 'Яндекс → Spotify')),
+        h('button', { disabled: true, onclick: () => toast('Скоро') }, h('b', {}, 'Spotify → Яндекс'), h('span', {}, 'скоро'))),
+      body);
+    let info = null;
+    let timer = null;
+    let picked = null; // выбранные источники: ключ → {src, ref}
+
+    async function load() {
+      clearTimeout(timer);
+      try {
+        info = await api('/api/transfer');
+      } catch (e) { if (alive()) put(body, emptyEl('alert', e.message)); return; }
+      if (!alive()) return;
+      draw();
+    }
+    entry.onShow = load;
+
+    function draw() {
+      const job = info.job;
+      if (job && job.status === 'running') {
+        drawProgress(job);
+        timer = setTimeout(() => { if (alive() && state.tab === 'transfer') load(); }, 2000);
+      } else if (!info.redirect_uri) {
+        put(body, emptyEl('alert', 'Перенос не настроен: у бота не задан адрес мини-приложения (WEBAPP_URL).'));
+      } else if (!info.spotify || !info.spotify.connected) {
+        drawConnect();
+      } else {
+        drawPick();
+      }
+    }
+
+    // ----- шаг 1: своё приложение Spotify и вход -----
+    function drawConnect() {
+      const sp = info.spotify;
+      const input = h('input', { class: 'text mono', placeholder: '32 символа, например 1a2b3c…', value: (sp && sp.client_id) || '',
+        maxLength: 40, autocomplete: 'off', autocapitalize: 'off', spellcheck: false, enterKeyHint: 'done' });
+      const loginBtn = h('button', { class: 'btn block', disabled: !(sp && sp.client_id) }, icon('external', 'sm'), 'Войти в Spotify');
+      const saveId = async () => {
+        const value = input.value.trim().toLowerCase();
+        if (sp && sp.client_id === value) return true;
+        try {
+          await api('/api/transfer/spotify', { method: 'PUT', body: { client_id: value } });
+          info.spotify = { client_id: value, connected: false, name: null };
+          loginBtn.disabled = false;
+          return true;
+        } catch (e) { fail(e); return false; }
+      };
+      input.addEventListener('input', () => { loginBtn.disabled = !/^[0-9a-f]{32}$/i.test(input.value.trim()); });
+      loginBtn.addEventListener('click', async () => {
+        haptic.tap();
+        if (!(await saveId())) return;
+        try {
+          const r = await api('/api/transfer/spotify/login', { method: 'POST' });
+          openLink(r.url);
+          toast('После входа вернитесь сюда', 4000);
+        } catch (e) { fail(e); }
+      });
+      const uri = h('code', { class: 'copy-code' }, info.redirect_uri);
+      put(body,
+        h('ol', { class: 'steps transfer-steps' },
+          h('li', {}, h('b', {}, 'Создайте приложение Spotify'),
+            'Войдите на сайт для разработчиков Spotify аккаунтом с Premium (так требует Spotify) и нажмите ',
+            h('i', {}, 'Create app'), '. Название и описание — любые.',
+            h('button', { class: 'btn secondary small', onclick: () => openLink(SPOTIFY_DASHBOARD) }, icon('external', 'sm'), 'Открыть сайт Spotify')),
+          h('li', {}, h('b', {}, 'Вставьте Redirect URI'),
+            'В поле ', h('i', {}, 'Redirect URIs'), ' добавьте этот адрес, в ', h('i', {}, 'APIs used'), ' отметьте ',
+            h('i', {}, 'Web API'), ', согласитесь с условиями и сохраните.',
+            h('div', { class: 'copy-row' }, uri,
+              h('button', { class: 'icon-btn', 'aria-label': 'Скопировать', onclick: () => { haptic.tap(); copyText(info.redirect_uri); } }, icon('copy', 'sm')))),
+          h('li', {}, h('b', {}, 'Скопируйте Client ID'),
+            'Он на странице приложения, в ', h('i', {}, 'Settings'), '. Секрет (Client secret) не нужен — никуда его не вставляйте.',
+            input),
+          h('li', {}, h('b', {}, 'Войдите в Spotify'), 'Тем же аккаунтом, на который создали приложение.', loginBtn)),
+        h('div', { class: 'hint' }, 'Другие аккаунты Spotify приложение пустит, только если добавить их email в ',
+          h('i', {}, 'User Management'), ' (до 5 человек).'),
+        h('button', { class: 'btn secondary block', onclick: () => { haptic.tap(); load(); } }, icon('refresh', 'sm'), 'Я вошёл — проверить'));
+    }
+
+    // ----- шаг 2: что переносить -----
+    async function drawPick() {
+      const sp = info.spotify;
+      const account = h('div', { class: 'card transfer-account' },
+        h('div', { class: 'row' }, h('span', { class: 'sp-logo' }, icon('music', 'sm')),
+          h('div', { class: 'meta' }, h('div', { class: 'title' }, sp.name || 'Spotify'), h('div', { class: 'sub' }, 'Spotify подключён')),
+          h('button', { class: 'link-btn', onclick: disconnect }, 'Выйти')));
+      const list = h('div', { class: 'card list' }, skRows(3));
+      const go = h('button', { class: 'btn block big' }, 'Перенести');
+      put(body, account, info.job ? resultCard(info.job) : null,
+        h('div', { class: 'section-head' }, h('h2', {}, 'Что перенести')), list,
+        h('div', { class: 'hint' }, 'Лайки попадут в «Любимые треки» Spotify, плейлисты — новыми плейлистами с теми же названиями. ',
+          'Каждый трек бот ищет в Spotify по названию, исполнителю и длительности; что не нашлось — покажет списком.'),
+        go);
+      let src;
+      try { src = await api('/api/transfer/sources'); } catch (e) { if (alive()) put(list, emptyEl('alert', e.message)); return; }
+      if (!alive()) return;
+      if (!picked) picked = { likes: { src: 'likes' } };
+      const drawGo = () => {
+        const n = Object.keys(picked).length;
+        go.disabled = !n;
+        go.textContent = n ? `Перенести (${n})` : 'Выберите, что перенести';
+      };
+      const choose = (key, value) => (on) => { if (on) picked[key] = value; else delete picked[key]; drawGo(); };
+      put(list,
+        toggleRow('heart', 'Мне нравится', tracksWord(src.likes), !!picked.likes, choose('likes', { src: 'likes' })),
+        src.playlists.filter((p) => p.count > 0).map((p) => toggleRow('list', p.title, tracksWord(p.count),
+          !!picked[`pl:${p.ref}`], choose(`pl:${p.ref}`, { src: 'pl', ref: p.ref }))));
+      drawGo();
+      go.addEventListener('click', async () => {
+        haptic.tap();
+        go.disabled = true;
+        try {
+          const r = await api('/api/transfer/start', { method: 'POST', body: { sources: Object.values(picked) } });
+          info.job = r.job;
+          draw();
+        } catch (e) { fail(e); drawGo(); }
+      });
+    }
+
+    async function disconnect() {
+      if (!(await confirmAsk('Отключить Spotify? Приложение (Client ID) бот запомнит — войти снова можно в один шаг.'))) return;
+      try { await api('/api/transfer/spotify', { method: 'DELETE' }); load(); } catch (e) { fail(e); }
+    }
+
+    // ----- шаг 3: прогресс и итог -----
+    function sourceLine(s) {
+      const total = s.total == null ? '…' : s.total;
+      return h('div', { class: 'transfer-src' },
+        h('div', { class: 'title' }, s.title),
+        h('div', { class: 'sub' }, s.total == null ? 'ждёт очереди' : `${s.done} из ${total} · найдено ${s.found}`));
+    }
+
+    function drawProgress(job) {
+      const total = job.sources.reduce((a, s) => a + (s.total || 0), 0);
+      const done = job.sources.reduce((a, s) => a + (s.done || 0), 0);
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      const cur = job.sources[job.current] || job.sources[0];
+      put(body, h('div', { class: 'card transfer-progress' },
+        h('div', { class: 'transfer-pct' }, `${pct}%`),
+        h('div', { class: 'sub' }, cur ? `Сейчас: ${cur.title}` : 'Начинаю…'),
+        h('div', { class: 'progress' }, h('div', { style: `width: ${pct}%` })),
+        h('div', { class: 'transfer-srcs' }, job.sources.map(sourceLine)),
+        h('button', { class: 'btn secondary block danger', onclick: async () => {
+          if (!(await confirmAsk('Остановить перенос? Уже найденное бот запомнит — в следующий раз будет быстрее.'))) return;
+          try { await api('/api/transfer/cancel', { method: 'POST' }); load(); } catch (e) { fail(e); }
+        } }, 'Остановить')),
+        h('div', { class: 'hint' }, 'Можно закрыть приложение: перенос идёт на сервере, а когда закончится — бот напишет в чат.'));
+    }
+
+    function resultCard(job) {
+      const head = { done: 'Перенос закончен', cancelled: 'Перенос остановлен', failed: 'Перенос прервался',
+        interrupted: 'Перенос прервался: бот перезапускался' }[job.status] || 'Прошлый перенос';
+      const missed = job.sources.flatMap((s) => s.missed || []);
+      return h('div', { class: `card transfer-result ${job.status}` },
+        h('div', { class: 'title' }, head),
+        job.error ? h('div', { class: 'sub err' }, job.error) : null,
+        job.sources.filter((s) => s.total != null).map((s) => h('div', { class: 'transfer-src' },
+          h('div', { class: 'meta' }, h('div', { class: 'title' }, s.title),
+            h('div', { class: 'sub' }, `перенесено ${s.found} из ${s.total}`)),
+          s.url ? h('button', { class: 'link-btn', onclick: () => openLink(s.url) }, 'Открыть') : null)),
+        missed.length ? h('button', { class: 'link-btn', onclick: () => missedSheet(missed) },
+          `Не нашлось: ${missed.length} — показать`) : null);
+    }
+
+    function missedSheet(missed) {
+      openSheet([
+        h('div', { class: 'sheet-title' }, `Не нашлось в Spotify: ${missed.length}`),
+        h('div', { class: 'card list' }, missed.map((m) => h('div', { class: 'row' },
+          h('div', { class: 'meta' }, h('div', { class: 'title' }, m.title), h('div', { class: 'sub' }, m.artists))))),
+        h('div', { class: 'sheet-note' }, 'Обычно это треки, которых нет в Spotify, загруженные вами файлы или другие версии (ремиксы, slowed). Их можно найти и добавить вручную.'),
+      ]);
+    }
+  }
+
   // ---------- общие плейлисты (bot/shared.py) ----------
   const SHARED_HOW = 'Добавляйте и удаляйте треки прямо в приложении Яндекс Музыки — у остальных изменения появятся в течение нескольких минут, и наоборот.';
 
@@ -2386,7 +2571,7 @@
     loadLibrary().then(ready).catch(fail);
   }
 
-  const ROOTS = { library: libraryView, search: searchView, upload: uploadView };
+  const ROOTS = { library: libraryView, search: searchView, upload: uploadView, transfer: transferView };
 
   // ---------- вход в Яндекс Музыку ----------
   function showLogin(switching = false) {
@@ -2781,7 +2966,8 @@
   function boot() {
     extendTunnelConsent();
     applyPrefs();
-    const labels = { library: ['library', 'Медиатека'], search: ['search', 'Поиск'], upload: ['upload', 'Загрузка'] };
+    const labels = { library: ['library', 'Медиатека'], search: ['search', 'Поиск'], upload: ['upload', 'Загрузка'],
+      transfer: ['swap', 'Перенос'] };
     document.querySelectorAll('#tabs button').forEach((b) => {
       const [ic, label] = labels[b.dataset.tab];
       put(b, h('span', { class: 'pill' }, icon(ic)), label);

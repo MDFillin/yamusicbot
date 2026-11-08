@@ -35,6 +35,10 @@ Telegram-бот на aiogram и мини-приложение («Медиате�
   и жанрами/эпохами из rotor/stations/list, отклики trackStarted/trackFinished/skip.
 - На сервере Caddy общий с MeshCentral (udalenka666.duckdns.org): `docker-compose.override.yml` + `Caddyfile` лежат
   только на сервере, не в git (попадают в ночную копию). Пересобирать бота — `docker compose up -d --build bot`.
+- Перенос Яндекс → Spotify — вкладка «Перенос» (bot/spotify.py, bot/transfer.py, bot/web/transfer_api.py).
+  Своё приложение Spotify у каждого пользователя (Client ID + PKCE): у dev-mode приложений с 2026 года лимит
+  5 пользователей и нужен Premium владельца. Эндпоинты — по февральским правилам 2026: /me/playlists,
+  /playlists/{id}/items, PUT /me/library (по 40), поиск по 10. Следующий шаг — Spotify → Яндекс.
 - Ночная копия: cron в 01:17 UTC запускает `scripts/backup.sh` с паролем из `~/.yamusicbot-backup-pass`; архив
   (бот + `~/.claude` + crontab) приходит владельцу в Telegram. Лог — `~/yamusicbot-backup.log`.
 

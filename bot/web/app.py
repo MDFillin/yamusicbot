@@ -1050,7 +1050,7 @@ async def _cleanup(app: web.Application) -> None:
 def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sender: TrackSender,
                placer: TopPlacer | None = None, admin: Admin | None = None,
                listening: Listening | None = None, shared: SharedPlaylists | None = None) -> web.Application:
-    from bot.web import admin_api, stats_api  # модули берут CTX и USER отсюда
+    from bot.web import admin_api, stats_api, transfer_api  # модули берут CTX и USER отсюда
     app = web.Application(
         client_max_size=config.web_max_upload_mb * 1024 * 1024,
         middlewares=[compress_middleware, errors_middleware, auth_middleware],
@@ -1062,6 +1062,7 @@ def create_app(config: Config, bot: Bot, accounts: Accounts, store: Storage, sen
     app.add_routes(routes)
     app.add_routes(admin_api.routes)
     app.add_routes(stats_api.routes)
+    transfer_api.setup(app)
     app.on_response_prepare.append(security_headers)
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)

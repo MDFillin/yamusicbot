@@ -194,6 +194,33 @@ CREATE TABLE IF NOT EXISTS shared_seen (
     track_id TEXT NOT NULL,
     PRIMARY KEY (shared_id, user_id, track_id)
 );
+-- Перенос музыки между сервисами (bot/transfer.py). Вход в Spotify: у каждого своё приложение (Client ID),
+-- токены зашифрованы, как и вход в Яндекс.
+CREATE TABLE IF NOT EXISTS spotify_accounts (
+    user_id INTEGER PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    tokens TEXT,                   -- JSON токенов, зашифрованный; NULL — приложение задано, но вход не выполнен
+    name TEXT,                     -- имя в Spotify
+    connected_at INTEGER
+);
+-- Найденные соответствия треков (общие для всех: каталог один). dst_id NULL — не нашли.
+CREATE TABLE IF NOT EXISTS transfer_matches (
+    direction TEXT NOT NULL,       -- ym2sp | sp2ym
+    src_id TEXT NOT NULL,
+    dst_id TEXT,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (direction, src_id)
+);
+CREATE TABLE IF NOT EXISTS transfer_jobs (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    direction TEXT NOT NULL,
+    status TEXT NOT NULL,          -- running | done | cancelled | failed | interrupted
+    state TEXT NOT NULL,           -- JSON: источники, прогресс, что не нашлось
+    created_at INTEGER NOT NULL,
+    finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS transfer_jobs_user ON transfer_jobs (user_id, id);
 CREATE INDEX IF NOT EXISTS shared_members_user ON shared_members (user_id);
 CREATE INDEX IF NOT EXISTS plays_user_day ON plays (user_id, day);
 CREATE INDEX IF NOT EXISTS listens_user_track ON listens (user_id, track_id);
@@ -252,6 +279,77 @@ class Storage:
 
     def _all(self, sql: str, *args) -> list[tuple]:
         return self._db.execute(sql, args).fetchall()
+
+    # ---------- перенос музыки (bot/transfer.py) ----------
+
+    def get_spotify(self, user_id: int) -> tuple[str, dict | None, str | None] | None:
+        """(Client ID, токены или None, имя в Spotify) или None, если Spotify не настраивали."""
+        row = self._one("SELECT client_id, tokens, name FROM spotify_accounts WHERE user_id = ?", user_id)
+        if row is None:
+            return None
+        tokens = None
+        if row[1]:
+            try:
+                tokens = json.loads(self._cipher.decrypt(row[1]))
+            except (KeyMismatch, ValueError):
+                log.error("Вход в Spotify пользователя %s не расшифровывается — нужно войти заново", user_id)
+        return row[0], tokens, row[2]
+
+    def set_spotify_client(self, user_id: int, client_id: str) -> None:
+        """Новое приложение — прежний вход к нему не подходит."""
+        self._db.execute(
+            "INSERT INTO spotify_accounts (user_id, client_id) VALUES (?, ?) ON CONFLICT (user_id) DO UPDATE SET "
+            "client_id = excluded.client_id, tokens = NULL, name = NULL, connected_at = NULL", (user_id, client_id))
+
+    def set_spotify_tokens(self, user_id: int, tokens: dict, name: str | None = None) -> None:
+        if name is None:
+            self._db.execute("UPDATE spotify_accounts SET tokens = ? WHERE user_id = ?",
+                             (self._cipher.encrypt(json.dumps(tokens)), user_id))
+        else:
+            self._db.execute("UPDATE spotify_accounts SET tokens = ?, name = ?, connected_at = ? WHERE user_id = ?",
+                             (self._cipher.encrypt(json.dumps(tokens)), name, int(time.time()), user_id))
+
+    def forget_spotify_login(self, user_id: int) -> None:
+        self._db.execute("UPDATE spotify_accounts SET tokens = NULL, name = NULL, connected_at = NULL "
+                         "WHERE user_id = ?", (user_id,))
+
+    def get_matches(self, direction: str, src_ids: list[str]) -> dict[str, tuple[str | None, int]]:
+        result: dict[str, tuple[str | None, int]] = {}
+        for i in range(0, len(src_ids), 500):
+            chunk = src_ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            for src, dst, at in self._all(
+                    f"SELECT src_id, dst_id, at FROM transfer_matches WHERE direction = ? AND src_id IN ({marks})",
+                    direction, *chunk):
+                result[src] = (dst, at)
+        return result
+
+    def set_match(self, direction: str, src_id: str, dst_id: str | None) -> None:
+        self._db.execute("INSERT OR REPLACE INTO transfer_matches (direction, src_id, dst_id, at) VALUES (?, ?, ?, ?)",
+                         (direction, src_id, dst_id, int(time.time())))
+
+    def add_transfer_job(self, user_id: int, direction: str, state: dict) -> int:
+        cur = self._db.execute(
+            "INSERT INTO transfer_jobs (user_id, direction, status, state, created_at) VALUES (?, ?, 'running', ?, ?)",
+            (user_id, direction, json.dumps(state, ensure_ascii=False), int(time.time())))
+        return int(cur.lastrowid)
+
+    def update_transfer_job(self, job_id: int, status: str, state: dict) -> None:
+        finished = None if status == "running" else int(time.time())
+        self._db.execute("UPDATE transfer_jobs SET status = ?, state = ?, finished_at = ? WHERE id = ?",
+                         (status, json.dumps(state, ensure_ascii=False), finished, job_id))
+
+    def last_transfer_job(self, user_id: int) -> tuple[int, str, str, dict] | None:
+        """(id, направление, статус, состояние) последнего переноса."""
+        row = self._one("SELECT id, direction, status, state FROM transfer_jobs WHERE user_id = ? ORDER BY id DESC "
+                        "LIMIT 1", user_id)
+        return (row[0], row[1], row[2], json.loads(row[3])) if row else None
+
+    def interrupt_transfer_jobs(self) -> int:
+        """После перезапуска бота незаконченные переносы помечаются прерванными (их можно запустить снова)."""
+        cur = self._db.execute("UPDATE transfer_jobs SET status = 'interrupted', finished_at = ? "
+                               "WHERE status = 'running'", (int(time.time()),))
+        return cur.rowcount
 
     def backup(self, dest: Path) -> None:
         """Целостная копия базы (можно делать на ходу)."""

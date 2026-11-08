@@ -629,3 +629,35 @@ details.log pre {
 .new-artists .chip { background: var(--surface); }
 .stats-intro .perks { margin: 2px 0 0; gap: 0; }
 .stats-intro .perks li { padding: 6px 0; }
+
+/* ---------- «Перенос» ---------- */
+.transfer-lead { margin: 4px 2px 14px; font-size: 14px; }
+.transfer-dir { margin-bottom: 18px; }
+.transfer-dir button[disabled] { opacity: .55; }
+.transfer-steps { max-width: none; }
+.transfer-steps li { line-height: 1.45; font-size: 14px; color: var(--hint); }
+.transfer-steps li b { color: var(--text); font-size: 15px; }
+.transfer-steps li i { font-style: normal; font-weight: 600; color: var(--text); }
+.transfer-steps .btn { margin-top: 12px; }
+.btn.small { height: 40px; padding: 0 14px; font-size: 14px; }
+.transfer input.text { display: block; width: 100%; height: 46px; margin-top: 12px; border-radius: 12px; border: 0; padding: 0 12px;
+  background: var(--bg); color: var(--text); outline: none; font-size: 15px; }
+.transfer input.text:focus { box-shadow: 0 0 0 2px var(--accent); }
+.mono, .copy-code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.copy-row { display: flex; align-items: center; gap: 6px; margin-top: 12px; padding: 4px 4px 4px 12px; border-radius: 12px; background: var(--bg); }
+.copy-code { flex: 1; min-width: 0; font-size: 13px; color: var(--text); word-break: break-all; }
+.transfer > .btn, .transfer > .hint { margin-top: 14px; }
+.transfer-account { margin-bottom: 12px; }
+.sp-logo { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; background: #1ed760; color: #000; flex: none; }
+.transfer-progress, .transfer-result { padding: 16px; display: grid; gap: 8px; margin-bottom: 12px; }
+.transfer-pct { font-size: 34px; font-weight: 800; letter-spacing: -.02em; }
+.transfer-progress .progress { margin: 4px 0 6px; }
+.transfer-srcs { display: grid; gap: 8px; margin-bottom: 6px; }
+.transfer-src { display: flex; align-items: center; gap: 10px; }
+.transfer-src .meta { flex: 1; min-width: 0; }
+.transfer-src .title, .transfer-result > .title { font-weight: 600; }
+.transfer-result > .title { font-size: 17px; }
+.transfer-src .sub, .transfer-progress > .sub { color: var(--hint); font-size: 13px; }
+.transfer-result .err { color: var(--danger); font-size: 14px; }
+.transfer-result.done > .title::before { content: "✅ "; }
+.transfer-result.failed > .title::before, .transfer-result.interrupted > .title::before { content: "⚠️ "; }
