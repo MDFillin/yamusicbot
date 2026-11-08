@@ -34,7 +34,7 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API = "https://api.spotify.com/v1"
 SCOPES = " ".join((
-    "user-library-read", "user-library-modify", "user-follow-modify",
+    "user-library-read", "user-library-modify", "user-follow-read", "user-follow-modify",
     "playlist-read-private", "playlist-read-collaborative", "playlist-modify-private", "playlist-modify-public",
 ))
 CLIENT_ID_RE = re.compile(r"[0-9a-f]{32}")
@@ -42,6 +42,9 @@ LIBRARY_BATCH = 40  # PUT /me/library — не больше 40 URI
 PLAYLIST_BATCH = 100  # POST /playlists/{id}/items — не больше 100
 SEARCH_LIMIT = 10  # в режиме разработки больше 10 за запрос не отдают
 MIN_INTERVAL = 0.25  # сек между запросами одного пользователя: у каждого своё приложение и своя квота
+# «Любимые треки» Spotify сортирует по времени добавления с точностью до секунды: чтобы порядок совпал
+# с Яндексом, лайки сохраняются по одному и не чаще раза в секунду.
+LIKE_GAP = 1.1
 MAX_RETRY_AFTER = 120  # сек: дольше не ждём — перенос сообщит об ошибке, а не повиснет
 
 
@@ -198,14 +201,36 @@ class Spotify:
 
     # ---------- запись ----------
 
-    async def save_tracks(self, uris: Sequence[str]) -> None:
-        """В «Любимые треки». Spotify ставит дату добавления по порядку запросов — сохраняем от старых к новым."""
+    async def library_contains(self, uris: Sequence[str]) -> list[bool]:
+        result: list[bool] = []
         for i in range(0, len(uris), LIBRARY_BATCH):
-            await self.request("PUT", "/me/library", params={"uris": ",".join(uris[i:i + LIBRARY_BATCH])})
+            batch = list(uris[i:i + LIBRARY_BATCH])
+            data = await self.request("GET", "/me/library/contains", params={"uris": ",".join(batch)})
+            ok = isinstance(data, list) and len(data) == len(batch)
+            result += [bool(x) for x in data] if ok else [False] * len(batch)
+        return result
+
+    async def save_tracks(self, uris: Sequence[str], on_saved=None) -> None:
+        """В «Любимые треки» по одному, от старых к новым: дата добавления у каждого своя — порядок как задан."""
+        last = 0.0
+        for uri in uris:
+            wait = last + LIKE_GAP - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            await self.request("PUT", "/me/library", params={"uris": uri})
+            last = time.monotonic()
+            if on_saved and on_saved(uri) is False:
+                return  # остановили
 
     async def create_playlist(self, name: str, description: str = "") -> dict[str, Any]:
         return await self.request("POST", "/me/playlists",
                                   json={"name": name[:100], "public": False, "description": description[:300]})
+
+    async def replace_playlist(self, playlist_id: str, uris: Sequence[str]) -> None:
+        """Содержимое плейлиста — ровно uris в этом порядке (первые 100 заменяют всё, остальные дописываются)."""
+        await self.request("PUT", f"/playlists/{playlist_id}/items", json={"uris": list(uris[:PLAYLIST_BATCH])})
+        if len(uris) > PLAYLIST_BATCH:
+            await self.add_to_playlist(playlist_id, uris[PLAYLIST_BATCH:])
 
     async def add_to_playlist(self, playlist_id: str, uris: Sequence[str]) -> None:
         for i in range(0, len(uris), PLAYLIST_BATCH):

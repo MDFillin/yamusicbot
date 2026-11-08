@@ -51,6 +51,7 @@ class FakeSpotify:
         self.searches: list[str] = []
         self.saved: list[str] = []
         self.playlists: list[tuple[str, list[str]]] = []
+        self.replaced: list[tuple[str, list[str]]] = []
 
     async def me(self):
         return {"display_name": "Андрей"}
@@ -59,8 +60,18 @@ class FakeSpotify:
         self.searches.append(query)
         return [t for key, tracks in self.catalog.items() if key.lower() in query.lower() for t in tracks]
 
-    async def save_tracks(self, uris):
-        self.saved.extend(uris)
+    async def library_contains(self, uris):
+        return [u in self.saved for u in uris]
+
+    async def save_tracks(self, uris, on_saved=None):
+        for uri in uris:
+            self.saved.append(uri)
+            if on_saved and on_saved(uri) is False:
+                return
+
+    async def replace_playlist(self, playlist_id, uris):
+        self.replaced.append((playlist_id, list(uris)))
+        self.playlists[int(playlist_id[1:]) - 1] = (self.playlists[int(playlist_id[1:]) - 1][0], list(uris))
 
     async def create_playlist(self, name, description=""):
         self.playlists.append((name, []))
@@ -98,6 +109,11 @@ async def spotify_api():
         calls.append(("library", request.headers["Authorization"], request.query["uris"].split(",")))
         return web.Response(status=200)
 
+    async def contains(request):
+        uris = request.query["uris"].split(",")
+        calls.append(("contains", uris))
+        return web.json_response([u.endswith("0") for u in uris])
+
     async def items(request):
         calls.append(("items", request.match_info["id"], (await request.json())["uris"]))
         return web.json_response({"snapshot_id": "s"}, status=201)
@@ -109,16 +125,18 @@ async def spotify_api():
 
     app.router.add_post("/api/token", token)
     app.router.add_put("/v1/me/library", library)
+    app.router.add_get("/v1/me/library/contains", contains)
     app.router.add_post("/v1/playlists/{id}/items", items)
     app.router.add_get("/v1/me", me)
     server = TestServer(app)
     await server.start_server()
     base = str(server.make_url("")).rstrip("/")
-    old = spotify_module.API, spotify_module.TOKEN_URL, spotify_module.MIN_INTERVAL
-    spotify_module.API, spotify_module.TOKEN_URL, spotify_module.MIN_INTERVAL = base + "/v1", base + "/api/token", 0
+    old = spotify_module.API, spotify_module.TOKEN_URL, spotify_module.MIN_INTERVAL, spotify_module.LIKE_GAP
+    spotify_module.API, spotify_module.TOKEN_URL = base + "/v1", base + "/api/token"
+    spotify_module.MIN_INTERVAL, spotify_module.LIKE_GAP = 0, 0
     async with aiohttp.ClientSession() as http:
         yield NS(http=http, calls=calls)
-    spotify_module.API, spotify_module.TOKEN_URL, spotify_module.MIN_INTERVAL = old
+    spotify_module.API, spotify_module.TOKEN_URL, spotify_module.MIN_INTERVAL, spotify_module.LIKE_GAP = old
     await server.close()
 
 
@@ -126,13 +144,17 @@ async def test_spotify_refreshes_token_retries_429_and_batches(spotify_api):
     saved = []
     sp = Spotify(spotify_api.http, "c" * 32, Tokens("A1", "R1", time.time() - 1), on_tokens=saved.append)
     uris = [f"spotify:track:{i}" for i in range(85)]
-    await sp.save_tracks(uris)
+    await sp.save_tracks(uris[:3])
     await sp.add_to_playlist("pl", uris + uris + uris)
+    contains = await sp.library_contains(uris)
+    assert contains == [u.endswith("0") for u in uris]
+    assert [len(c[1]) for c in spotify_api.calls if c[0] == "contains"] == [40, 40, 5]
     token = [c for c in spotify_api.calls if c[0] == "token"]
     assert token[0][1] == {"grant_type": "refresh_token", "refresh_token": "R1", "client_id": "c" * 32}
     assert len(token) == 1 and saved and saved[0].access == "A2" and saved[0].refresh == "R2"
     library = [c for c in spotify_api.calls if c[0] == "library"]
-    assert [len(c[2]) for c in library] == [40, 40, 5] and library[0][1] == "Bearer A2", "по 40, 429 переждали"
+    assert [c[2] for c in library] == [[u] for u in uris[:3]], "лайки — по одному, по порядку, 429 переждали"
+    assert library[0][1] == "Bearer A2"
     assert [len(c[2]) for c in spotify_api.calls if c[0] == "items"] == [100, 100, 55]
 
 
@@ -174,16 +196,21 @@ async def test_transfer_likes_and_playlist(tmp_path):
     assert sp.playlists == [("Мои записи", ["spotify:track:k", "spotify:track:g"])]
     likes, playlist = job.state["sources"]
     assert (likes["total"], likes["done"], likes["found"]) == (3, 3, 2)
-    assert likes["missed"] == [{"title": "Нет в Spotify", "artists": "Кино"}]
+    assert likes["missed"] == [{"title": "Нет в Spotify", "artists": "Кино", "id": "3", "ugc": False, "pos": 3}]
+    assert (likes["to_save"], likes["saved"], likes["phase"]) == (2, 2, "done")
     assert playlist["url"] == "https://open.spotify.com/playlist/p1" and playlist["already"] == 2, "пары запомнены"
     assert store.last_transfer_job(1)[2] == "done"
     [(user, text)] = sent
     assert user == 1 and "перенесено 2 из 3, не нашлось 1" in text
 
     searches = len(sp.searches)
-    transfers.start(1, ym_with_library(), sp, [SourcePick("likes")])
-    await wait_job(transfers, 1)
+    transfers.start(1, ym_with_library(), sp, [SourcePick("likes"), SourcePick("pl", "42.1003")])
+    job = await wait_job(transfers, 1)
     assert len(sp.searches) == searches, "второй раз — без поиска: найденное и «не нашли» в кэше"
+    assert sp.saved == ["spotify:track:k", "spotify:track:g"], "уже сохранённые лайки не трогаем — порядок цел"
+    assert job.state["sources"][0]["to_save"] == 0
+    assert len(sp.playlists) == 1 and sp.replaced == [("p1", ["spotify:track:k", "spotify:track:g"])], \
+        "тот же плейлист обновлён, а не создан второй"
     store.set_match(YM2SP, "3", None)
     store._db.execute("UPDATE transfer_matches SET at = 0 WHERE src_id = '3'")
     transfers.start(1, ym_with_library(), sp, [SourcePick("likes")])
@@ -284,3 +311,48 @@ async def test_transfer_api_start_and_progress(tenv, monkeypatch):
     job = (await (await c.get("/api/transfer")).json())["job"]
     assert job["status"] == "done" and [s["found"] for s in job["sources"]] == [1, 1]
     assert fake.saved == ["spotify:track:k"] and tenv.sender is not None
+
+
+UGC = "596c86f1-a7c4-42fa-ac0b-bbe0cf95255c"
+
+
+def ym_with_files() -> FakeYM:
+    """Плейлист вперемешку: каталог и загруженные файлы с «грязными» тегами."""
+    ym = FakeYM()
+    ym.tracks[UGC] = NS(id=UGC, title="BITZ - Письмо", version=None, duration_ms=111_290, available=True,
+                        artists=[NS(id=None, name="RioSsa93", cover=None)], albums=[], cover_uri=None)
+    ym.tracks["u2"] = NS(id="u2", title="Демо с репетиции", version=None, duration_ms=95_000, available=True,
+                         artists=[NS(id=None, name="Я", cover=None)], albums=[], cover_uri=None)
+    ym.playlist.tracks = [NS(id=UGC, track=None, track_id=UGC), NS(id=1, track=None, track_id="1:10"),
+                          NS(id="u2", track=None, track_id="u2")]
+    return ym
+
+
+async def test_uploaded_files_are_searched_and_kept_in_order(tmp_path):
+    store = Storage(tmp_path / "bot.db")
+    transfers = Transfers(store)
+    sp = FakeSpotify({"письмо": [sp_track("spotify:track:bitz", "Письмо", "BITZ", 112_000)],
+                      "Кукушка": [sp_track("spotify:track:k", "Kukushka", "Kino", 200_000)]})
+    transfers.start(1, ym_with_files(), sp, [SourcePick("pl", "42.1003")])
+    job = await wait_job(transfers, 1)
+    st = job.state["sources"][0]
+    assert sp.playlists == [("Мои записи", ["spotify:track:bitz", "spotify:track:k"])], "порядок как в Яндексе"
+    assert st["files_found"] == 1
+    assert st["missed"] == [{"title": "Демо с репетиции", "artists": "Я", "id": "u2", "ugc": True, "pos": 3}]
+    assert "загруженных файлов нет в Spotify: 1" in summary_text(job.state)
+    store.close()
+
+
+async def test_send_missing_files_to_chat(tenv, monkeypatch):
+    calls = []
+    monkeypatch.setattr(transfer_api, "start_bulk_download", lambda *a, **kw: calls.append(kw) or True)
+    assert (await tenv.client.post("/api/transfer/files")).status == 404
+    state = {"sources": [
+        {"missed": [{"id": "b", "ugc": True, "pos": 9}, {"id": "a", "ugc": True, "pos": 2}, {"id": "5", "ugc": False}]},
+        {"missed": [{"id": "a", "ugc": True, "pos": 1}, {"id": "c", "ugc": True, "pos": 4}]},
+    ]}
+    job_id = tenv.store.add_transfer_job(1, YM2SP, state)
+    tenv.store.update_transfer_job(job_id, "done", state)
+    resp = await tenv.client.post("/api/transfer/files")
+    assert (await resp.json()) == {"started": True, "count": 3}
+    assert calls[0]["items"] == ["a", "b", "c"], "по порядку списков, без каталожных и без повторов"

@@ -1545,8 +1545,10 @@
       const go = h('button', { class: 'btn block big' }, 'Перенести');
       put(body, account, info.job ? resultCard(info.job) : null,
         h('div', { class: 'section-head' }, h('h2', {}, 'Что перенести')), list,
-        h('div', { class: 'hint' }, 'Лайки попадут в «Любимые треки» Spotify, плейлисты — новыми плейлистами с теми же названиями. ',
-          'Каждый трек бот ищет в Spotify по названию, исполнителю и длительности; что не нашлось — покажет списком.'),
+        h('div', { class: 'hint' }, 'Порядок сохраняется как в Яндексе. Лайки попадут в «Любимые треки» Spotify — бот добавляет их ',
+          'по одному, от старых к новым, примерно секунда на трек. Плейлисты появятся в Spotify с теми же названиями ',
+          '(при повторном переносе обновятся, а не задвоятся). Ваши загруженные файлы бот тоже ищет в Spotify; ',
+          'каких там нет — пришлёт в чат, чтобы добавить их в Spotify на компьютере.'),
         go);
       let src;
       try { src = await api('/api/transfer/sources'); } catch (e) { if (alive()) put(list, emptyEl('alert', e.message)); return; }
@@ -1581,10 +1583,18 @@
 
     // ----- шаг 3: прогресс и итог -----
     function sourceLine(s) {
-      const total = s.total == null ? '…' : s.total;
-      return h('div', { class: 'transfer-src' },
-        h('div', { class: 'title' }, s.title),
-        h('div', { class: 'sub' }, s.total == null ? 'ждёт очереди' : `${s.done} из ${total} · найдено ${s.found}`));
+      let sub = 'ждёт очереди';
+      if (s.phase === 'saving' && s.src === 'likes' && s.to_save != null) {
+        const left = Math.max(0, s.to_save - s.saved);
+        sub = `добавляю в «Любимые» по порядку: ${s.saved} из ${s.to_save}` + (left > 60 ? ` · ещё ~${Math.ceil(left * 1.2 / 60)} мин` : '');
+      } else if (s.phase === 'saving') {
+        sub = 'собираю плейлист в Spotify…';
+      } else if (s.phase === 'done') {
+        sub = `готово · перенесено ${s.found} из ${s.total}`;
+      } else if (s.total != null) {
+        sub = `ищу в Spotify: ${s.done} из ${s.total} · найдено ${s.found}`;
+      }
+      return h('div', { class: 'transfer-src' }, h('div', { class: 'meta' }, h('div', { class: 'title' }, s.title), h('div', { class: 'sub' }, sub)));
     }
 
     function drawProgress(job) {
@@ -1608,6 +1618,7 @@
       const head = { done: 'Перенос закончен', cancelled: 'Перенос остановлен', failed: 'Перенос прервался',
         interrupted: 'Перенос прервался: бот перезапускался' }[job.status] || 'Прошлый перенос';
       const missed = job.sources.flatMap((s) => s.missed || []);
+      const files = new Set(missed.filter((m) => m.ugc && m.id).map((m) => m.id)).size;
       return h('div', { class: `card transfer-result ${job.status}` },
         h('div', { class: 'title' }, head),
         job.error ? h('div', { class: 'sub err' }, job.error) : null,
@@ -1615,16 +1626,36 @@
           h('div', { class: 'meta' }, h('div', { class: 'title' }, s.title),
             h('div', { class: 'sub' }, `перенесено ${s.found} из ${s.total}`)),
           s.url ? h('button', { class: 'link-btn', onclick: () => openLink(s.url) }, 'Открыть') : null)),
-        missed.length ? h('button', { class: 'link-btn', onclick: () => missedSheet(missed) },
-          `Не нашлось: ${missed.length} — показать`) : null);
+        missed.length ? h('button', { class: 'link-btn', onclick: () => missedSheet(job) },
+          `Не нашлось: ${missed.length} — показать`) : null,
+        files ? h('button', { class: 'btn secondary block', onclick: sendFiles }, icon('send', 'sm'), `Прислать мои файлы в чат (${files})`) : null);
     }
 
-    function missedSheet(missed) {
+    async function sendFiles() {
+      haptic.tap();
+      try {
+        const r = await api('/api/transfer/files', { method: 'POST' });
+        toast(r.started ? `Отправляю в чат: ${r.count}` : 'Уже отправляю в чат — дождитесь конца', 3500);
+      } catch (e) { fail(e); }
+    }
+
+    function missedSheet(job) {
+      const total = job.sources.reduce((a, s) => a + (s.missed || []).length, 0);
+      const files = job.sources.reduce((a, s) => a + (s.missed || []).filter((m) => m.ugc).length, 0);
       openSheet([
-        h('div', { class: 'sheet-title' }, `Не нашлось в Spotify: ${missed.length}`),
-        h('div', { class: 'card list' }, missed.map((m) => h('div', { class: 'row' },
-          h('div', { class: 'meta' }, h('div', { class: 'title' }, m.title), h('div', { class: 'sub' }, m.artists))))),
-        h('div', { class: 'sheet-note' }, 'Обычно это треки, которых нет в Spotify, загруженные вами файлы или другие версии (ремиксы, slowed). Их можно найти и добавить вручную.'),
+        h('div', { class: 'sheet-title' }, `Не нашлось в Spotify: ${total}`),
+        job.sources.filter((s) => (s.missed || []).length).map((s) => [
+          h('div', { class: 'section-head' }, h('h2', {}, s.title)),
+          h('div', { class: 'card list' }, [...s.missed].sort((a, b) => (a.pos || 0) - (b.pos || 0)).map((m) => h('div', { class: 'row' },
+            h('span', { class: 'miss-pos' }, m.pos ? `№${m.pos}` : ''),
+            h('div', { class: 'meta' }, h('div', { class: 'title' }, m.title),
+              h('div', { class: 'sub' }, m.ugc ? h('span', { class: 'badge' }, 'ваш файл') : null, m.ugc ? ' ' : '', m.artists))))),
+        ]),
+        h('div', { class: 'sheet-note' }, '№ — место трека в списке Яндекса (у лайков считается сверху, от новых). ',
+          files ? 'Загруженные вами файлы Spotify через API не принимает: бот пришлёт их в чат, а в приложении Spotify на компьютере их можно ' +
+            'добавить как локальные файлы (Настройки → Локальные файлы) и перетащить в плейлист на нужное место. ' : '',
+          'Остальное — треки, которых нет в Spotify, или другие версии (ремиксы, slowed).'),
+        files ? h('button', { class: 'btn block', onclick: () => { closeSheet(); sendFiles(); } }, icon('send', 'sm'), `Прислать мои файлы в чат (${files})`) : null,
       ]);
     }
   }

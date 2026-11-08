@@ -12,6 +12,7 @@ import aiohttp
 from aiohttp import web
 
 from bot import net
+from bot.handlers.download import start_bulk_download
 from bot.spotify import (
     CLIENT_ID_RE,
     Spotify,
@@ -149,6 +150,26 @@ async def start(request: web.Request) -> web.Response:
         raise web.HTTPBadGateway(text=str(e)) from e
     transfers.start(user_id, request[YM], sp, picks)
     return web.json_response({"job": _job_json(request, user_id)})
+
+
+@routes.post("/api/transfer/files")
+async def send_files(request: web.Request) -> web.Response:
+    """Свои загруженные файлы, которых нет в Spotify, — в чат по порядку списков: их можно добавить в Spotify
+    на компьютере как локальные файлы (через API Spotify файлы не принимает)."""
+    ctx, user_id = request.app[CTX], _user(request)
+    last = ctx.store.last_transfer_job(user_id)
+    if last is None:
+        raise web.HTTPNotFound(text="Переносов ещё не было")
+    ids = []
+    for source in last[3].get("sources") or []:
+        ids += [m["id"] for m in sorted(source.get("missed") or [], key=lambda m: m.get("pos", 0))
+                if m.get("ugc") and m.get("id")]
+    ids = list(dict.fromkeys(ids))
+    if not ids:
+        raise web.HTTPBadRequest(text="Ваших файлов среди ненайденного нет")
+    started = start_bulk_download(ctx.bot, user_id, user_id, "transfer", "", request[YM], ctx.sender,
+                                  items=ids, title="Ваши файлы, которых нет в Spotify")
+    return web.json_response({"started": started, "count": len(ids)})
 
 
 @routes.post("/api/transfer/cancel")

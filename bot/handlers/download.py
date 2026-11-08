@@ -54,13 +54,17 @@ async def on_bulk(call: CallbackQuery, callback_data: BulkCb, bot: Bot, ym: Yand
 
 
 def start_bulk_download(
-    bot: Bot, user_id: int, chat_id: int, src: str, ref: str, ym: YandexMusic, sender: TrackSender
+    bot: Bot, user_id: int, chat_id: int, src: str, ref: str, ym: YandexMusic, sender: TrackSender,
+    items: list[str] | None = None, title: str | None = None,
 ) -> bool:
-    """Запускает отправку всего списка в чат. False — если у пользователя уже идёт скачивание."""
+    """Запускает отправку всего списка в чат. False — если у пользователя уже идёт скачивание.
+
+    items/title — свой список треков вместо источника src/ref (например, файлы, которых нет в Spotify)."""
     running = _bulk_tasks.get(user_id)
     if running and not running.done():
         return False
-    task = spawn(_bulk_download(bot, chat_id, src, ref, ym, sender), f"скачивание списка {src} для {user_id}")
+    task = spawn(_bulk_download(bot, chat_id, src, ref, ym, sender, items, title),
+                 f"скачивание списка {src} для {user_id}")
     _bulk_tasks[user_id] = task
     task.add_done_callback(lambda t: _bulk_tasks.pop(user_id, None) if _bulk_tasks.get(user_id) is t else None)
     return True
@@ -76,7 +80,8 @@ async def on_cancel_bulk(call: CallbackQuery) -> None:
         await call.answer("Нечего останавливать")
 
 
-async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexMusic, sender: TrackSender) -> None:
+async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexMusic, sender: TrackSender,
+                         items: list[str] | None = None, list_title: str | None = None) -> None:
     status = await bot.send_message(chat_id, "⏳ Собираю список треков…")
 
     async def update(text: str, with_cancel: bool = True) -> None:
@@ -88,10 +93,14 @@ async def _bulk_download(bot: Bot, chat_id: int, src: str, ref: str, ym: YandexM
     sent, failed = 0, []
     total = 0
     try:
-        source = await load_source(ym, src, ref)
-        tracks = await resolve(ym, source.items)
+        if items is not None:
+            tracks = await resolve(ym, items)
+            title = html.escape(list_title or "Треки")
+        else:
+            source = await load_source(ym, src, ref)
+            tracks = await resolve(ym, source.items)
+            title = html.escape(source.title)
         total = len(tracks)
-        title = html.escape(source.title)
         for i, track in enumerate(tracks, 1):
             await update(f"⏳ {title}\nСкачиваю {i}/{total}: {html.escape(track_title(track))}")
             try:
