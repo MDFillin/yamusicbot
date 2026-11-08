@@ -29,6 +29,7 @@ import aiohttp
 from bot import net
 
 log = logging.getLogger(__name__)
+_sleep = asyncio.sleep  # подменяется в тестах: паузы Spotify бывают по суткам
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -41,11 +42,16 @@ CLIENT_ID_RE = re.compile(r"[0-9a-f]{32}")
 LIBRARY_BATCH = 40  # PUT /me/library — не больше 40 URI
 PLAYLIST_BATCH = 100  # POST /playlists/{id}/items — не больше 100
 SEARCH_LIMIT = 10  # в режиме разработки больше 10 за запрос не отдают
-MIN_INTERVAL = 0.25  # сек между запросами одного пользователя: у каждого своё приложение и своя квота
+# Сек между запросами одного пользователя (у каждого своё приложение и своя квота). Лимиты приложений в режиме
+# разработки Spotify не публикует, а за превышение закрывает доступ почти на сутки: ~4 запроса в секунду
+# в течение трёх минут хватило для такого бана. Поэтому медленно, а после каждого 429 — ещё медленнее.
+MIN_INTERVAL = 2.0
+MAX_INTERVAL = 10.0
 # «Любимые треки» Spotify сортирует по времени добавления с точностью до секунды: чтобы порядок совпал
 # с Яндексом, лайки сохраняются по одному и не чаще раза в секунду.
 LIKE_GAP = 1.1
-MAX_RETRY_AFTER = 120  # сек: дольше не ждём — перенос сообщит об ошибке, а не повиснет
+MAX_RETRY_AFTER = 27 * 3600  # сек: столько пережидаем сами (Spotify банит и на сутки); дольше — ошибка
+LONG_PAUSE = 60  # сек: о паузе дольше этого сообщаем (on_pause), чтобы человек видел, когда продолжится
 
 
 class SpotifyError(Exception):
@@ -124,6 +130,8 @@ class Spotify:
         self.client_id = client_id
         self.tokens = tokens
         self.on_tokens = on_tokens
+        self.on_pause = None  # on_pause(до_какого_времени | None): Spotify попросил долгую паузу / пауза кончилась
+        self.interval = MIN_INTERVAL
         self._lock = asyncio.Lock()
         self._last = 0.0
 
@@ -138,9 +146,10 @@ class Spotify:
 
     async def request(self, method: str, path: str, *, params: dict | None = None, json: Any = None) -> Any:
         url = path if path.startswith("https://") else API + path
-        for attempt in range(4):
-            async with self._lock:  # запросы одного человека — по очереди и не чаще MIN_INTERVAL
-                wait = self._last + MIN_INTERVAL - time.monotonic()
+        attempt = 0  # неудачи, кроме 429: 429 пережидаем сколько скажут
+        while True:
+            async with self._lock:  # запросы одного человека — по очереди и не чаще self.interval
+                wait = self._last + self.interval - time.monotonic()
                 if wait > 0:
                     await asyncio.sleep(wait)
                 self._last = time.monotonic()
@@ -149,18 +158,25 @@ class Spotify:
                     async with self.http.request(method, url, params=params, json=json, headers=headers,
                                                  timeout=net.timeout(30)) as resp:
                         if resp.status == 429:
-                            retry = int(resp.headers.get("Retry-After", "5") or 5)
+                            retry = int(resp.headers.get("Retry-After", "5") or 5) + 1
                             if retry > MAX_RETRY_AFTER:
-                                raise SpotifyError(f"Spotify просит подождать {retry // 60} мин — слишком много "
+                                raise SpotifyError(f"Spotify просит подождать {retry // 3600} ч — слишком много "
                                                    "запросов. Попробуйте позже", 429)
-                            log.info("Spotify 429: жду %s с", retry)
-                            self._last = time.monotonic() + retry
+                            self.interval = min(self.interval * 1.5 + 0.5, MAX_INTERVAL)
+                            log.info("Spotify 429: жду %s с, дальше раз в %.1f с", retry, self.interval)
+                            if retry > LONG_PAUSE and self.on_pause:
+                                self.on_pause(time.time() + retry)
+                            await _sleep(retry)
+                            if retry > LONG_PAUSE and self.on_pause:
+                                self.on_pause(None)
+                            self._last = time.monotonic()
                             continue
-                        if resp.status == 401 and attempt == 0:
+                        attempt += 1
+                        if resp.status == 401 and attempt == 1:
                             self.tokens.expires_at = 0  # истёк раньше срока — обновим и повторим
                             continue
-                        if resp.status >= 500 and attempt < 3:
-                            self._last = time.monotonic() + 2 * (attempt + 1)
+                        if resp.status >= 500 and attempt < 4:
+                            self._last = time.monotonic() + 2 * attempt
                             continue
                         if resp.status in (200, 201, 202, 204):
                             try:
@@ -173,10 +189,10 @@ class Spotify:
                             raise SpotifyAuthError(_auth_hint(resp.status, message), resp.status)
                         raise SpotifyError(f"Spotify: {message}", resp.status)
                 except (aiohttp.ClientError, TimeoutError) as e:
-                    if attempt == 3:
+                    attempt += 1
+                    if attempt >= 4:
                         raise SpotifyError(f"Нет связи со Spotify: {e.__class__.__name__}") from e
                     self._last = time.monotonic() + 2
-        raise SpotifyError("Spotify не ответил после нескольких попыток")
 
     async def _pages(self, path: str, limit: int = 50) -> AsyncIterator[dict[str, Any]]:
         url: str | None = path

@@ -345,11 +345,13 @@ class Storage:
                         "LIMIT 1", user_id)
         return (row[0], row[1], row[2], json.loads(row[3])) if row else None
 
-    def interrupt_transfer_jobs(self) -> int:
-        """После перезапуска бота незаконченные переносы помечаются прерванными (их можно запустить снова)."""
-        cur = self._db.execute("UPDATE transfer_jobs SET status = 'interrupted', finished_at = ? "
-                               "WHERE status = 'running'", (int(time.time()),))
-        return cur.rowcount
+    def interrupt_transfer_jobs(self) -> list[tuple[int, dict]]:
+        """После перезапуска бота: незаконченные переносы помечаются прерванными. Возвращает (пользователь,
+        состояние) каждого — чтобы продолжить их заново."""
+        rows = self._all("SELECT user_id, state FROM transfer_jobs WHERE status = 'running' ORDER BY id")
+        self._db.execute("UPDATE transfer_jobs SET status = 'interrupted', finished_at = ? WHERE status = 'running'",
+                         (int(time.time()),))
+        return [(row[0], json.loads(row[1])) for row in rows]
 
     def backup(self, dest: Path) -> None:
         """Целостная копия базы (можно делать на ходу)."""

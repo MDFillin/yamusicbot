@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import secrets
@@ -32,6 +33,8 @@ TRANSFERS = web.AppKey("transfers", Transfers)
 SPOTIFY_HTTP = web.AppKey("spotify_http", aiohttp.ClientSession)
 LOGINS = web.AppKey("spotify_logins", dict)  # state → (user_id, verifier, client_id, когда)
 LOGIN_TTL = 900  # сек на вход в Spotify
+RESUME_DELAY = 30  # сек после запуска — продолжить прерванные переносы
+RESUME_TASK = web.AppKey("transfer_resume", asyncio.Task)
 MAX_SOURCES = 50
 
 
@@ -232,8 +235,21 @@ async def callback(request: web.Request) -> web.Response:
 async def _startup(app: web.Application) -> None:
     app[SPOTIFY_HTTP] = net.session(timeout=net.timeout(60))
 
+    async def connect(user_id: int):
+        ym = await app[CTX].accounts.get(user_id)
+        sp = spotify_client(app, user_id)
+        return (ym, sp) if ym is not None and sp is not None else None
+
+    async def resume() -> None:
+        await asyncio.sleep(RESUME_DELAY)  # пусть бот сначала спокойно поднимется
+        await app[TRANSFERS].resume_interrupted(connect)
+
+    app[RESUME_TASK] = asyncio.create_task(resume())
+
 
 async def _cleanup(app: web.Application) -> None:
+    if RESUME_TASK in app:
+        app[RESUME_TASK].cancel()
     for job in list(app[TRANSFERS].jobs.values()):
         if job.task and not job.task.done():
             job.task.cancel()

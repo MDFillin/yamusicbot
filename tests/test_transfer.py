@@ -104,7 +104,7 @@ async def test_find_tries_translit_and_picks_best():
 @pytest.fixture
 async def spotify_api():
     calls: list[tuple] = []
-    state = {"limited": 1}
+    state = {"limited": 1, "retry_after": "0"}
     app = web.Application()
 
     async def token(request):
@@ -115,7 +115,7 @@ async def spotify_api():
     async def library(request):
         if state["limited"]:
             state["limited"] -= 1
-            return web.Response(status=429, headers={"Retry-After": "0"})
+            return web.Response(status=429, headers={"Retry-After": state["retry_after"]})
         calls.append(("library", request.headers["Authorization"], request.query["uris"].split(",")))
         return web.Response(status=200)
 
@@ -140,7 +140,7 @@ async def spotify_api():
     spotify_module.API, spotify_module.TOKEN_URL = base + "/v1", base + "/api/token"
     spotify_module.MIN_INTERVAL, spotify_module.LIKE_GAP = 0, 0
     async with aiohttp.ClientSession() as http:
-        yield NS(http=http, calls=calls)
+        yield NS(http=http, calls=calls, state=state)
     spotify_module.API, spotify_module.TOKEN_URL, spotify_module.MIN_INTERVAL, spotify_module.LIKE_GAP = old
     await server.close()
 
@@ -240,11 +240,22 @@ async def test_transfer_cancel_and_restart_marks(tmp_path):
     job = await wait_job(transfers, 1)
     assert job.state["status"] == "cancelled" and "остановлен" in summary_text(job.state)
 
-    transfers.start(2, ym_with_library(), SlowSpotify(), [SourcePick("likes")])
+    transfers.start(2, ym_with_library(), SlowSpotify(), [SourcePick("likes"), SourcePick("pl", "42.1003")])
     release.clear()
     await asyncio.sleep(0.05)
-    assert Transfers(store).store.last_transfer_job(2)[2] == "interrupted", "после перезапуска — прерван"
+    restarted = Transfers(store)  # бот перезапустился (например, ночная копия)
+    assert store.last_transfer_job(2)[2] == "interrupted"
     transfers.jobs[2].task.cancel()
+    fresh = FakeSpotify()
+
+    async def connect(user_id):
+        return (ym_with_library(), fresh) if user_id == 2 else None
+
+    await restarted.resume_interrupted(connect)
+    job = await wait_job(restarted, 2)
+    assert job.state["status"] == "done" and [s["src"] for s in job.state["sources"]] == ["likes", "pl"], \
+        "продолжен сам, с теми же списками"
+    assert restarted.interrupted == {}
     store.close()
 
 
@@ -403,3 +414,39 @@ def test_merge_plan(current, desired, result):
     for pos, uris in merge_plan(list(current), list(desired)):
         items[pos:pos] = uris
     assert "".join(items) == result
+
+
+async def test_spotify_waits_out_long_ban_and_slows_down(spotify_api, monkeypatch):
+    slept, pauses = [], []
+
+    async def fake_sleep(sec):
+        slept.append(sec)
+
+    monkeypatch.setattr(spotify_module, "_sleep", fake_sleep)
+    spotify_api.state.update(limited=1, retry_after="85000")  # как у пользователя: почти сутки
+    sp = Spotify(spotify_api.http, "c" * 32, Tokens("A1", "R1", time.time() + 999))
+    sp.on_pause = pauses.append
+    await sp.save_tracks(["spotify:track:1"])
+    assert slept == [85001], "пережидаем сами, а не падаем"
+    assert len(pauses) == 2 and pauses[0] > time.time() + 84000 and pauses[1] is None, "перенос знает, до когда пауза"
+    assert sp.interval > 0, "после 429 — медленнее"
+    assert [c for c in spotify_api.calls if c[0] == "library"], "после паузы запрос повторён"
+
+
+async def test_cancel_during_spotify_pause(tmp_path):
+    store = Storage(tmp_path / "bot.db")
+    transfers = Transfers(store)
+    forever = asyncio.Event()
+
+    class BannedSpotify(FakeSpotify):
+        async def search_tracks(self, query):
+            self.on_pause(time.time() + 85000)
+            await forever.wait()
+
+    transfers.start(1, ym_with_library(), BannedSpotify(), [SourcePick("likes")])
+    await asyncio.sleep(0.05)
+    assert transfers.jobs[1].state["paused_until"] > time.time()
+    assert transfers.cancel(1)
+    job = await wait_job(transfers, 1)
+    assert job.state["status"] == "cancelled" and store.last_transfer_job(1)[2] == "cancelled"
+    store.close()

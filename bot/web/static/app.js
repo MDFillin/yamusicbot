@@ -1546,7 +1546,8 @@
       put(body, account, info.job ? resultCard(info.job) : null,
         h('div', { class: 'section-head' }, h('h2', {}, 'Что перенести')), list,
         h('div', { class: 'hint' }, 'Порядок сохраняется как в Яндексе. Лайки попадут в «Любимые треки» Spotify — бот добавляет их ',
-          'по одному, от старых к новым, примерно секунда на трек. Плейлисты появятся в Spotify с теми же названиями. ',
+          'по одному, от старых к новым. Spotify строго ограничивает число запросов, поэтому бот работает неспешно — ',
+          'примерно 2 секунды на трек (тысяча лайков — около часа); уже перенесённое повторно не ищется. Плейлисты появятся в Spotify с теми же названиями. ',
           'Повторять перенос можно сколько угодно: что уже есть в Spotify (даже перенесённое раньше другим сервисом ',
           'или другой версией), бот узнает и не добавит второй раз — добавится только новое, а плейлист с тем же ',
           'названием дополнится, не теряя того, что вы добавили в Spotify сами. Ваши загруженные файлы бот тоже ищет в Spotify; ',
@@ -1584,6 +1585,8 @@
     }
 
     // ----- шаг 3: прогресс и итог -----
+    const fmtLeft = (sec) => (sec < 3600 ? `${Math.ceil(sec / 60)} мин` : `${Math.floor(sec / 3600)} ч ${Math.round((sec % 3600) / 60)} мин`);
+
     function transferStats(s) {
       const parts = [`в Spotify ${s.found} из ${s.total}`];
       if (s.in_spotify) parts.push(`${s.in_spotify} уже были`, `добавлено ${s.saved || 0}`);
@@ -1594,7 +1597,7 @@
       let sub = 'ждёт очереди';
       if (s.phase === 'saving' && s.src === 'likes' && s.to_save != null) {
         const left = Math.max(0, s.to_save - s.saved);
-        sub = `добавляю в «Любимые» по порядку: ${s.saved} из ${s.to_save}` + (left > 60 ? ` · ещё ~${Math.ceil(left * 1.2 / 60)} мин` : '');
+        sub = `добавляю в «Любимые» по порядку: ${s.saved} из ${s.to_save}` + (left > 30 ? ` · ещё ~${fmtLeft(left * 2.1)}` : '');
       } else if (s.phase === 'saving') {
         sub = s.to_save ? `добавляю в плейлист: ${s.saved || 0} из ${s.to_save}` : 'сверяю плейлист в Spotify…';
       } else if (s.phase === 'library') {
@@ -1612,9 +1615,14 @@
       const done = job.sources.reduce((a, s) => a + (s.done || 0), 0);
       const pct = total ? Math.round((done / total) * 100) : 0;
       const cur = job.sources[job.current] || job.sources[0];
+      const paused = job.paused_until && job.paused_until * 1000 > Date.now()
+        ? new Date(job.paused_until * 1000).toLocaleString('ru-RU', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })
+        : null;
       put(body, h('div', { class: 'card transfer-progress' },
         h('div', { class: 'transfer-pct' }, `${pct}%`),
         h('div', { class: 'sub' }, cur ? `Сейчас: ${cur.title}` : 'Начинаю…'),
+        paused ? h('div', { class: 'transfer-pause' }, icon('clock', 'sm'),
+          `Spotify попросил паузу — слишком много запросов. Продолжу сам ${paused}, ничего делать не нужно.`) : null,
         h('div', { class: 'progress' }, h('div', { style: `width: ${pct}%` })),
         h('div', { class: 'transfer-srcs' }, job.sources.map(sourceLine)),
         h('button', { class: 'btn secondary block danger', onclick: async () => {

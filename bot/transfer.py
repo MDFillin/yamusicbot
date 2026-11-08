@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 YM2SP = "ym2sp"
 MISS_RETRY = 7 * 86400  # «не нашли» перепроверяем через неделю
 ACCEPT = 0.74  # минимальная оценка пары
-GOOD_ENOUGH = 0.92  # такой пары хватает — дальше не ищем
+GOOD_ENOUGH = 0.85  # такой пары хватает — дальше не ищем (каждый запрос к Spotify на счету)
 SAVE_EVERY = 10  # сохранять прогресс каждые N треков
 MAX_MISSES = 3000  # сколько ненайденных треков хранить в итоге
 YM_PAGE = 100
@@ -150,7 +150,7 @@ def queries(wanted: Wanted) -> list[str]:
             result.append(f"{latin(a)} {latin(t)}")
     if wanted.ugc:
         result.append(f'track:"{norm_title(wanted.title)}"')  # исполнитель в файле может быть чужим
-    return list(dict.fromkeys(q.strip() for q in result if q.strip()))[:7]
+    return list(dict.fromkeys(q.strip() for q in result if q.strip()))[:5 if wanted.ugc else 3]
 
 
 async def find_on_spotify(sp: Spotify, wanted: Wanted) -> str | None:
@@ -255,8 +255,28 @@ class Transfers:
         self.store = store
         self.notify = notify
         self.jobs: dict[int, TransferJob] = {}
-        if count := store.interrupt_transfer_jobs():
-            log.info("Перенос: прервано перезапуском бота — %s", count)
+        # Прерванные перезапуском (ночная копия ненадолго останавливает бота, а перенос идёт часами) —
+        # продолжаются сами (resume_interrupted): найденные пары запомнены, уже добавленное в Spotify не задвоится.
+        self.interrupted: dict[int, list[SourcePick]] = {}
+        for user_id, state in store.interrupt_transfer_jobs():
+            picks = [SourcePick(s["src"], s.get("ref") or "") for s in state.get("sources") or []
+                     if s.get("src") in ("likes", "pl")]
+            if picks:
+                self.interrupted[user_id] = picks
+        if self.interrupted:
+            log.info("Перенос: прервано перезапуском бота — %s, продолжу", len(self.interrupted))
+
+    async def resume_interrupted(self, connect: Callable[[int], Awaitable[tuple[Any, Any] | None]]) -> None:
+        """Продолжить переносы, прерванные перезапуском. connect(user_id) → (Яндекс, Spotify) или None."""
+        pending, self.interrupted = self.interrupted, {}
+        for user_id, picks in pending.items():
+            try:
+                clients = await connect(user_id)
+            except Exception as e:  # noqa: BLE001 — не вышло у одного — продолжаем остальных
+                log.info("Перенос %s не продолжен: %s", user_id, e)
+                continue
+            if clients and not self.running(user_id):
+                self.start(user_id, clients[0], clients[1], picks)
 
     def running(self, user_id: int) -> TransferJob | None:
         job = self.jobs.get(user_id)
@@ -281,6 +301,8 @@ class Transfers:
         if job is None:
             return False
         job.cancelled = True
+        if job.state.get("paused_until") and job.task:
+            job.task.cancel()  # ждёт конца паузы Spotify (до суток) — не ждём, останавливаем сразу
         return True
 
     def _save(self, job: TransferJob, status: str = "running") -> None:
@@ -291,6 +313,12 @@ class Transfers:
 
     async def _run(self, job: TransferJob, ym: YandexMusic, sp: Spotify, picks: list[SourcePick]) -> None:
         status = "done"
+
+        def on_pause(until: float | None) -> None:
+            job.state["paused_until"] = int(until) if until else None
+            self._save(job)
+
+        sp.on_pause = on_pause
         try:
             for i, pick in enumerate(picks):
                 if job.cancelled:
@@ -299,9 +327,12 @@ class Transfers:
                 await self._source(job, ym, sp, pick, job.state["sources"][i])
             if job.cancelled:
                 status = "cancelled"
-        except asyncio.CancelledError:  # бот останавливается
-            status = "interrupted"
-            raise
+        except asyncio.CancelledError:
+            if not job.cancelled:  # бот останавливается
+                status = "interrupted"
+                raise
+            status = "cancelled"  # остановили во время паузы Spotify
+            job.state["paused_until"] = None
         except SpotifyError as e:
             status, job.state["error"] = "failed", str(e)
         except Exception:  # итог переноса пользователь должен увидеть в любом случае

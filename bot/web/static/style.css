@@ -663,3 +663,5 @@ details.log pre {
 .transfer-result.failed > .title::before, .transfer-result.interrupted > .title::before { content: "⚠️ "; }
 .miss-pos { flex: none; min-width: 42px; color: var(--hint); font-size: 13px; font-variant-numeric: tabular-nums; }
 .transfer-result .btn { margin-top: 6px; }
+.transfer-pause { display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px; border-radius: 12px; background: var(--fill); font-size: 13px; line-height: 1.4; }
+.transfer-pause .i { flex: none; margin-top: 1px; color: var(--accent); }
