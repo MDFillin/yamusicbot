@@ -211,9 +211,20 @@ class Spotify:
     async def playlists(self) -> list[dict[str, Any]]:
         return [p async for p in self._pages("/me/playlists") if p]
 
-    async def liked_tracks(self) -> list[dict[str, Any]]:
-        """Все «Любимые треки» (вместе с локальными файлами, если их туда добавляли)."""
-        return [i["track"] async for i in self._pages("/me/tracks") if i and i.get("track")]
+    async def liked_tracks(self, on_page=None) -> list[dict[str, Any]]:
+        """Все «Любимые треки» (вместе с локальными файлами, если их туда добавляли).
+
+        on_page(загружено, всего) — после каждой страницы; вернул False — хватит (перенос остановили)."""
+        result: list[dict[str, Any]] = []
+        url: str | None = "/me/tracks"
+        params: dict | None = {"limit": 50}
+        while url:
+            page = await self.request("GET", url, params=params) or {}
+            result += [i["track"] for i in page.get("items") or [] if i and i.get("track")]
+            if on_page and on_page(len(result), int(page.get("total") or len(result))) is False:
+                break
+            url, params = page.get("next"), None
+        return result
 
     async def playlist_items(self, playlist_id: str) -> list[dict[str, Any]]:
         """Треки своего плейлиста по порядку (чужие плейлисты Spotify с 2026 года не отдаёт)."""

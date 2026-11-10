@@ -61,8 +61,11 @@ class FakeSpotify:
     async def me(self):
         return {"id": "me", "display_name": "Андрей"}
 
-    async def liked_tracks(self):
-        return [self.tracks[u] for u in reversed(self.saved)]
+    async def liked_tracks(self, on_page=None):
+        result = [self.tracks[u] for u in reversed(self.saved)]
+        if on_page:
+            on_page(len(result), len(result))
+        return result
 
     async def playlists(self):
         return [{"id": f"p{i + 1}", "name": name, "owner": {"id": "me"}} for i, (name, _) in enumerate(self.pls)]
@@ -450,3 +453,18 @@ async def test_cancel_during_spotify_pause(tmp_path):
     job = await wait_job(transfers, 1)
     assert job.state["status"] == "cancelled" and store.last_transfer_job(1)[2] == "cancelled"
     store.close()
+
+
+async def test_liked_library_shows_progress_and_stops_at_once(spotify_api, tmp_path):
+    pages = [{"items": [{"track": sp_track(f"spotify:track:{p}{i}", "x", "y")} for i in range(50)], "total": 120,
+              "next": f"/me/tracks?p={p + 1}" if p < 2 else None} for p in range(3)]
+    seen = []
+
+    class PagedSpotify(Spotify):
+        async def request(self, method, path, **kw):
+            return pages[0] if kw.get("params") else pages[int(path.rsplit("=", 1)[1])]
+
+    sp = PagedSpotify(spotify_api.http, "c" * 32, Tokens("A", "R", time.time() + 999))
+    tracks = await sp.liked_tracks(lambda loaded, total: seen.append((loaded, total)))
+    assert len(tracks) == 150 and seen == [(50, 120), (100, 120), (150, 120)]
+    assert len(await sp.liked_tracks(lambda loaded, total: False)) == 50, "остановили — дальше не грузим"

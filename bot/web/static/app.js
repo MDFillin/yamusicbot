@@ -1601,7 +1601,10 @@
       } else if (s.phase === 'saving') {
         sub = s.to_save ? `добавляю в плейлист: ${s.saved || 0} из ${s.to_save}` : 'сверяю плейлист в Spotify…';
       } else if (s.phase === 'library') {
-        sub = 'смотрю, что уже есть в Spotify…';
+        sub = s.library_total
+          ? `загружаю ваши «Любимые» из Spotify, чтобы не добавить второй раз: ${s.library_loaded} из ${s.library_total}` +
+            (s.library_total - s.library_loaded > 500 ? ` · ещё ~${fmtLeft((s.library_total - s.library_loaded) / 50 * 2.2)}` : '')
+          : 'смотрю, что уже есть в Spotify…';
       } else if (s.phase === 'done') {
         sub = transferStats(s);
       } else if (s.total != null) {

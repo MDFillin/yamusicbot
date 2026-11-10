@@ -358,7 +358,14 @@ class Transfers:
         # Что уже лежит в Spotify: туда второй раз не добавляем.
         playlist_id = None
         if likes:
-            library = SpotifyLibrary(await sp.liked_tracks())
+            def on_page(loaded: int, total: int) -> bool:
+                st["library_loaded"], st["library_total"] = loaded, total
+                self._save(job)
+                return not job.cancelled
+
+            library = SpotifyLibrary(await sp.liked_tracks(on_page))
+            if job.cancelled:
+                return
         else:
             playlist_id = await self._target_playlist(job, sp, pick, st["title"])
             library = SpotifyLibrary(await sp.playlist_items(playlist_id) if playlist_id else [])
